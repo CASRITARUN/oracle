@@ -250,6 +250,31 @@
     <div class="legend">Best-effort headline scan — not verified analysis, not a results-date calendar. Treat as a nudge to look closer, never a green light.</div>
   </div>
 
+  <div class="panel">
+    <h2>9. Event Calendar — avoid new entries around these dates</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button id="refreshEventsBtn">Refresh Calendar</button>
+      <span id="eventsStatus" class="loading"></span>
+    </div>
+    <table id="eventsTable" style="display:none;">
+      <thead><tr><th>Date</th><th>Days Away</th><th>Event</th><th>Source</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="legend" id="eventsEmpty">No flagged events in the lookahead window.</div>
+    <div class="row" style="margin-top:14px;">
+      <input type="text" id="newEventDate" placeholder="YYYY-MM-DD" style="width:120px;" />
+      <input type="text" id="newEventLabel" placeholder="Event label (e.g. Election result day)" style="width:260px;" />
+      <button class="secondary" id="addEventBtn">Add Event</button>
+    </div>
+    <div class="legend">
+      RBI MPC and US Fed (FOMC) dates are seeded from officially published calendars — re-verify at
+      rbi.org.in / federalreserve.gov since schedules can shift. Election result days and geopolitical
+      events aren't predictable in advance and are NOT auto-tracked — add them here yourself as they
+      become known, and they'll show as warnings when building new trades or on existing positions
+      whose expiry falls after the event.
+    </div>
+  </div>
+
 </div>
 
 <!-- Execute confirmation modal -->
@@ -275,12 +300,110 @@
   </div>
 </div>
 
+<!-- Close Position confirmation modal -->
+<div class="modal-overlay" id="closeModal">
+  <div class="modal">
+    <h3>Confirm position close / square-off</h3>
+    <div class="modal-warning">This reverses each leg (buy back what you sold, sell what you bought) at current market prices — real orders, real money. Review before confirming.</div>
+    <table style="width:100%; font-size:13px;">
+      <thead><tr><th>Leg</th><th>Qty</th><th id="closePriceHeader" style="display:none;">Price</th><th></th></tr></thead>
+      <tbody id="closeOrderLines"></tbody>
+    </table>
+    <div class="row" style="margin-top:14px;">
+      <label class="inline">Product
+        <select id="closeProduct"><option value="NRML">NRML (carry overnight)</option><option value="MIS">MIS (intraday)</option></select></label>
+      <label class="inline">Order type
+        <select id="closeOrderType"><option value="MARKET">MARKET</option><option value="LIMIT">LIMIT</option></select></label>
+    </div>
+    <div class="row" style="margin-top:16px;">
+      <button class="danger" id="closeConfirmBtn">Yes, close this position</button>
+      <button class="secondary" id="closeCancelBtn">Cancel</button>
+    </div>
+    <div id="closeResultBox" style="margin-top:14px;"></div>
+  </div>
+</div>
+
+<script>
+let closeOrders = [];
+let currentClosePositionId = null;
+
+async function openCloseModal(posId) {
+  currentClosePositionId = posId;
+  const loggedIn = await checkSession();
+  if (!loggedIn) { alert("Connect your Kite account first."); return; }
+  try {
+    const r = await apiFetch(`/api/execute/${posId}/close/preview`);
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    closeOrders = d.orders.map(o => ({...o}));
+    renderCloseOrderLines();
+    document.getElementById("closeResultBox").innerHTML = "";
+    document.getElementById("closeModal").classList.add("open");
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+function renderCloseOrderLines() {
+  const showPrice = document.getElementById("closeOrderType").value === "LIMIT";
+  document.getElementById("closePriceHeader").style.display = showPrice ? "table-cell" : "none";
+  const tbody = document.getElementById("closeOrderLines");
+  tbody.innerHTML = "";
+  closeOrders.forEach((o, idx) => {
+    const tr = document.createElement("tr");
+    const cls = o.transaction_type === "SELL" ? "sell" : "buy";
+    tr.innerHTML = `
+      <td class="${cls}">${o.transaction_type} ${o.tradingsymbol} <span style="color:var(--muted); font-size:11px;">(closes ${o.original_transaction_type})</span></td>
+      <td><input type="number" min="1" value="${o.quantity}" style="width:70px;" onchange="closeOrders[${idx}].quantity=this.value" /></td>
+      <td style="display:${showPrice ? 'table-cell' : 'none'};">
+        <input type="number" step="0.05" value="${o.price ?? ''}" style="width:80px;" onchange="closeOrders[${idx}].price=this.value" />
+      </td>
+      <td><button class="secondary small-btn" onclick="closeOrders.splice(${idx},1); renderCloseOrderLines();">Remove</button></td>`;
+    tbody.appendChild(tr);
+  });
+  if (!closeOrders.length) {
+    tbody.innerHTML = `<tr><td colspan="4" style="color:var(--red);">All legs removed — nothing would be placed.</td></tr>`;
+  }
+}
+
+document.getElementById("closeOrderType").onchange = renderCloseOrderLines;
+
+document.getElementById("closeCancelBtn").onclick = () => {
+  document.getElementById("closeModal").classList.remove("open");
+  currentClosePositionId = null;
+};
+
+document.getElementById("closeConfirmBtn").onclick = async () => {
+  if (!currentClosePositionId) return;
+  if (!closeOrders.length) { alert("No legs left to place."); return; }
+  const product = document.getElementById("closeProduct").value;
+  const orderType = document.getElementById("closeOrderType").value;
+  const resultBox = document.getElementById("closeResultBox");
+  resultBox.innerHTML = `<span class="loading">Placing close orders...</span>`;
+  try {
+    const r = await apiFetch(`/api/execute/${currentClosePositionId}/close/confirm`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirmed: true, product, order_type: orderType, orders: closeOrders})
+    });
+    const d = await r.json();
+    if (d.error) { resultBox.innerHTML = `<span style="color:var(--red);">${d.error}</span>`; return; }
+    let html = "";
+    d.results.forEach(res => {
+      const color = res.status === "placed" ? "var(--green)" : "var(--red)";
+      html += `<div style="color:${color}; font-size:13px; margin-bottom:4px;">${res.leg}: ${res.tradingsymbol} — ${res.status}${res.order_id ? " (order " + res.order_id + ")" : ""}${res.error ? " — " + res.error : ""}</div>`;
+    });
+    html += `<div style="margin-top:10px; font-size:13px; color:${d.fully_closed ? "var(--green)" : "var(--red)"};">${d.note}</div>`;
+    resultBox.innerHTML = html;
+    loadOrders();
+    loadWatchlist();
+  } catch (e) { resultBox.innerHTML = `<span style="color:var(--red);">Request failed: ${e}</span>`; }
+};
+</script>
+
 <script>
 let priceChartInstance = null;
 let currentExecPositionId = null;
 
 async function checkSession() {
-  const r = await fetch("/api/session-status");
+  const r = await apiFetch("/api/session-status");
   const d = await r.json();
   const el = document.getElementById("loginArea");
   if (d.logged_in) {
@@ -288,18 +411,40 @@ async function checkSession() {
   } else {
     el.innerHTML = `<button id="loginBtn">Connect Kite Account</button>`;
     document.getElementById("loginBtn").onclick = async () => {
-      const r2 = await fetch("/api/login-url");
+      const r2 = await apiFetch("/api/login-url");
       const d2 = await r2.json();
       window.location.href = d2.url;
     };
+    if (d.session_expired) {
+      el.innerHTML += ` <span class="pill bad">Session expired — please reconnect</span>`;
+    }
   }
   return d.logged_in;
 }
 
+// Detects a 401/session_expired response from ANY API call and immediately flips the header
+// back to "Connect Kite Account" instead of silently leaving a stale "Connected" pill showing
+// while every actual data call keeps failing behind the scenes.
+async function apiFetch(url, options) {
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    let data = {};
+    try { data = await res.clone().json(); } catch (e) {}
+    if (data.session_expired || data.error === "not_logged_in") {
+      checkSession();
+    }
+  }
+  return res;
+}
+
+// Proactively re-check every 2 minutes so the pill updates even if the person isn't actively
+// clicking anything (e.g. token expired overnight and they just left the tab open).
+setInterval(checkSession, 2 * 60 * 1000);
+
 document.getElementById("forceRefreshBtn").onclick = async () => {
   const loggedIn = await checkSession();
   if (!loggedIn) return;
-  await fetch("/api/refresh-data", {method: "POST"});
+  await apiFetch("/api/refresh-data", {method: "POST"});
   alert("Instrument cache cleared. Re-run the screener to pull fresh data from the market.");
 };
 
@@ -314,7 +459,7 @@ document.getElementById("runScreenerBtn").onclick = async () => {
   if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
   status.textContent = "Scanning F&O universe — this can take 20-40s...";
   try {
-    const r = await fetch("/api/screener?limit=25");
+    const r = await apiFetch("/api/screener?limit=25");
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     const tbody = document.querySelector("#screenerTable tbody");
@@ -358,7 +503,7 @@ document.getElementById("loadExpiriesBtn").onclick = async () => {
   const loggedIn = await checkSession();
   if (!loggedIn) return;
   try {
-    const r = await fetch(`/api/expiries/${sym}`);
+    const r = await apiFetch(`/api/expiries/${sym}`);
     const d = await r.json();
     if (d.error) { alert(d.error); return; }
     const sel = document.getElementById("expirySelect");
@@ -377,7 +522,7 @@ document.getElementById("loadChainExpiriesBtn").onclick = async () => {
   const loggedIn = await checkSession();
   if (!loggedIn) return;
   try {
-    const r = await fetch(`/api/expiries/${sym}`);
+    const r = await apiFetch(`/api/expiries/${sym}`);
     const d = await r.json();
     if (d.error) { alert(d.error); return; }
     const sel = document.getElementById("chainExpirySelect");
@@ -409,7 +554,7 @@ document.getElementById("buildBtn").onclick = async () => {
       target_delta: targetDelta, wing_width_pct: wingWidthPct, strategy_type: currentStrategyType, lots
     });
     if (expiry) params.append("expiry", expiry);
-    const r = await fetch(`/api/strategy/${sym}?${params}`);
+    const r = await apiFetch(`/api/strategy/${sym}?${params}`);
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; document.getElementById("strategyBox").style.display="none"; return; }
     status.textContent = "";
@@ -449,6 +594,8 @@ document.getElementById("buildBtn").onclick = async () => {
     if (d.available_call_strikes_above_short) noteText += ` | Nearby call strikes: ${d.available_call_strikes_above_short.join(", ")}`;
     if (d.available_put_strikes_below_short) noteText += ` | Nearby put strikes: ${d.available_put_strikes_below_short.join(", ")}`;
     if (d.margin_error) noteText += ` | Margin lookup failed: ${d.margin_error}`;
+    if (d.entry_event_warning) noteText += ` ⚠ ${d.entry_event_warning}`;
+    if (d.event_before_expiry) noteText += ` | Note: ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before this expiry.`;
     document.getElementById("s_note").textContent = noteText;
   } catch (e) { status.textContent = "Request failed: " + e; }
 };
@@ -463,7 +610,7 @@ document.getElementById("trackBtn").onclick = async () => {
   const lots = document.getElementById("lotsInput").value || 1;
   const expiry = document.getElementById("expirySelect").value || null;
   try {
-    const r = await fetch("/api/watchlist/add", {
+    const r = await apiFetch("/api/watchlist/add", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({symbol: sym, target_delta: targetDelta, wing_width_pct: wingWidthPct,
                              strategy_type: currentStrategyType, lots, expiry})
@@ -488,7 +635,7 @@ document.getElementById("quickTradeBtn").onclick = async () => {
   const lots = document.getElementById("lotsInput").value || 1;
   const expiry = document.getElementById("expirySelect").value || null;
   try {
-    const r = await fetch("/api/watchlist/add", {
+    const r = await apiFetch("/api/watchlist/add", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({symbol: sym, target_delta: targetDelta, wing_width_pct: wingWidthPct,
                              strategy_type: currentStrategyType, lots, expiry})
@@ -512,7 +659,7 @@ document.getElementById("chainBtn").onclick = async () => {
   try {
     const params = new URLSearchParams();
     if (expiry) params.append("expiry", expiry);
-    const r = await fetch(`/api/optionchain/${sym}?${params}`);
+    const r = await apiFetch(`/api/optionchain/${sym}?${params}`);
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     document.getElementById("chainMeta").textContent = `${d.symbol} · Spot ₹${d.spot} · Expiry ${d.expiry} · Lot size ${d.lot_size}`;
@@ -548,7 +695,7 @@ async function loadWatchlist() {
   if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
   status.textContent = "Refreshing against today's market data...";
   try {
-    const r = await fetch("/api/watchlist");
+    const r = await apiFetch("/api/watchlist");
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     const tbody = document.querySelector("#watchlistTable tbody");
@@ -577,6 +724,15 @@ async function loadWatchlist() {
       }
       const pnlClass = p.current.pnl >= 0 ? "pnl-pos" : "pnl-neg";
       const detailId = `legdetail_${p.id}`;
+      let zoneCell = zonePill(p.current.zone);
+      if (p.current.exit_suggested) {
+        const reasonsAttr = (p.current.exit_reasons || []).join(" ").replace(/"/g, "&quot;");
+        zoneCell += ` <span class="pill bad" title="${reasonsAttr}">Exit suggested</span>`;
+      }
+      if (p.current.event_before_expiry) {
+        const ev = p.current.event_before_expiry;
+        zoneCell += ` <span class="pill warn" title="${ev.label} on ${ev.date}">Event in ${ev.days_away}d</span>`;
+      }
       tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot}</td><td>${p.current.spot}</td>
                       <td>${p.current.days_left}</td>
                       <td>₹${p.current.current_position_value}</td>
@@ -584,10 +740,11 @@ async function loadWatchlist() {
                       <td>${p.current.probability_of_success_pct ?? "-"}%</td>
                       <td>${maxLossDisplay}</td>
                       <td>${marginDisplay}</td>
-                      <td>${zonePill(p.current.zone)}</td>
+                      <td>${zoneCell}</td>
                       <td>
                         <button class="secondary small-btn" onclick="toggleLegDetail('${detailId}')">Prices</button>
                         <button class="small-btn" onclick="openExecuteModal('${p.id}')">Execute</button>
+                        <button class="danger small-btn" onclick="openCloseModal('${p.id}')">Close Position</button>
                         <button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button>
                       </td>`;
       tbody.appendChild(tr);
@@ -601,10 +758,13 @@ async function loadWatchlist() {
         const lg = p.current.legs_current && p.current.legs_current[k];
         if (!lg) return;
         const legPnlClass = lg.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+        const deltaLine = lg.current_delta !== undefined
+          ? `<div style="color:var(--muted); font-size:11px;">Current delta: ${lg.current_delta}</div>` : "";
         legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px;">
                       <div style="color:var(--muted); font-size:11px;">${legLabels[k]} (strike ${lg.strike})</div>
                       <div style="font-size:13px;">Entry ₹${lg.entry_price} → Now ₹${lg.current_price}</div>
                       <div class="${legPnlClass}" style="font-size:13px;">P&amp;L ₹${lg.pnl}</div>
+                      ${deltaLine}
                     </div>`;
       });
       legHtml += `</div></td>`;
@@ -617,7 +777,7 @@ async function loadWatchlist() {
 }
 
 async function removePosition(id) {
-  await fetch(`/api/watchlist/${id}`, {method: "DELETE"});
+  await apiFetch(`/api/watchlist/${id}`, {method: "DELETE"});
   loadWatchlist();
 }
 
@@ -636,7 +796,7 @@ async function openExecuteModal(posId) {
   const loggedIn = await checkSession();
   if (!loggedIn) { alert("Connect your Kite account first."); return; }
   try {
-    const r = await fetch(`/api/execute/${posId}/preview`);
+    const r = await apiFetch(`/api/execute/${posId}/preview`);
     const d = await r.json();
     if (d.error) { alert("Error: " + d.error); return; }
     execOrders = d.orders.map(o => ({...o, price: o.reference_price}));
@@ -692,7 +852,7 @@ document.getElementById("execConfirmBtn").onclick = async () => {
   const resultBox = document.getElementById("execResultBox");
   resultBox.innerHTML = `<span class="loading">Placing orders...</span>`;
   try {
-    const r = await fetch(`/api/execute/${currentExecPositionId}/confirm`, {
+    const r = await apiFetch(`/api/execute/${currentExecPositionId}/confirm`, {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({confirmed: true, product, order_type: orderType, orders: execOrders})
     });
@@ -716,7 +876,7 @@ async function loadOrders() {
   if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
   status.textContent = "Loading orders...";
   try {
-    const r = await fetch("/api/orders");
+    const r = await apiFetch("/api/orders");
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     const tbody = document.querySelector("#ordersTable tbody");
@@ -746,7 +906,7 @@ async function loadOrders() {
 
 async function cancelOrder(orderId) {
   if (!confirm("Cancel this order?")) return;
-  const r = await fetch(`/api/orders/${orderId}/cancel`, {method: "POST"});
+  const r = await apiFetch(`/api/orders/${orderId}/cancel`, {method: "POST"});
   const d = await r.json();
   if (d.error) alert("Error: " + d.error);
   loadOrders();
@@ -759,7 +919,7 @@ async function modifyOrderPrompt(orderId) {
   if (newPrice) body.price = newPrice;
   if (newQty) body.quantity = newQty;
   if (!Object.keys(body).length) return;
-  const r = await fetch(`/api/orders/${orderId}/modify`, {
+  const r = await apiFetch(`/api/orders/${orderId}/modify`, {
     method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
   });
   const d = await r.json();
@@ -780,14 +940,14 @@ document.getElementById("chartBtn").onclick = async () => {
   const interval = document.getElementById("chartInterval").value;
   const days = document.getElementById("chartDays").value || 60;
   try {
-    const r = await fetch(`/api/chart/${sym}?interval=${interval}&days=${days}`);
+    const r = await apiFetch(`/api/chart/${sym}?interval=${interval}&days=${days}`);
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     if (!d.candles.length) { status.textContent = "No candle data returned for this range."; return; }
 
     let upper = null, lower = null;
     try {
-      const wr = await fetch("/api/watchlist");
+      const wr = await apiFetch("/api/watchlist");
       const wd = await wr.json();
       const matches = (wd.positions || []).filter(p => p.symbol === sym && !p.mtm_error);
       if (matches.length) {
@@ -838,7 +998,7 @@ document.getElementById("newsBtn").onclick = async () => {
   if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
   status.textContent = "Fetching headlines...";
   try {
-    const r = await fetch(`/api/news/${sym}`);
+    const r = await apiFetch(`/api/news/${sym}`);
     const d = await r.json();
     const box = document.getElementById("newsBox");
     box.innerHTML = "";
@@ -854,9 +1014,65 @@ document.getElementById("newsBtn").onclick = async () => {
   } catch (e) { status.textContent = "Request failed: " + e; }
 };
 
+// ---------- Event calendar ----------
+async function loadEvents() {
+  const status = document.getElementById("eventsStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
+  status.textContent = "Loading calendar...";
+  try {
+    const r = await apiFetch("/api/event-calendar?days=90");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    const tbody = document.querySelector("#eventsTable tbody");
+    tbody.innerHTML = "";
+    if (!d.events.length) {
+      document.getElementById("eventsTable").style.display = "none";
+      document.getElementById("eventsEmpty").style.display = "block";
+      status.textContent = "";
+      return;
+    }
+    document.getElementById("eventsEmpty").style.display = "none";
+    d.events.forEach(e => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${e.date}</td><td>${e.days_away}</td><td>${e.label}</td><td>${e.source}</td>
+                      <td><button class="secondary small-btn" onclick="deleteEvent(${e.index})">Delete</button></td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById("eventsTable").style.display = "table";
+    status.textContent = "";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+
+document.getElementById("addEventBtn").onclick = async () => {
+  const date = document.getElementById("newEventDate").value.trim();
+  const label = document.getElementById("newEventLabel").value.trim() || "Custom event";
+  if (!date) { alert("Enter a date in YYYY-MM-DD format."); return; }
+  try {
+    const r = await apiFetch("/api/event-calendar/add", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({date, label, type: "custom"})
+    });
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    document.getElementById("newEventDate").value = "";
+    document.getElementById("newEventLabel").value = "";
+    loadEvents();
+  } catch (e) { alert("Request failed: " + e); }
+};
+
+async function deleteEvent(index) {
+  if (!confirm("Remove this event from the calendar?")) return;
+  await apiFetch(`/api/event-calendar/${index}`, {method: "DELETE"});
+  loadEvents();
+}
+
+document.getElementById("refreshEventsBtn").onclick = loadEvents;
+
 checkSession();
 loadWatchlist();
 loadOrders();
+loadEvents();
 </script>
 </body>
 </html>
