@@ -38,6 +38,8 @@
   .pnl-neg { color: var(--red); font-weight:600; }
   .chart-wrap { position:relative; height:280px; margin-top:10px; }
   .small-btn { padding:5px 10px; font-size:12px; }
+  .action-cell { display:flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:280px; }
+  .action-cell button { white-space:nowrap; }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .track-row { display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap: wrap; }
   .legend { color:var(--muted); font-size:12px; margin-top:10px; line-height:1.5; }
@@ -148,6 +150,7 @@
         <div class="metric profit"><div class="k">Max Profit</div><div class="v" id="m_profit"></div></div>
         <div class="metric loss"><div class="k">Max Loss</div><div class="v" id="m_loss"></div></div>
         <div class="metric"><div class="k">Margin / Investment Required</div><div class="v" id="m_margin"></div></div>
+        <div class="metric profit"><div class="k">Net Profit After Est. Entry Charges</div><div class="v" id="m_net_profit"></div></div>
         <div class="metric"><div class="k">Breakeven Range</div><div class="v" id="m_be"></div></div>
       </div>
 
@@ -201,7 +204,7 @@
     <table id="watchlistTable" style="display:none;">
       <thead>
         <tr><th>Symbol</th><th>Type</th><th>Qty</th><th>Entry Spot</th><th>Current Spot</th><th>Days Left</th>
-            <th>Position Value</th><th>P&amp;L</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
+            <th>Position Value</th><th>P&amp;L</th><th>Net P&amp;L (after charges)</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -407,7 +410,11 @@ async function checkSession() {
   const d = await r.json();
   const el = document.getElementById("loginArea");
   if (d.logged_in) {
-    el.innerHTML = `<span class="pill ok">Connected to Kite</span>`;
+    el.innerHTML = `<span class="pill ok">Connected to Kite</span> <button class="secondary small-btn" id="logoutBtn">Log out</button>`;
+    document.getElementById("logoutBtn").onclick = async () => {
+      await apiFetch("/api/logout", {method: "POST"});
+      checkSession();
+    };
   } else {
     el.innerHTML = `<button id="loginBtn">Connect Kite Account</button>`;
     document.getElementById("loginBtn").onclick = async () => {
@@ -589,11 +596,14 @@ document.getElementById("buildBtn").onclick = async () => {
     document.getElementById("m_loss").textContent = d.max_loss === null ? "Unlimited" : "₹" + d.max_loss;
     document.getElementById("m_margin").textContent = d.margin_required !== null && d.margin_required !== undefined
       ? "₹" + d.margin_required : (d.margin_error ? "Unavailable" : "—");
+    document.getElementById("m_net_profit").textContent = d.net_profit_after_entry_charges !== null
+      ? "₹" + d.net_profit_after_entry_charges : "—";
     document.getElementById("m_be").textContent = `${d.breakeven_lower} — ${d.breakeven_upper}`;
     let noteText = d.note;
     if (d.available_call_strikes_above_short) noteText += ` | Nearby call strikes: ${d.available_call_strikes_above_short.join(", ")}`;
     if (d.available_put_strikes_below_short) noteText += ` | Nearby put strikes: ${d.available_put_strikes_below_short.join(", ")}`;
     if (d.margin_error) noteText += ` | Margin lookup failed: ${d.margin_error}`;
+    if (d.estimated_entry_charges) noteText += ` | Est. entry charges: ₹${d.estimated_entry_charges.total} (brokerage ₹${d.estimated_entry_charges.brokerage}, STT ₹${d.estimated_entry_charges.stt}, exchange+SEBI+GST ₹${(d.estimated_entry_charges.exchange_txn_charges + d.estimated_entry_charges.sebi_fee + d.estimated_entry_charges.gst).toFixed(2)}, stamp duty ₹${d.estimated_entry_charges.stamp_duty}) — entry side only, exit charges apply too if closed before expiry.`;
     if (d.entry_event_warning) noteText += ` ⚠ ${d.entry_event_warning}`;
     if (d.event_before_expiry) noteText += ` | Note: ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before this expiry.`;
     document.getElementById("s_note").textContent = noteText;
@@ -716,7 +726,7 @@ async function loadWatchlist() {
       const qty = p.quantity || p.lot_size;
       if (p.mtm_error) {
         tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot ?? "-"}</td>
-                        <td colspan="5" style="color:var(--red);">${p.mtm_error}</td>
+                        <td colspan="6" style="color:var(--red);">${p.mtm_error}</td>
                         <td>${maxLossDisplay}</td><td>${marginDisplay}</td><td><span class="pill warn">Error</span></td>
                         <td><button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button></td>`;
         tbody.appendChild(tr);
@@ -733,19 +743,23 @@ async function loadWatchlist() {
         const ev = p.current.event_before_expiry;
         zoneCell += ` <span class="pill warn" title="${ev.label} on ${ev.date}">Event in ${ev.days_away}d</span>`;
       }
+      const netPnlClass = p.current.net_pnl_after_charges >= 0 ? "pnl-pos" : "pnl-neg";
       tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot}</td><td>${p.current.spot}</td>
                       <td>${p.current.days_left}</td>
                       <td>₹${p.current.current_position_value}</td>
                       <td class="${pnlClass}">₹${p.current.pnl}</td>
+                      <td class="${netPnlClass}" title="Round-trip est. charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
                       <td>${p.current.probability_of_success_pct ?? "-"}%</td>
                       <td>${maxLossDisplay}</td>
                       <td>${marginDisplay}</td>
                       <td>${zoneCell}</td>
                       <td>
-                        <button class="secondary small-btn" onclick="toggleLegDetail('${detailId}')">Prices</button>
-                        <button class="small-btn" onclick="openExecuteModal('${p.id}')">Execute</button>
-                        <button class="danger small-btn" onclick="openCloseModal('${p.id}')">Close Position</button>
-                        <button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button>
+                        <div class="action-cell">
+                          <button class="secondary small-btn" onclick="toggleLegDetail('${detailId}')">Prices</button>
+                          <button class="small-btn" onclick="openExecuteModal('${p.id}')">Execute</button>
+                          <button class="danger small-btn" onclick="openCloseModal('${p.id}')">Close</button>
+                          <button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button>
+                        </div>
                       </td>`;
       tbody.appendChild(tr);
 
@@ -753,7 +767,7 @@ async function loadWatchlist() {
       detailTr.id = detailId;
       detailTr.style.display = "none";
       const legLabels = {sell_call: "Sell Call", buy_call: "Buy Call", sell_put: "Sell Put", buy_put: "Buy Put"};
-      let legHtml = `<td colspan="13"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
+      let legHtml = `<td colspan="14"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
       Object.keys(legLabels).forEach(k => {
         const lg = p.current.legs_current && p.current.legs_current[k];
         if (!lg) return;
