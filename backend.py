@@ -39,6 +39,7 @@ from flask import Flask, request, jsonify, send_from_directory, redirect
 
 try:
     from kiteconnect import KiteConnect
+    from kiteconnect.exceptions import TokenException
 except ImportError:
     raise SystemExit("Missing dependency. Run: pip install kiteconnect flask numpy requests")
 
@@ -47,10 +48,13 @@ import requests
 
 # ---------------------------------------------------------------------------
 # CONFIG — fill these in from https://developers.kite.trade (your app)
+# SECURITY: set these as real environment variables (or a .env file loaded before
+# this process starts) — do NOT hardcode real keys/secrets directly in this file,
+# especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "b4j9bna5hdew1hh4")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mbrdjydzd9ckisvrp4tsqbtkkgojpzue")
-REDIRECT_URL = "https://algo.wecon.in/api/callback"   # set this exact URL in your Kite app settings
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -64,6 +68,24 @@ MIN_DAYS_TO_EXPIRY = 7
 DEFAULT_TARGET_DELTA = 0.18
 DEFAULT_WING_WIDTH_PCT = 0.05
 CHAIN_STRIKE_RANGE_PCT = 0.25
+
+# --- Exit / stop-loss suggestion rule (informational only — this tool never auto-exits) ---
+# Trigger a suggested-exit flag when EITHER condition is met, whichever occurs first:
+#   1) total position loss reaches this multiple of the premium originally received, or
+#   2) either short leg's delta magnitude rises to at least this threshold.
+STOP_LOSS_PREMIUM_MULTIPLE = 2.0
+STOP_LOSS_DELTA_THRESHOLD = 0.35
+
+# --- Event calendar (informational only) ---
+# A hand-maintained list of known macro event dates that commonly move markets, used to warn
+# against opening NEW positions right around them, and to flag existing positions that run into
+# one before expiry. RBI MPC and FOMC dates below were sourced from RBI/Federal Reserve published
+# calendars — always re-verify at rbi.org.in and federalreserve.gov since schedules can shift.
+# Election result days and geopolitical events are NOT reliably predictable in advance and are not
+# auto-populated — add them yourself via POST /api/event-calendar/add as they become known.
+EVENT_CALENDAR_FILE = os.path.join(os.path.dirname(__file__), "event_calendar.json")
+ENTRY_WARNING_WINDOW_DAYS = 2   # warn on new entries if an event falls within this many days
+TRADE_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "trade_history.json")
 
 # Index symbols you can type directly (in addition to any F&O stock) — maps to the exact
 # Kite quote key Kite uses for that index's live spot price.
@@ -106,6 +128,126 @@ def find_position(pos_id):
         if p["id"] == pos_id:
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# Event calendar (informational, hand-maintained)
+# ---------------------------------------------------------------------------
+def load_event_calendar():
+    if not os.path.exists(EVENT_CALENDAR_FILE):
+        return []
+    try:
+        with open(EVENT_CALENDAR_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_event_calendar(events):
+    with open(EVENT_CALENDAR_FILE, "w") as f:
+        json.dump(events, f, indent=2)
+
+
+def seed_event_calendar_if_missing():
+    """Seeds a starter calendar the first time this runs. Sourced from officially published
+    RBI and US Federal Reserve calendars as of this writing — verify/update at rbi.org.in and
+    federalreserve.gov, since meeting schedules can shift and this list isn't auto-refreshed."""
+    if os.path.exists(EVENT_CALENDAR_FILE):
+        return
+    events = [
+        # RBI Monetary Policy Committee — FY 2026-27 schedule (published by RBI)
+        {"date": "2026-08-05", "label": "RBI MPC Policy Announcement", "type": "rbi_policy", "source": "RBI FY26-27 calendar"},
+        {"date": "2026-10-07", "label": "RBI MPC Policy Announcement", "type": "rbi_policy", "source": "RBI FY26-27 calendar"},
+        {"date": "2026-12-04", "label": "RBI MPC Policy Announcement", "type": "rbi_policy", "source": "RBI FY26-27 calendar"},
+        # US Federal Reserve FOMC — 2026 schedule (decision announced on 2nd day, ~2pm ET)
+        {"date": "2026-07-29", "label": "FOMC Rate Decision", "type": "fed_policy", "source": "federalreserve.gov 2026 calendar"},
+        {"date": "2026-09-16", "label": "FOMC Rate Decision", "type": "fed_policy", "source": "federalreserve.gov 2026 calendar"},
+        {"date": "2026-10-28", "label": "FOMC Rate Decision", "type": "fed_policy", "source": "federalreserve.gov 2026 calendar"},
+        {"date": "2026-12-09", "label": "FOMC Rate Decision", "type": "fed_policy", "source": "federalreserve.gov 2026 calendar"},
+        # Union Budget — fixed Feb 1 convention in India since 2017
+        {"date": "2027-02-01", "label": "Union Budget Day", "type": "budget", "source": "fixed annual convention"},
+    ]
+    save_event_calendar(events)
+
+
+def get_upcoming_events(days_ahead=45):
+    events = load_event_calendar()
+    today = datetime.now().date()
+    upcoming = []
+    for idx, e in enumerate(events):
+        try:
+            d = datetime.strptime(e["date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        days_away = (d - today).days
+        if 0 <= days_away <= days_ahead:
+            upcoming.append({**e, "days_away": days_away, "index": idx})
+    upcoming.sort(key=lambda e: e["days_away"])
+    return upcoming
+
+
+def get_entry_warning():
+    """Checks for any flagged event within ENTRY_WARNING_WINDOW_DAYS — used to warn (not block)
+    against opening a brand-new position right around a known macro event."""
+    near = [e for e in get_upcoming_events(days_ahead=ENTRY_WARNING_WINDOW_DAYS)]
+    if not near:
+        return None
+    labels = ", ".join(f"{e['label']} ({e['date']})" for e in near)
+    return (f"Heads up: {labels} within the next {ENTRY_WARNING_WINDOW_DAYS} days. Many traders avoid "
+            f"opening new option-selling positions right around major policy/event days due to volatility risk. "
+            f"This is informational only — the tool does not block the trade.")
+
+
+def get_event_before_expiry(expiry_str):
+    """For an existing tracked position — any flagged event between today and its expiry."""
+    try:
+        expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    today = datetime.now().date()
+    days_to_expiry = max((expiry_date - today).days, 0)
+    events = get_upcoming_events(days_ahead=days_to_expiry)
+    return events[0] if events else None
+
+
+# ---------------------------------------------------------------------------
+# Trade history (archived on full close)
+# ---------------------------------------------------------------------------
+def load_trade_history():
+    if not os.path.exists(TRADE_HISTORY_FILE):
+        return []
+    try:
+        with open(TRADE_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_trade_history(history):
+    with open(TRADE_HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2, default=str)
+
+
+def archive_closed_position(position, close_results):
+    history = load_trade_history()
+    est_realized_pnl = sum(
+        r.get("estimated_realized_pnl", 0) for r in close_results if r["status"] == "placed"
+    )
+    history.append({
+        "id": position["id"], "symbol": position["symbol"], "strategy_type": position.get("strategy_type"),
+        "added_on": position.get("added_on"), "closed_on": datetime.now().date().isoformat(),
+        "entry_max_profit": position.get("entry_max_profit"), "entry_max_loss": position.get("entry_max_loss"),
+        "estimated_realized_pnl": round(est_realized_pnl, 2),
+        "close_orders": close_results,
+        "note": "estimated_realized_pnl is based on quoted prices at close time, not confirmed fill "
+                "prices — check your Zerodha contract note for the exact realized P&L.",
+    })
+    save_trade_history(history)
+
+
+# Seed the event calendar once at import time — works whether launched via
+# `python backend.py` directly or imported by Gunicorn (`gunicorn backend:app`).
+seed_event_calendar_if_missing()
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +364,24 @@ def callback():
 
 @app.route("/api/session-status")
 def session_status():
-    return jsonify({"logged_in": SESSION["access_token"] is not None,
-                     "logged_in_at": SESSION["logged_in_at"]})
+    """Actively validates the token (not just checks it's present) so a stale/expired token
+    can't keep showing 'Connected' after it's no longer valid — this is the fix for the tool
+    showing 'connected' even when Zerodha has actually invalidated the session."""
+    if not SESSION["access_token"]:
+        return jsonify({"logged_in": False, "logged_in_at": None})
+    try:
+        kite.set_access_token(SESSION["access_token"])
+        kite.profile()  # cheap call just to confirm the token still actually works
+        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"]})
+    except TokenException:
+        SESSION["access_token"] = None
+        SESSION["logged_in_at"] = None
+        return jsonify({"logged_in": False, "logged_in_at": None, "session_expired": True})
+    except Exception:
+        # network hiccup or similar — don't log the user out for a transient error,
+        # just report what we last knew
+        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"],
+                         "warning": "Could not verify token freshness right now (network issue?)."})
 
 
 def require_session():
@@ -231,6 +389,18 @@ def require_session():
         return False
     kite.set_access_token(SESSION["access_token"])
     return True
+
+
+@app.errorhandler(TokenException)
+def handle_token_exception(e):
+    """Catches an expired/invalid token from ANY route (whichever endpoint happened to hit
+    Zerodha with a stale token), clears the stored session, and tells the frontend to show the
+    login button again — instead of a generic 500 error or a UI that silently keeps showing
+    'Connected' while every data call quietly fails."""
+    SESSION["access_token"] = None
+    SESSION["logged_in_at"] = None
+    return jsonify({"error": "session_expired", "session_expired": True,
+                     "message": "Your Zerodha session has expired. Please reconnect."}), 401
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +434,51 @@ def refresh_data():
     SCREENER_CACHE["results"] = None
     SCREENER_CACHE["fetched_at"] = None
     return jsonify({"ok": True, "message": "Instrument cache cleared. Re-run the screener to refresh rankings."})
+
+
+# ---------------------------------------------------------------------------
+# Event calendar — avoid-new-entry warnings and existing-position event flags
+# ---------------------------------------------------------------------------
+@app.route("/api/event-calendar")
+def event_calendar_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    days_ahead = int(request.args.get("days", 45))
+    events = get_upcoming_events(days_ahead)
+    return jsonify({"events": events,
+                     "note": "Hand-maintained calendar (RBI/Fed dates from published sources — re-verify at "
+                             "rbi.org.in and federalreserve.gov). Election result days and geopolitical events "
+                             "are not predictable in advance and are not auto-tracked — add them yourself below "
+                             "as they become known."})
+
+
+@app.route("/api/event-calendar/add", methods=["POST"])
+def event_calendar_add():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    date_str = body.get("date")
+    if not date_str:
+        return jsonify({"error": "date is required (YYYY-MM-DD)"}), 400
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "Invalid date format, expected YYYY-MM-DD"}), 400
+    events = load_event_calendar()
+    events.append({"date": date_str, "label": body.get("label", "Custom event"),
+                    "type": body.get("type", "custom"), "source": "user-added"})
+    save_event_calendar(events)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/event-calendar/<int:index>", methods=["DELETE"])
+def event_calendar_delete(index):
+    events = load_event_calendar()
+    if 0 <= index < len(events):
+        events.pop(index)
+        save_event_calendar(events)
+        return jsonify({"ok": True})
+    return jsonify({"error": "Invalid event index"}), 400
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +765,8 @@ def build_strategy(symbol, target_delta=DEFAULT_TARGET_DELTA, wing_width_pct=DEF
     margin_required, margin_error = compute_margin(legs_for_margin, quantity)
     result["margin_required"] = margin_required
     result["margin_error"] = margin_error
+    result["entry_event_warning"] = get_entry_warning()
+    result["event_before_expiry"] = get_event_before_expiry(result["expiry"])
     return result
 
 
@@ -670,6 +887,7 @@ def mark_to_market(position):
         zone = "near_expiry"
 
     probability_of_success = None
+    delta_call = delta_put = None
     if days_left > 0:
         call_strike = position["legs"]["sell_call"]["strike"]
         put_strike = position["legs"]["sell_put"]["strike"]
@@ -682,6 +900,27 @@ def mark_to_market(position):
         probability_of_success = round(max(0.0, 1 - prob_call_itm - prob_put_itm) * 100, 1)
     else:
         probability_of_success = 100.0 if zone == "safe" else 0.0
+
+    # --- Stop-loss / exit suggestion (informational only — never auto-exits) ---
+    # Trigger on whichever occurs first: total loss reaches N x premium received, or
+    # either short leg's delta magnitude has risen to the threshold. Checking delta rather
+    # than only waiting for the theoretical max loss catches a position going wrong earlier.
+    exit_suggested, exit_reasons = False, []
+    entry_premium_total = abs(position["entry_net_credit_per_share"] * quantity)
+    if entry_premium_total and pnl <= -STOP_LOSS_PREMIUM_MULTIPLE * entry_premium_total:
+        exit_suggested = True
+        exit_reasons.append(f"Loss (₹{abs(pnl)}) has reached {STOP_LOSS_PREMIUM_MULTIPLE}x the premium "
+                             f"received (₹{entry_premium_total}).")
+    if delta_call is not None and abs(delta_call) >= STOP_LOSS_DELTA_THRESHOLD:
+        exit_suggested = True
+        exit_reasons.append(f"Short call delta has risen to {round(delta_call, 3)} "
+                             f"(≥{STOP_LOSS_DELTA_THRESHOLD} threshold) — that side is losing its 'safety margin'.")
+    if delta_put is not None and abs(delta_put) >= STOP_LOSS_DELTA_THRESHOLD:
+        exit_suggested = True
+        exit_reasons.append(f"Short put delta has risen to {round(delta_put, 3)} "
+                             f"(≥{STOP_LOSS_DELTA_THRESHOLD} threshold) — that side is losing its 'safety margin'.")
+
+    event_flag = get_event_before_expiry(position["expiry"])
 
     leg_details = {}
     for k in leg_keys:
@@ -696,12 +935,18 @@ def mark_to_market(position):
             "entry_price": entry_price, "current_price": round(current_price, 2),
             "pnl": round(per_share * quantity, 2)
         }
+        if k == "sell_call" and delta_call is not None:
+            leg_details[k]["current_delta"] = round(delta_call, 3)
+        if k == "sell_put" and delta_put is not None:
+            leg_details[k]["current_delta"] = round(delta_put, 3)
 
     return {
         "spot": spot, "pnl": pnl, "current_debit_per_share": round(current_debit_per_share, 2),
         "current_position_value": current_position_value, "legs_current": leg_details,
         "days_left": days_left, "zone": zone, "probability_of_success_pct": probability_of_success,
-        "pct_of_max_profit": round((pnl / position["entry_max_profit"] * 100), 1) if position["entry_max_profit"] else None
+        "pct_of_max_profit": round((pnl / position["entry_max_profit"] * 100), 1) if position["entry_max_profit"] else None,
+        "exit_suggested": exit_suggested, "exit_reasons": exit_reasons,
+        "event_before_expiry": event_flag,
     }
 
 
@@ -733,6 +978,38 @@ def watchlist():
 def leg_keys_for(position):
     return ["sell_call", "buy_call", "sell_put", "buy_put"] if position.get("strategy_type") == "iron_condor" \
         else ["sell_call", "sell_put"]
+
+
+def place_basket_orders(legs_to_place, product, order_type):
+    """Places each leg as a separate real order. Stops immediately on the first failure rather
+    than continuing — continuing could leave a partial, unintentionally unhedged position."""
+    results = []
+    for item in legs_to_place:
+        txn_type = kite.TRANSACTION_TYPE_SELL if item["transaction_type"] == "SELL" else kite.TRANSACTION_TYPE_BUY
+        quantity = int(item.get("quantity") or 1)
+        reference_price = item.get("price")
+        try:
+            kwargs = dict(
+                variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NFO,
+                tradingsymbol=item["tradingsymbol"], transaction_type=txn_type,
+                quantity=quantity, product=getattr(kite, f"PRODUCT_{product}"),
+                order_type=getattr(kite, f"ORDER_TYPE_{order_type}"),
+                validity=kite.VALIDITY_DAY,
+            )
+            if order_type == "LIMIT" and reference_price:
+                kwargs["price"] = float(reference_price)
+            order_id = kite.place_order(**kwargs)
+            results.append({"leg": item.get("leg", "?"), "tradingsymbol": item["tradingsymbol"],
+                             "transaction_type": item["transaction_type"], "quantity": quantity,
+                             "status": "placed", "order_id": order_id,
+                             "estimated_realized_pnl": 0,  # filled in by caller if this is a closing trade
+                             "reference_price": reference_price})
+        except Exception as e:
+            results.append({"leg": item.get("leg", "?"), "tradingsymbol": item["tradingsymbol"],
+                             "transaction_type": item["transaction_type"], "quantity": quantity,
+                             "status": "failed", "error": str(e)})
+            break
+    return results
 
 
 @app.route("/api/execute/<pos_id>/preview")
@@ -794,31 +1071,7 @@ def execute_confirm(pos_id):
     if not legs_to_place:
         return jsonify({"error": "No legs left to place — every leg was removed in the review screen."}), 400
 
-    results = []
-    for item in legs_to_place:
-        txn_type = kite.TRANSACTION_TYPE_SELL if item["transaction_type"] == "SELL" else kite.TRANSACTION_TYPE_BUY
-        quantity = int(item.get("quantity") or 1)
-        try:
-            kwargs = dict(
-                variety=kite.VARIETY_REGULAR, exchange=kite.EXCHANGE_NFO,
-                tradingsymbol=item["tradingsymbol"], transaction_type=txn_type,
-                quantity=quantity, product=getattr(kite, f"PRODUCT_{product}"),
-                order_type=getattr(kite, f"ORDER_TYPE_{order_type}"),
-                validity=kite.VALIDITY_DAY,
-            )
-            if order_type == "LIMIT" and item.get("price"):
-                kwargs["price"] = float(item["price"])
-            order_id = kite.place_order(**kwargs)
-            results.append({"leg": item.get("leg", "?"), "tradingsymbol": item["tradingsymbol"],
-                             "transaction_type": item["transaction_type"], "quantity": quantity,
-                             "status": "placed", "order_id": order_id})
-        except Exception as e:
-            results.append({"leg": item.get("leg", "?"), "tradingsymbol": item["tradingsymbol"],
-                             "transaction_type": item["transaction_type"], "quantity": quantity,
-                             "status": "failed", "error": str(e)})
-            # Stop immediately on first failure — continuing could leave you with a partial,
-            # unhedged position. Better to stop and let you check/complete manually.
-            break
+    results = place_basket_orders(legs_to_place, product, order_type)
 
     positions = load_positions()
     for p in positions:
@@ -841,6 +1094,113 @@ def execute_confirm(pos_id):
                  "All legs failed — nothing was placed." if any_failed and placed_count == 0 else
                  f"All {placed_count}/{total_legs} legs placed successfully. Verify fills in your Zerodha app.")
     })
+
+
+# ---------------------------------------------------------------------------
+# Close / square-off a position — reverses each leg (buy back what you sold,
+# sell what you bought) to flatten it before expiry.
+# ---------------------------------------------------------------------------
+def build_close_orders(position):
+    """Reverse of the entry orders, with a fresh reference price per leg from live quotes."""
+    quantity = position.get("quantity", position["lot_size"])
+    leg_keys = leg_keys_for(position)
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    quotes = kite.quote(inst_keys)
+
+    orders = []
+    for k in leg_keys:
+        leg = position["legs"][k]
+        original_txn = "SELL" if k.startswith("sell") else "BUY"
+        close_txn = "BUY" if original_txn == "SELL" else "SELL"
+        ref_price = extract_price(quotes.get(f"NFO:{leg['tradingsymbol']}"))
+        orders.append({
+            "leg": k, "tradingsymbol": leg["tradingsymbol"], "transaction_type": close_txn,
+            "quantity": quantity, "price": ref_price, "reference_price": ref_price,
+            "entry_price": leg["ltp"], "original_transaction_type": original_txn,
+        })
+    return orders
+
+
+@app.route("/api/execute/<pos_id>/close/preview")
+def close_preview(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    position = find_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    orders = build_close_orders(position)
+    return jsonify({
+        "position_id": pos_id, "symbol": position["symbol"], "orders": orders,
+        "default_product": "NRML", "default_order_type": "MARKET",
+        "warning": "This will CLOSE/SQUARE OFF this position — buying back what you sold and selling what "
+                   "you bought, at current market prices. Review carefully, then confirm to send these real "
+                   "orders to your Zerodha account."
+    })
+
+
+@app.route("/api/execute/<pos_id>/close/confirm", methods=["POST"])
+def close_confirm(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    if not body.get("confirmed"):
+        return jsonify({"error": "Confirmation flag not set — nothing was placed."}), 400
+
+    position = find_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+
+    product = body.get("product", "NRML")
+    order_type = body.get("order_type", "MARKET")
+    custom_orders = body.get("orders")
+    legs_to_place = custom_orders if custom_orders else build_close_orders(position)
+
+    if not legs_to_place:
+        return jsonify({"error": "No legs left to place — every leg was removed in the review screen."}), 400
+
+    results = place_basket_orders(legs_to_place, product, order_type)
+
+    # Estimate realized P&L per leg using the reference price captured at preview/placement time
+    # (NOT a confirmed fill price — market orders execute asynchronously). Purely informational.
+    entry_by_leg = {o["leg"]: o.get("entry_price") for o in legs_to_place}
+    for r in results:
+        if r["status"] != "placed":
+            continue
+        entry_price = entry_by_leg.get(r["leg"])
+        close_price = next((o.get("reference_price") for o in legs_to_place if o["leg"] == r["leg"]), None)
+        if entry_price is not None and close_price is not None:
+            is_sell_originally = r["transaction_type"] == "BUY"  # closing a BUY means original leg was a SELL
+            per_share = (entry_price - close_price) if is_sell_originally else (close_price - entry_price)
+            r["estimated_realized_pnl"] = round(per_share * r["quantity"], 2)
+
+    positions = load_positions()
+    still_present = None
+    for p in positions:
+        if p["id"] == pos_id:
+            p["broker_orders"] = p.get("broker_orders", []) + results
+            still_present = p
+
+    any_failed = any(r["status"] == "failed" for r in results)
+    placed_count = sum(1 for r in results if r["status"] == "placed")
+    total_legs = len(legs_to_place)
+    fully_closed = placed_count == total_legs and not any_failed
+
+    if fully_closed and still_present:
+        archive_closed_position(still_present, results)
+        positions = [p for p in positions if p["id"] != pos_id]
+        note = (f"Position fully closed and archived to trade_history.json. "
+                f"Estimated realized P&L: ₹{round(sum(r.get('estimated_realized_pnl', 0) for r in results), 2)} "
+                f"(based on quoted prices at close, not confirmed fills — check your contract note).")
+    elif any_failed and placed_count > 0:
+        note = ("PARTIAL CLOSE: some legs closed, one failed. You may now hold a mismatched position. "
+                "Open your Zerodha app / Kite web IMMEDIATELY to check and manually complete the close.")
+    elif any_failed:
+        note = "All legs failed — nothing was closed."
+    else:
+        note = f"All {placed_count}/{total_legs} legs placed to close this position. Verify fills in your Zerodha app."
+
+    save_positions(positions)
+    return jsonify({"results": results, "fully_closed": fully_closed, "note": note})
 
 
 @app.route("/api/orders")
