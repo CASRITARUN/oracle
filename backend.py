@@ -32,6 +32,7 @@ import math
 import time
 import json
 import threading
+import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
@@ -52,8 +53,8 @@ import requests
 # this process starts) — do NOT hardcode real keys/secrets directly in this file,
 # especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("KITE_API_KEY", "b4j9bna5hdew1hh4")
-API_SECRET = os.environ.get("KITE_API_SECRET", "mbrdjydzd9ckisvrp4tsqbtkkgojpzue")
+API_KEY = os.environ.get("KITE_API_KEY", "PUT_YOUR_API_KEY_HERE")
+API_SECRET = os.environ.get("KITE_API_SECRET", "PUT_YOUR_API_SECRET_HERE")
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
@@ -76,6 +77,21 @@ CHAIN_STRIKE_RANGE_PCT = 0.25
 STOP_LOSS_PREMIUM_MULTIPLE = 2.0
 STOP_LOSS_DELTA_THRESHOLD = 0.35
 
+# --- Approximate Zerodha F&O options charges (informational estimate only) ---
+# These are commonly published rates as of this writing — brokerage/tax rules DO change over
+# time (STT rates in particular have changed via budget announcements before). Verify current
+# rates at https://zerodha.com/charges and your actual contract note before relying on this for
+# anything beyond a rough planning estimate. All values are editable here.
+CHARGES = {
+    "brokerage_flat": 20.0,          # per executed order, or 0.03% of turnover, whichever is LOWER
+    "brokerage_pct": 0.0003,
+    "stt_sell_pct": 0.001,           # Securities Transaction Tax, options SELL side, on premium turnover
+    "exchange_txn_pct": 0.0003503,   # NSE F&O exchange transaction charge, on premium turnover (both sides)
+    "sebi_pct": 0.0000001,           # SEBI turnover fee (₹10 per crore == 0.0001%), both sides
+    "gst_pct": 0.18,                 # GST on (brokerage + exchange txn charges + SEBI fee)
+    "stamp_duty_buy_pct": 0.00003,   # stamp duty, BUY side only, on premium turnover
+}
+
 # --- Event calendar (informational only) ---
 # A hand-maintained list of known macro event dates that commonly move markets, used to warn
 # against opening NEW positions right around them, and to flag existing positions that run into
@@ -97,6 +113,12 @@ INDEX_SYMBOLS = {
 }
 
 app = Flask(__name__, static_folder="static", static_url_path="")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("kite_dashboard")
 kite = KiteConnect(api_key=API_KEY)
 
 SESSION = {"access_token": None, "logged_in_at": None}
@@ -233,14 +255,27 @@ def archive_closed_position(position, close_results):
     est_realized_pnl = sum(
         r.get("estimated_realized_pnl", 0) for r in close_results if r["status"] == "placed"
     )
+    exit_orders_for_charges = [
+        {"price": r.get("reference_price") or 0, "quantity": r.get("quantity", 0),
+         "transaction_type": r.get("transaction_type", "SELL")}
+        for r in close_results if r["status"] == "placed"
+    ]
+    exit_charges = estimate_charges(exit_orders_for_charges)
+    entry_charges_total = position.get("entry_estimated_charges") or 0
+    round_trip_charges = round(entry_charges_total + exit_charges["total"], 2)
+    net_realized_after_charges = round(est_realized_pnl - round_trip_charges, 2)
+
     history.append({
         "id": position["id"], "symbol": position["symbol"], "strategy_type": position.get("strategy_type"),
         "added_on": position.get("added_on"), "closed_on": datetime.now().date().isoformat(),
         "entry_max_profit": position.get("entry_max_profit"), "entry_max_loss": position.get("entry_max_loss"),
         "estimated_realized_pnl": round(est_realized_pnl, 2),
+        "entry_charges": entry_charges_total, "estimated_exit_charges": exit_charges["total"],
+        "estimated_round_trip_charges": round_trip_charges,
+        "net_realized_pnl_after_charges": net_realized_after_charges,
         "close_orders": close_results,
         "note": "estimated_realized_pnl is based on quoted prices at close time, not confirmed fill "
-                "prices — check your Zerodha contract note for the exact realized P&L.",
+                "prices — check your Zerodha contract note for the exact realized P&L and charges.",
     })
     save_trade_history(history)
 
@@ -342,6 +377,38 @@ def compute_margin(legs_for_margin, quantity, product="NRML"):
         return None, str(e)
 
 
+def estimate_charges(orders):
+    """orders: list of {'price': float, 'quantity': int, 'transaction_type': 'BUY'/'SELL'}.
+    Returns an approximate total charges figure (brokerage + STT + exchange fee + SEBI fee +
+    GST + stamp duty) for placing this exact basket as ONE side of a trade (i.e. call this once
+    for entry orders, and again separately for exit orders, to get a full round-trip estimate).
+    This is a planning estimate only — always verify against your actual Kite contract note."""
+    total_brokerage = total_stt = total_exchange = total_sebi = total_stamp = 0.0
+    for o in orders:
+        turnover = float(o["price"]) * int(o["quantity"])
+        if turnover <= 0:
+            continue
+        brokerage = min(CHARGES["brokerage_flat"], CHARGES["brokerage_pct"] * turnover)
+        exchange_txn = CHARGES["exchange_txn_pct"] * turnover
+        sebi = CHARGES["sebi_pct"] * turnover
+        total_brokerage += brokerage
+        total_exchange += exchange_txn
+        total_sebi += sebi
+        if o["transaction_type"] == "SELL":
+            total_stt += CHARGES["stt_sell_pct"] * turnover
+        else:
+            total_stamp += CHARGES["stamp_duty_buy_pct"] * turnover
+
+    gst = CHARGES["gst_pct"] * (total_brokerage + total_exchange + total_sebi)
+    total = total_brokerage + total_stt + total_exchange + total_sebi + gst + total_stamp
+
+    return {
+        "brokerage": round(total_brokerage, 2), "stt": round(total_stt, 2),
+        "exchange_txn_charges": round(total_exchange, 2), "sebi_fee": round(total_sebi, 2),
+        "gst": round(gst, 2), "stamp_duty": round(total_stamp, 2), "total": round(total, 2),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Kite login flow
 # ---------------------------------------------------------------------------
@@ -391,6 +458,16 @@ def require_session():
     return True
 
 
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    """Clears the stored session so the dashboard stops using this token — does NOT invalidate
+    the token on Zerodha's side (Kite has no logout API), it just makes this app forget it."""
+    SESSION["access_token"] = None
+    SESSION["logged_in_at"] = None
+    logger.info("User logged out — session cleared.")
+    return jsonify({"ok": True})
+
+
 @app.errorhandler(TokenException)
 def handle_token_exception(e):
     """Catches an expired/invalid token from ANY route (whichever endpoint happened to hit
@@ -399,8 +476,22 @@ def handle_token_exception(e):
     'Connected' while every data call quietly fails."""
     SESSION["access_token"] = None
     SESSION["logged_in_at"] = None
+    logger.warning("TokenException caught — clearing session and asking frontend to reconnect.")
     return jsonify({"error": "session_expired", "session_expired": True,
                      "message": "Your Zerodha session has expired. Please reconnect."}), 401
+
+
+@app.errorhandler(Exception)
+def handle_any_exception(e):
+    """Safety net: ANY unhandled exception anywhere in the app returns valid JSON instead of an
+    HTML error page. Without this, a bug in one route (e.g. a new feature touching old saved
+    data) crashes with a raw 500 HTML page, which breaks every frontend '.json()' call with a
+    confusing 'SyntaxError: string did not match expected pattern' instead of a clear message."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e  # let normal HTTP errors (404, 405, etc.) behave as Flask normally would
+    logger.exception("Unhandled exception on %s %s", request.method, request.path)
+    return jsonify({"error": "internal_error", "message": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +858,20 @@ def build_strategy(symbol, target_delta=DEFAULT_TARGET_DELTA, wing_width_pct=DEF
     result["margin_error"] = margin_error
     result["entry_event_warning"] = get_entry_warning()
     result["event_before_expiry"] = get_event_before_expiry(result["expiry"])
+
+    entry_orders_for_charges = [{"price": lg["ltp"], "quantity": quantity,
+                                  "transaction_type": "SELL" if k.startswith("sell") else "BUY"}
+                                 for k, lg in result["legs"].items()]
+    entry_charges = estimate_charges(entry_orders_for_charges)
+    result["estimated_entry_charges"] = entry_charges
+    if result["max_profit"] is not None:
+        result["net_profit_after_entry_charges"] = round(result["max_profit"] - entry_charges["total"], 2)
+    else:
+        result["net_profit_after_entry_charges"] = None
+    result["charges_note"] = ("Entry-side charges only (opening the position). If you square off "
+                               "before expiry, exit-side charges apply too — see the Trade Section for "
+                               "the running round-trip estimate once tracked. Approximate; verify against "
+                               "your Kite contract note.")
     return result
 
 
@@ -821,6 +926,7 @@ def watchlist_add():
         "entry_max_loss": built["max_loss"],
         "entry_margin_required": built.get("margin_required"),
         "entry_margin_error": built.get("margin_error"),
+        "entry_estimated_charges": built.get("estimated_entry_charges", {}).get("total"),
         "breakeven_upper": built["breakeven_upper"],
         "breakeven_lower": built["breakeven_lower"],
         "broker_orders": [],
@@ -922,6 +1028,18 @@ def mark_to_market(position):
 
     event_flag = get_event_before_expiry(position["expiry"])
 
+    # --- Charges: entry (stored at tracking time) + a live exit-side estimate, giving a running
+    # round-trip net P&L. This is what actually answers "what would I really pocket if I closed now."
+    exit_orders_for_charges = []
+    for k in leg_keys:
+        original_txn = "SELL" if k.startswith("sell") else "BUY"
+        close_txn = "BUY" if original_txn == "SELL" else "SELL"
+        exit_orders_for_charges.append({"price": prices[k], "quantity": quantity, "transaction_type": close_txn})
+    exit_charges = estimate_charges(exit_orders_for_charges)
+    entry_charges_total = position.get("entry_estimated_charges") or 0
+    round_trip_charges = round(entry_charges_total + exit_charges["total"], 2)
+    net_pnl_after_charges = round(pnl - round_trip_charges, 2)
+
     leg_details = {}
     for k in leg_keys:
         entry_price = position["legs"][k]["ltp"]
@@ -947,6 +1065,8 @@ def mark_to_market(position):
         "pct_of_max_profit": round((pnl / position["entry_max_profit"] * 100), 1) if position["entry_max_profit"] else None,
         "exit_suggested": exit_suggested, "exit_reasons": exit_reasons,
         "event_before_expiry": event_flag,
+        "entry_charges": entry_charges_total, "estimated_exit_charges": exit_charges["total"],
+        "estimated_round_trip_charges": round_trip_charges, "net_pnl_after_charges": net_pnl_after_charges,
     }
 
 
@@ -958,7 +1078,12 @@ def watchlist():
     today_str = datetime.now().date().isoformat()
     out, changed = [], False
     for p in positions:
-        mtm = mark_to_market(p)
+        try:
+            mtm = mark_to_market(p)
+        except Exception as e:
+            logger.exception("mark_to_market failed for position %s (%s)", p.get("id"), p.get("symbol"))
+            out.append({**p, "mtm_error": f"Internal error while pricing this position: {e}"})
+            continue
         if mtm and "__error__" in mtm:
             out.append({**p, "mtm_error": mtm["__error__"]})
             continue
