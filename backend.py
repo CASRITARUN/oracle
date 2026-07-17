@@ -92,6 +92,191 @@ CHARGES = {
     "stamp_duty_buy_pct": 0.00003,   # stamp duty, BUY side only, on premium turnover
 }
 
+# --- Stock-picking screener v2: IV-rank, liquidity, ban-list, news (all best-effort) ---
+# Kite has no historical-IV endpoint, so a genuine IV Rank/Percentile has to be built up by us,
+# one snapshot per day, in a small local file. Until enough days have accumulated, iv_rank will
+# be null and we fall back to a same-day cross-sectional IV percentile (how rich this stock's IV
+# is TODAY relative to the other F&O stocks scanned today) so the field is never just empty.
+IV_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "iv_history.json")
+IVR_LOOKBACK_DAYS = 252          # ~1 trading year of daily ATM-IV snapshots kept per symbol
+IVR_MIN_HISTORY_DAYS = 20        # need at least this many stored days before trusting a real IV rank
+
+# Liquidity gate applied to the ATM strike (both legs) before a stock is allowed into the
+# "top picks" ranking — a calm, high-IV stock is still a bad pick if you can't get filled near mid.
+MIN_ATM_TOTAL_OI = 500           # combined ATM CE+PE open interest, in contracts (lots), not shares
+MAX_ATM_SPREAD_PCT = 4.0         # combined ATM CE+PE avg bid-ask spread, as % of mid price
+
+# Composite score weights (must sum to 1.0). Higher composite = better candidate for this
+# option-SELLING strategy: rich premium (high IV) + calm underlying + liquid enough to trade.
+SCORE_WEIGHTS = {"iv_richness": 0.40, "calmness": 0.35, "liquidity": 0.25}
+
+NEWS_FOR_TOP_N = 10              # only fetch headlines for the final top-N shown, to keep this fast
+FO_BAN_LIST_URL = "https://nsearchives.nseindia.com/content/fo/fo_secban.csv"
+
+
+def load_iv_history():
+    if not os.path.exists(IV_HISTORY_FILE):
+        return {}
+    try:
+        with open(IV_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_iv_history(history):
+    with open(IV_HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def update_iv_history_and_get_rank(symbol, atm_iv_pct, history, today_str):
+    """Appends today's ATM IV snapshot (idempotent per day so re-running the screener the same
+    day doesn't distort the series), trims to the lookback window, and returns
+    (iv_rank_pct_or_None, days_of_history)."""
+    series = history.setdefault(symbol, [])
+    series[:] = [pt for pt in series if pt["date"] != today_str]
+    series.append({"date": today_str, "iv": atm_iv_pct})
+    series.sort(key=lambda p: p["date"])
+    if len(series) > IVR_LOOKBACK_DAYS:
+        del series[:-IVR_LOOKBACK_DAYS]
+
+    if len(series) < IVR_MIN_HISTORY_DAYS:
+        return None, len(series)
+    values = [p["iv"] for p in series]
+    below_or_equal = sum(1 for v in values if v <= atm_iv_pct)
+    rank_pct = 100.0 * below_or_equal / len(values)
+    return round(rank_pct, 1), len(series)
+
+
+def get_fo_ban_list():
+    """Best-effort fetch of NSE's daily F&O ban list. NSE's site actively blocks plain
+    requests without a real browser session/cookie handshake, and the URL/format can change —
+    if this fails, we say so explicitly rather than silently treating everything as 'not banned'.
+    Returns (set_of_symbols_or_None, error_message_or_None)."""
+    try:
+        session = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/csv,*/*",
+        }
+        session.get("https://www.nseindia.com", headers=headers, timeout=8)  # cookie warm-up
+        resp = session.get(FO_BAN_LIST_URL, headers=headers, timeout=8)
+        resp.raise_for_status()
+        lines = [l.strip() for l in resp.text.splitlines() if l.strip()]
+        symbols = set()
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            for p in parts:
+                if p.isupper() and p.isalnum() and len(p) > 1:
+                    symbols.add(p)
+        return symbols, None
+    except Exception as e:
+        return None, (f"Could not fetch NSE F&O ban list ({e}). Verify manually at "
+                       f"https://www.nseindia.com/companies-listing/corporate-filings-actions "
+                       f"before trading — this filter is best-effort only.")
+
+
+def pick_atm_contracts(nfo_opts_for_symbol, last_close, today):
+    """Given this symbol's NFO-OPT instruments, last close price, and today's date, picks the
+    nearest valid expiry (same MIN_DAYS_TO_EXPIRY rule as the strategy builder) and the strike
+    closest to last_close. Returns (ce_tradingsymbol, pe_tradingsymbol, strike, expiry, T) or None."""
+    if not nfo_opts_for_symbol:
+        return None
+    all_expiries = sorted({o["expiry"] for o in nfo_opts_for_symbol})
+    valid = [e for e in all_expiries if (e - today).days >= MIN_DAYS_TO_EXPIRY]
+    if not valid:
+        return None
+    expiry = valid[0]
+    chain = [o for o in nfo_opts_for_symbol if o["expiry"] == expiry]
+    strikes = sorted({o["strike"] for o in chain})
+    if not strikes:
+        return None
+    atm_strike = min(strikes, key=lambda k: abs(k - last_close))
+    ce = next((o for o in chain if o["strike"] == atm_strike and o["instrument_type"] == "CE"), None)
+    pe = next((o for o in chain if o["strike"] == atm_strike and o["instrument_type"] == "PE"), None)
+    if not ce or not pe:
+        return None
+    T = max((expiry - today).days, 0) / 365.0
+    return ce["tradingsymbol"], pe["tradingsymbol"], atm_strike, expiry, T
+
+
+def quote_spread_pct(q):
+    """Bid-ask spread as % of mid, from a Kite quote's depth. None if depth unavailable."""
+    if not q:
+        return None
+    depth = q.get("depth", {}) or {}
+    buys = [b for b in depth.get("buy", []) if b.get("price", 0) > 0]
+    sells = [s for s in depth.get("sell", []) if s.get("price", 0) > 0]
+    if not buys or not sells:
+        return None
+    bid, ask = buys[0]["price"], sells[0]["price"]
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * 100.0
+
+
+def get_atm_iv_and_liquidity_bulk(candidates, nfo):
+    """candidates: list of {'symbol', 'last_close'}. Batches Kite quote() calls (chunks of 200
+    instruments, well under Kite's per-call limit) instead of one call per stock, since fetching
+    a full option chain per stock (like get_chain_for_symbol does for a single symbol) would mean
+    hundreds of extra round-trips here. Returns {symbol: {atm_iv_pct, atm_oi_total, spread_pct,
+    expiry}} — a symbol is omitted if its ATM contracts couldn't be resolved or quoted."""
+    today = datetime.now().date()
+    opts_by_symbol = {}
+    for o in nfo:
+        if o["segment"] == "NFO-OPT":
+            opts_by_symbol.setdefault(o["name"], []).append(o)
+
+    picks = {}  # symbol -> (ce_ts, pe_ts, strike, expiry, T)
+    needed_keys = []
+    for c in candidates:
+        sym = c["symbol"]
+        pick = pick_atm_contracts(opts_by_symbol.get(sym, []), c["last_close"], today)
+        if pick:
+            picks[sym] = pick
+            ce_ts, pe_ts, _, _, _ = pick
+            needed_keys.append(f"NFO:{ce_ts}")
+            needed_keys.append(f"NFO:{pe_ts}")
+
+    quotes = {}
+    chunk_size = 200
+    for i in range(0, len(needed_keys), chunk_size):
+        chunk = needed_keys[i:i + chunk_size]
+        try:
+            quotes.update(kite.quote(chunk))
+        except Exception:
+            continue  # skip this chunk rather than fail the whole screener
+
+    out = {}
+    for sym, (ce_ts, pe_ts, strike, expiry, T) in picks.items():
+        ce_q = quotes.get(f"NFO:{ce_ts}")
+        pe_q = quotes.get(f"NFO:{pe_ts}")
+        ce_ltp, pe_ltp = extract_price(ce_q), extract_price(pe_q)
+        if ce_ltp is None or pe_ltp is None:
+            continue
+        last_close = next(c["last_close"] for c in candidates if c["symbol"] == sym)
+        ce_iv = implied_vol(ce_ltp, last_close, strike, T, "CE")
+        pe_iv = implied_vol(pe_ltp, last_close, strike, T, "PE")
+        atm_iv_pct = (ce_iv + pe_iv) / 2 * 100
+        ce_oi = (ce_q or {}).get("oi", 0) or 0
+        pe_oi = (pe_q or {}).get("oi", 0) or 0
+        spreads = [s for s in (quote_spread_pct(ce_q), quote_spread_pct(pe_q)) if s is not None]
+        spread_pct = round(sum(spreads) / len(spreads), 2) if spreads else None
+        out[sym] = {"atm_iv_pct": round(atm_iv_pct, 1), "atm_oi_total": int(ce_oi + pe_oi),
+                     "atm_spread_pct": spread_pct, "atm_expiry": str(expiry)}
+    return out
+
+
+def _percentile_rank(value, all_values):
+    """0-100, higher = higher value relative to the group. None-safe."""
+    vals = [v for v in all_values if v is not None]
+    if value is None or not vals:
+        return 50.0  # neutral when data is missing, rather than silently zero-weighting it
+    below_or_equal = sum(1 for v in vals if v <= value)
+    return 100.0 * below_or_equal / len(vals)
+
+
 # --- Event calendar (informational only) ---
 # A hand-maintained list of known macro event dates that commonly move markets, used to warn
 # against opening NEW positions right around them, and to flag existing positions that run into
@@ -600,10 +785,15 @@ def screener():
         return jsonify({"error": "not_logged_in"}), 401
     limit = int(request.args.get("limit", 25))
     force = request.args.get("force", "false").lower() == "true"
+    include_news = request.args.get("news", "true").lower() == "true"
+    today = datetime.now().date()
+    today_str = str(today)
+
     universe = fo_stock_universe(force=force)
-    _, nse = get_instruments(force=force)
+    nfo, nse = get_instruments(force=force)
     symbol_to_token = {i["tradingsymbol"]: i["instrument_token"] for i in nse if i["exchange"] == "NSE"}
 
+    # --- Pass 1: calmness (HV/ATR from daily closes) — same as before ---
     results = []
     for name in universe:
         token = symbol_to_token.get(name)
@@ -620,17 +810,102 @@ def screener():
         if len(results) >= 300:
             break
 
-    results.sort(key=lambda r: r["hv_annualized_pct"])
-    for i, r in enumerate(results):
-        r["rank"] = i + 1
-        r["total"] = len(results)
+    # --- Pass 2: ATM IV + liquidity, batched across all candidates at once ---
+    candidates = [{"symbol": r["symbol"], "last_close": r["ltp"]} for r in results]
+    try:
+        iv_liquidity = get_atm_iv_and_liquidity_bulk(candidates, nfo)
+    except Exception as e:
+        iv_liquidity = {}
+        logger.warning(f"ATM IV/liquidity batch fetch failed: {e}")
 
-    SCREENER_CACHE["results"] = results
+    iv_history = load_iv_history()
+    for r in results:
+        info = iv_liquidity.get(r["symbol"])
+        if not info:
+            r["atm_iv_pct"] = None
+            r["atm_oi_total"] = None
+            r["atm_spread_pct"] = None
+            r["iv_rank_pct"] = None
+            r["iv_rank_history_days"] = 0
+            r["liquidity_ok"] = False
+            continue
+        r.update(info)
+        rank_pct, hist_days = update_iv_history_and_get_rank(r["symbol"], info["atm_iv_pct"], iv_history, today_str)
+        r["iv_rank_pct"] = rank_pct
+        r["iv_rank_history_days"] = hist_days
+        r["liquidity_ok"] = (info["atm_oi_total"] >= MIN_ATM_TOTAL_OI and
+                              info["atm_spread_pct"] is not None and info["atm_spread_pct"] <= MAX_ATM_SPREAD_PCT)
+    save_iv_history(iv_history)
+
+    # --- Pass 3: best-effort F&O ban list, excludes banned symbols from top picks ---
+    ban_symbols, ban_error = get_fo_ban_list()
+    for r in results:
+        r["fo_banned_today"] = (ban_symbols is not None and r["symbol"] in ban_symbols)
+
+    # --- Composite score: rich IV (same-day cross-sectional percentile, since most stocks
+    # won't have 20+ days of stored history yet) + calm underlying + tradeable liquidity ---
+    all_iv = [r["atm_iv_pct"] for r in results]
+    all_hv = [r["hv_annualized_pct"] for r in results]
+    all_atr = [r["atr_pct_of_price"] for r in results]
+    all_oi = [r["atm_oi_total"] for r in results if r["atm_oi_total"]]
+    all_spread = [r["atm_spread_pct"] for r in results if r["atm_spread_pct"] is not None]
+
+    eligible = []
+    for r in results:
+        iv_richness_pct = (r["iv_rank_pct"] if r["iv_rank_pct"] is not None
+                            else _percentile_rank(r["atm_iv_pct"], all_iv))
+        calm_hv_pct = 100 - _percentile_rank(r["hv_annualized_pct"], all_hv)
+        calm_atr_pct = 100 - _percentile_rank(r["atr_pct_of_price"], all_atr)
+        calmness_pct = (calm_hv_pct + calm_atr_pct) / 2
+        oi_pct = _percentile_rank(r["atm_oi_total"], all_oi)
+        spread_pct_rank = 100 - _percentile_rank(r["atm_spread_pct"], all_spread)
+        liquidity_pct = (oi_pct + spread_pct_rank) / 2
+
+        composite = (SCORE_WEIGHTS["iv_richness"] * iv_richness_pct +
+                     SCORE_WEIGHTS["calmness"] * calmness_pct +
+                     SCORE_WEIGHTS["liquidity"] * liquidity_pct)
+        r["iv_richness_score"] = round(iv_richness_pct, 1)
+        r["calmness_score"] = round(calmness_pct, 1)
+        r["liquidity_score"] = round(liquidity_pct, 1)
+        r["composite_score"] = round(composite, 1)
+        if r["liquidity_ok"] and not r["fo_banned_today"] and r["atm_iv_pct"] is not None:
+            eligible.append(r)
+
+    eligible.sort(key=lambda r: r["composite_score"], reverse=True)
+    for i, r in enumerate(eligible):
+        r["rank"] = i + 1
+        r["total"] = len(eligible)
+
+    # Everything else (illiquid, banned, or IV/liquidity data unavailable) still gets returned
+    # further down the list so nothing silently disappears, just clearly marked as excluded.
+    excluded = [r for r in results if r not in eligible]
+    for r in excluded:
+        r["rank"] = None
+        r["total"] = len(eligible)
+
+    top = eligible[:limit]
+
+    # --- Pass 4: headlines, ONLY for the final top-N being shown, to keep this fast ---
+    if include_news:
+        for r in top[:NEWS_FOR_TOP_N]:
+            r["headlines"], r["headlines_error"] = _get_headlines_best_effort(r["symbol"])
+
+    SCREENER_CACHE["results"] = eligible + excluded
     SCREENER_CACHE["fetched_at"] = datetime.now()
 
-    return jsonify({"count": len(results), "stocks": results[:limit],
-                     "note": "Lower hv_annualized_pct / atr_pct_of_price = calmer stock. "
-                             "Still check upcoming results dates and F&O ban list yourself before trading."})
+    return jsonify({
+        "count": len(results), "eligible_count": len(eligible), "stocks": top,
+        "excluded_sample": excluded[:10],
+        "ban_list_note": ban_error if ban_error else "F&O ban list fetched OK — banned symbols excluded above.",
+        "note": ("Ranked by a composite score for OPTION-SELLING: IV richness (real IV Rank once "
+                 "20+ days of history accumulate in iv_history.json, cross-sectional IV percentile "
+                 "until then) 40%, calmness (inverse HV+ATR) 35%, ATM liquidity (OI + spread) 25%. "
+                 f"Stocks are excluded from ranking if ATM combined OI < {MIN_ATM_TOTAL_OI} lots, "
+                 f"ATM spread > {MAX_ATM_SPREAD_PCT}%, on today's F&O ban list, or IV couldn't be "
+                 "computed. Headlines are a best-effort keyword scan, NOT sentiment analysis or "
+                 "verified news — read the actual articles, and still check earnings/corporate "
+                 "action dates yourself before trading."),
+    })
 
 
 def get_stock_rank(symbol):
@@ -640,6 +915,9 @@ def get_stock_rank(symbol):
         if r["symbol"] == symbol:
             return {"rank": r["rank"], "total": r["total"],
                      "hv_annualized_pct": r["hv_annualized_pct"], "atr_pct_of_price": r["atr_pct_of_price"],
+                     "atm_iv_pct": r.get("atm_iv_pct"), "iv_rank_pct": r.get("iv_rank_pct"),
+                     "composite_score": r.get("composite_score"), "liquidity_ok": r.get("liquidity_ok"),
+                     "fo_banned_today": r.get("fo_banned_today"),
                      "screener_age_minutes": round((datetime.now() - SCREENER_CACHE["fetched_at"]).total_seconds() / 60, 1)}
     return None
 
@@ -1425,6 +1703,48 @@ def chart(symbol):
 # ---------------------------------------------------------------------------
 # News / event-risk headlines
 # ---------------------------------------------------------------------------
+def _get_headlines_best_effort(symbol, max_items=3):
+    """Shared by the screener (top-N picks) and /api/news/<symbol>. Best-effort keyword scan
+    of public RSS feeds — NOT sentiment analysis, NOT a verified event-risk signal. Returns
+    (list_of_headline_dicts, error_string_or_None)."""
+    symbol = symbol.upper()
+    sources = [
+        ("Google News",
+         f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' NSE share')}&hl=en-IN&gl=IN&ceid=IN:en"),
+        ("Yahoo Finance",
+         f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}.NS&region=IN&lang=en-IN"),
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+               "Accept": "application/rss+xml, application/xml, text/xml, */*"}
+    errors = []
+    ssl_issue_seen = False
+
+    for name, url in sources:
+        try:
+            headlines = _fetch_rss(url, headers, verify=True)
+            if headlines:
+                return headlines[:max_items], None
+            errors.append(f"{name} returned no items")
+        except requests.exceptions.SSLError:
+            ssl_issue_seen = True
+            errors.append(f"{name}: SSL certificate verification failed")
+            if ALLOW_INSECURE_NEWS:
+                try:
+                    headlines = _fetch_rss(url, headers, verify=False)
+                    if headlines:
+                        return headlines[:max_items], None
+                except Exception as e2:
+                    errors.append(f"{name} (insecure retry) also failed: {e2}")
+        except Exception as e:
+            errors.append(f"{name} failed: {e}")
+
+    guidance = ""
+    if ssl_issue_seen:
+        guidance = (" This looks like a network TLS-interception issue (corporate/government firewall) "
+                     "rather than a real absence of news — see /api/news/<symbol> for the full explanation.")
+    return [], "Could not fetch headlines. " + " | ".join(errors) + guidance
+
+
 def _fetch_rss(url, headers, verify=True, timeout=10):
     resp = requests.get(url, headers=headers, timeout=timeout, verify=verify)
     resp.raise_for_status()
@@ -1445,44 +1765,14 @@ def news(symbol):
     if not require_session():
         return jsonify({"error": "not_logged_in"}), 401
     symbol = symbol.upper()
-    sources = [
-        ("Google News",
-         f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' NSE share')}&hl=en-IN&gl=IN&ceid=IN:en"),
-        ("Yahoo Finance",
-         f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}.NS&region=IN&lang=en-IN"),
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-               "Accept": "application/rss+xml, application/xml, text/xml, */*"}
-    errors = []
-    ssl_issue_seen = False
-
-    for name, url in sources:
-        try:
-            headlines = _fetch_rss(url, headers, verify=True)
-            if headlines:
-                return jsonify({"symbol": symbol, "source": name, "headlines": headlines,
-                                 "note": "Best-effort headline scan, not verified analysis. "
-                                         "Read the actual articles before treating this as an event-risk signal."})
-            errors.append(f"{name} returned no items")
-        except requests.exceptions.SSLError as e:
-            ssl_issue_seen = True
-            errors.append(f"{name}: SSL certificate verification failed")
-            if ALLOW_INSECURE_NEWS:
-                try:
-                    headlines = _fetch_rss(url, headers, verify=False)
-                    if headlines:
-                        return jsonify({"symbol": symbol, "source": name + " (unverified TLS)", "headlines": headlines,
-                                         "note": "Fetched with certificate verification disabled because "
-                                                 "ALLOW_INSECURE_NEWS is set — your network is doing TLS "
-                                                 "interception. This is only used for public headlines, never "
-                                                 "for Kite API calls. Best-effort scan, not verified analysis."})
-                except Exception as e2:
-                    errors.append(f"{name} (insecure retry) also failed: {e2}")
-        except Exception as e:
-            errors.append(f"{name} failed: {e}")
+    headlines, error = _get_headlines_best_effort(symbol, max_items=5)
+    if headlines:
+        return jsonify({"symbol": symbol, "headlines": headlines,
+                         "note": "Best-effort headline scan, not verified analysis. "
+                                 "Read the actual articles before treating this as an event-risk signal."})
 
     guidance = ""
-    if ssl_issue_seen:
+    if error and "SSL certificate verification failed" in error:
         guidance = (" This looks like your network (office/government firewall, antivirus, or a proxy) is "
                      "intercepting HTTPS traffic with its own certificate — common on corporate/government "
                      "networks. Kite API calls aren't affected since those go through Kite's own SDK. To fix "
@@ -1490,9 +1780,8 @@ def news(symbol):
                      "REQUESTS_CA_BUNDLE environment variable. As a quick workaround for this headlines feature "
                      "only (not recommended on untrusted networks), you can set ALLOW_INSECURE_NEWS=true as an "
                      "environment variable before running backend.py.")
-
     return jsonify({"symbol": symbol, "headlines": [],
-                     "error": "Could not fetch news from any source. " + " | ".join(errors) + guidance})
+                     "error": "Could not fetch news from any source. " + (error or "") + guidance})
 
 
 # ---------------------------------------------------------------------------
