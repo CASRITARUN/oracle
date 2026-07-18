@@ -74,6 +74,19 @@
   .modal-warning { background:rgba(230,180,60,.12); border:1px solid rgba(230,180,60,.3); color:#e6b43c; padding:10px 14px; border-radius:8px; font-size:13px; margin-bottom:14px; }
   .order-line { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; }
   .order-line .sell { color: var(--red); } .order-line .buy { color: var(--green); }
+  .badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:600; }
+  .badge.excellent, .badge.good, .badge.suitable, .badge.range-bound { background:rgba(52,199,123,.15); color:var(--green); }
+  .badge.fair, .badge.average, .badge.transitioning, .badge.reduce-size, .badge.normal { background:rgba(230,180,60,.15); color:#e6b43c; }
+  .badge.avoid, .badge.strong-uptrend, .badge.strong-downtrend, .badge.extreme { background:rgba(229,72,77,.15); color:var(--red); }
+  .badge.unknown, .badge.volatile-mixed, .badge.low-volatility, .badge.high-volatility { background:rgba(139,147,163,.15); color:var(--muted); }
+  .insight-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px,1fr)); gap:12px; margin-top:14px; }
+  .insight-card { background:#1d212b; padding:10px 14px; border-radius:8px; }
+  .insight-card .k { color:var(--muted); font-size:11px; text-transform:uppercase; }
+  .insight-card .v { font-size:14px; font-weight:600; margin-top:3px; }
+  .insight-note { color:var(--muted); font-size:12px; margin-top:6px; }
+  .warn-box { background:rgba(230,180,60,.12); border:1px solid rgba(230,180,60,.3); color:#e6b43c; padding:8px 12px; border-radius:8px; font-size:12px; margin-top:10px; }
+  .why-list, .risk-list { margin:6px 0 0 18px; font-size:13px; }
+  .risk-list li { color: var(--red); }
 </style>
 </head>
 <body>
@@ -100,7 +113,7 @@
     <table id="screenerTable" style="display:none;">
       <thead><tr>
         <th>Rank</th><th>Symbol</th><th>LTP</th><th>ATM IV</th><th>IV Rank / %ile</th>
-        <th>HV (ann.)</th><th>ATR%</th><th>Liquidity</th><th>Score</th><th>Recent headlines</th><th></th>
+        <th>HV (ann.)</th><th>IV/HV</th><th>ATR%</th><th>Liquidity</th><th>Score</th><th>Recent headlines</th><th></th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -163,6 +176,27 @@
         <div class="metric"><div class="k">Breakeven Range</div><div class="v" id="m_be"></div></div>
       </div>
 
+      <div id="s_warnings"></div>
+
+      <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:18px;">Trading-logic insights</h3>
+      <div class="insight-grid">
+        <div class="insight-card"><div class="k">IV / HV Ratio</div><div class="v" id="ins_ivhv">—</div></div>
+        <div class="insight-card"><div class="k">Expected Move (to expiry)</div><div class="v" id="ins_em">—</div></div>
+        <div class="insight-card"><div class="k">Probability of Profit</div><div class="v" id="ins_pop">—</div></div>
+        <div class="insight-card"><div class="k">Trend Regime</div><div class="v" id="ins_trend">—</div></div>
+        <div class="insight-card"><div class="k">Volatility Regime</div><div class="v" id="ins_volregime">—</div></div>
+        <div class="insight-card"><div class="k">Trade Quality Score</div><div class="v" id="ins_score">—</div></div>
+        <div class="insight-card" style="grid-column: 1 / -1;"><div class="k">Suggested Strategy</div><div class="v" id="ins_suggested">—</div></div>
+      </div>
+      <div class="insight-note" id="ins_note"></div>
+
+      <div class="track-row" style="margin-top:18px;">
+        <label class="inline">Capital ₹ <input type="number" id="sizeCapital" placeholder="500000" style="width:110px;" /></label>
+        <label class="inline">Risk per trade % <input type="number" id="sizeRiskPct" placeholder="2" step="0.5" style="width:70px;" /></label>
+        <button class="secondary small-btn" id="sizeCalcBtn">Suggest Lots</button>
+        <span id="sizeResult" style="color:var(--muted); font-size:12px;"></span>
+      </div>
+
       <div class="track-row">
         <button id="trackBtn">Track This Position</button>
         <span id="trackStatus" class="loading"></span>
@@ -170,6 +204,30 @@
 
       <div class="disclaimer" id="s_note"></div>
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>2b. Today's Best Trade — rule-based pick from the last Screener run</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button id="bestTradeBtn">Find Today's Best Trade</button>
+      <span id="bestTradeStatus" class="loading"></span>
+    </div>
+    <div id="bestTradeBox" style="display:none;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>2c. Portfolio Greeks — net exposure across all tracked positions</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button id="portfolioGreeksBtn">Refresh Portfolio Greeks</button>
+      <span id="portfolioGreeksStatus" class="loading"></span>
+    </div>
+    <div class="insight-grid" id="portfolioGreeksBox" style="display:none;">
+      <div class="insight-card"><div class="k">Net Delta</div><div class="v" id="pg_delta">—</div></div>
+      <div class="insight-card"><div class="k">Net Theta (₹/day)</div><div class="v" id="pg_theta">—</div></div>
+      <div class="insight-card"><div class="k">Net Vega</div><div class="v" id="pg_vega">—</div></div>
+      <div class="insight-card"><div class="k">Net Gamma</div><div class="v" id="pg_gamma">—</div></div>
+    </div>
+    <div class="legend" id="portfolioGreeksNote"></div>
   </div>
 
   <div class="panel">
@@ -491,10 +549,14 @@ document.getElementById("runScreenerBtn").onclick = async () => {
       const headlines = (s.headlines && s.headlines.length)
         ? s.headlines.map(h => `<a href="${h.link}" target="_blank" rel="noopener">${h.title}</a>`).join("<br>")
         : (s.headlines_error ? `<span style="opacity:.6">n/a</span>` : "");
+      const ivHv = s.iv_hv
+        ? `${s.iv_hv.ratio} <span class="badge ${s.iv_hv.label.toLowerCase()}">${s.iv_hv.label}</span>`
+        : "—";
+      const ivTrendTxt = s.iv_trend ? ` <span style="opacity:.6">(${s.iv_trend.trend})</span>` : "";
       tr.innerHTML = `<td>${s.rank}/${s.total}</td><td>${s.symbol}${s.fo_banned_today ? " 🚫" : ""}</td>
-                      <td>${s.ltp}</td><td>${s.atm_iv_pct != null ? s.atm_iv_pct + "%" : "—"}</td>
+                      <td>${s.ltp}</td><td>${s.atm_iv_pct != null ? s.atm_iv_pct + "%" : "—"}${ivTrendTxt}</td>
                       <td>${ivRankLabel}</td>
-                      <td>${s.hv_annualized_pct}%</td><td>${s.atr_pct_of_price}%</td>
+                      <td>${s.hv_annualized_pct}%</td><td>${ivHv}</td><td>${s.atr_pct_of_price}%</td>
                       <td>${liquidity}</td><td><b>${s.composite_score}</b></td>
                       <td style="max-width:260px;font-size:12px;">${headlines}</td>
                       <td><button class="secondary small-btn" onclick="useSymbol('${s.symbol}')">Use</button></td>`;
@@ -626,7 +688,9 @@ document.getElementById("buildBtn").onclick = async () => {
       const leg = d.legs[key];
       const div = document.createElement("div");
       div.className = "leg-card";
-      div.innerHTML = `<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>`;
+      const potTxt = leg.probability_of_touch_pct != null
+        ? `<div style="font-size:11px; color:var(--muted); margin-top:2px;">POT ${leg.probability_of_touch_pct}%</div>` : "";
+      div.innerHTML = `<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>${potTxt}`;
       legGrid.appendChild(div);
     });
 
@@ -645,6 +709,128 @@ document.getElementById("buildBtn").onclick = async () => {
     if (d.entry_event_warning) noteText += ` ⚠ ${d.entry_event_warning}`;
     if (d.event_before_expiry) noteText += ` | Note: ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before this expiry.`;
     document.getElementById("s_note").textContent = noteText;
+
+    // ---- New trading-logic insight cards ----
+    document.getElementById("ins_ivhv").innerHTML = d.iv_hv
+      ? `${d.iv_hv.ratio} (IV ${d.iv_hv.iv_pct}% / HV ${d.iv_hv.hv_pct}%) <span class="badge ${d.iv_hv.label.toLowerCase()}">${d.iv_hv.label}</span>`
+      : `— <span style="opacity:.6">${d.iv_hv_note || ""}</span>`;
+
+    document.getElementById("ins_em").textContent = d.expected_move
+      ? `±₹${d.expected_move.expected_move} (${d.expected_move.expected_move_pct}%) → ${d.expected_move.lower}–${d.expected_move.upper}`
+      : "—";
+
+    document.getElementById("ins_pop").textContent = d.probability_of_profit_pct != null
+      ? `${d.probability_of_profit_pct}%` : "—";
+
+    document.getElementById("ins_trend").innerHTML = d.trend
+      ? `${d.trend.regime} <span class="badge ${d.trend.regime.toLowerCase().replace(/\s*\/\s*|\s+/g,'-')}">${d.trend.adx14 != null ? "ADX " + d.trend.adx14 : ""}</span>`
+      : `— <span style="opacity:.6">${d.trend_note || ""}</span>`;
+
+    document.getElementById("ins_volregime").innerHTML = d.volatility_regime
+      ? `${d.volatility_regime.label}${d.volatility_regime.india_vix != null ? " (VIX " + d.volatility_regime.india_vix + ")" : ""}
+         <span class="badge ${d.volatility_regime.recommendation.toLowerCase().replace(/\s+/g,'-')}">${d.volatility_regime.recommendation}</span>`
+      : "—";
+
+    document.getElementById("ins_score").innerHTML = d.trade_quality_score != null
+      ? `${d.trade_quality_score}/100 <span class="badge ${(d.trade_quality_label||"").toLowerCase()}">${d.trade_quality_label || ""}</span>`
+      : "—";
+
+    document.getElementById("ins_suggested").textContent = d.suggested_strategy && d.suggested_strategy.suggested
+      ? `${d.suggested_strategy.suggested} — ${d.suggested_strategy.reason}`
+      : (d.suggested_strategy ? d.suggested_strategy.reason : "—");
+
+    document.getElementById("ins_note").textContent = d.trade_quality_note || "";
+
+    const warnBox = document.getElementById("s_warnings");
+    warnBox.innerHTML = "";
+    if (d.expected_move_warning) {
+      warnBox.innerHTML += `<div class="warn-box">⚠ ${d.expected_move_warning}</div>`;
+    }
+    if (d.trend && d.trend.avoid_premium_selling) {
+      warnBox.innerHTML += `<div class="warn-box">⚠ ${d.trend.regime} detected (ADX ${d.trend.adx14}, RSI ${d.trend.rsi14}) — consider avoiding non-directional premium selling here.</div>`;
+    }
+    if (d.volatility_regime && d.volatility_regime.recommendation === "Avoid") {
+      warnBox.innerHTML += `<div class="warn-box">⚠ Volatility regime is "${d.volatility_regime.label}" — consider avoiding new premium-selling entries right now.</div>`;
+    }
+
+    // Store max_loss for the position-sizing helper below
+    window.__lastMaxLoss = d.max_loss;
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+// ---------- Position sizing calculator ----------
+document.getElementById("sizeCalcBtn").onclick = async () => {
+  const capital = document.getElementById("sizeCapital").value;
+  const riskPct = document.getElementById("sizeRiskPct").value;
+  const resultEl = document.getElementById("sizeResult");
+  const maxLoss = window.__lastMaxLoss;
+  if (!capital || !riskPct) { resultEl.textContent = "Enter capital and risk % first."; return; }
+  if (!maxLoss) { resultEl.textContent = "Calculate a strategy above first (needs its Max Loss per lot)."; return; }
+  const loggedIn = await checkSession();
+  if (!loggedIn) return;
+  try {
+    const params = new URLSearchParams({capital, risk_pct: riskPct, max_loss_per_lot: maxLoss});
+    const r = await apiFetch(`/api/position-sizing?${params}`);
+    const d = await r.json();
+    if (d.error) { resultEl.textContent = "Error: " + d.error; return; }
+    resultEl.textContent = `Max risk budget ₹${d.max_risk_amount} → recommended ${d.recommended_lots} lot(s) at this Max Loss.`;
+  } catch (e) { resultEl.textContent = "Request failed: " + e; }
+};
+
+// ---------- Today's Best Trade ----------
+document.getElementById("bestTradeBtn").onclick = async () => {
+  const status = document.getElementById("bestTradeStatus");
+  const box = document.getElementById("bestTradeBox");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
+  status.textContent = "Scanning the last screener run and building a strategy for the top pick...";
+  box.style.display = "none";
+  try {
+    const r = await apiFetch("/api/best-trade");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    status.textContent = "";
+    const why = (d.why_this_trade || []).map(x => `<li>${x}</li>`).join("");
+    const risks = (d.risks || []).map(x => `<li>${x}</li>`).join("");
+    const exitPlan = (d.suggested_exit_plan || []).map(x => `<li>${x}</li>`).join("");
+    box.innerHTML = `
+      <div class="rank-badge">${d.symbol} · Screener rank #${d.screener_rank}</div>
+      <div class="metric-row">
+        <div class="metric"><div class="k">Strategy</div><div class="v">${d.strategy.strategy_type.replace("_"," ")}</div></div>
+        <div class="metric profit"><div class="k">Expected Return (net of entry charges)</div><div class="v">${d.expected_return != null ? "₹"+d.expected_return : "—"}</div></div>
+        <div class="metric"><div class="k">Probability of Profit</div><div class="v">${d.probability_of_profit_pct != null ? d.probability_of_profit_pct+"%" : "—"}</div></div>
+        <div class="metric loss"><div class="k">Max Risk</div><div class="v">${d.max_risk != null ? "₹"+d.max_risk : "Unlimited"}</div></div>
+      </div>
+      <h4 style="margin-bottom:4px;">Why this trade</h4><ul class="why-list">${why || "<li>—</li>"}</ul>
+      <h4 style="margin-bottom:4px;">Risks</h4><ul class="risk-list">${risks || "<li>None flagged</li>"}</ul>
+      <h4 style="margin-bottom:4px;">Suggested exit plan</h4><ul class="why-list">${exitPlan}</ul>
+      <div class="disclaimer">${d.note}</div>
+    `;
+    box.style.display = "block";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+// ---------- Portfolio Greeks ----------
+document.getElementById("portfolioGreeksBtn").onclick = async () => {
+  const status = document.getElementById("portfolioGreeksStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
+  status.textContent = "Computing net Greeks across tracked positions...";
+  try {
+    const r = await apiFetch("/api/portfolio-greeks");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    status.textContent = "";
+    document.getElementById("pg_delta").textContent = d.net_delta;
+    document.getElementById("pg_theta").textContent = d.net_theta;
+    document.getElementById("pg_vega").textContent = d.net_vega;
+    document.getElementById("pg_gamma").textContent = d.net_gamma;
+    document.getElementById("portfolioGreeksBox").style.display = "grid";
+    let note = d.note;
+    if (d.errors && d.errors.length) {
+      note += " | Skipped: " + d.errors.map(e => `${e.symbol} (${e.error})`).join(", ");
+    }
+    document.getElementById("portfolioGreeksNote").textContent = note;
   } catch (e) { status.textContent = "Request failed: " + e; }
 };
 
@@ -710,7 +896,11 @@ document.getElementById("chainBtn").onclick = async () => {
     const r = await apiFetch(`/api/optionchain/${sym}?${params}`);
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
-    document.getElementById("chainMeta").textContent = `${d.symbol} · Spot ₹${d.spot} · Expiry ${d.expiry} · Lot size ${d.lot_size}`;
+    let metaTxt = `${d.symbol} · Spot ₹${d.spot} · Expiry ${d.expiry} · Lot size ${d.lot_size}`;
+    if (d.oi_summary) {
+      metaTxt += ` · PCR (OI) ${d.oi_summary.pcr != null ? d.oi_summary.pcr : "n/a"} · Max Pain ${d.oi_summary.max_pain_strike != null ? d.oi_summary.max_pain_strike : "n/a"}`;
+    }
+    document.getElementById("chainMeta").textContent = metaTxt;
     const callsBody = document.getElementById("callsBody");
     const putsBody = document.getElementById("putsBody");
     callsBody.innerHTML = ""; putsBody.innerHTML = "";
