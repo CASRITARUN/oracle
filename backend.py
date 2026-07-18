@@ -509,6 +509,256 @@ def implied_vol(price, S, K, T, opt_type, r=RISK_FREE_RATE):
     return (lo + hi) / 2
 
 
+# ---------------------------------------------------------------------------
+# Trading-logic enhancements: IV/HV, Expected Move, Probability of Touch,
+# Trend Detection (EMA/ADX/RSI), Volatility Regime. All heuristic / best-effort —
+# these support decision-making, they don't replace it.
+# ---------------------------------------------------------------------------
+def classify_iv_hv(iv_pct, hv_pct):
+    """IV/HV ratio + label. Rich IV relative to how much the stock actually moves is the
+    core edge in option selling — HV alone or IV alone can both be misleading."""
+    if not iv_pct or not hv_pct:
+        return None
+    ratio = iv_pct / hv_pct
+    if ratio > 1.30:
+        label = "Excellent"
+    elif ratio >= 1.10:
+        label = "Good"
+    elif ratio >= 1.0:
+        label = "Fair"
+    else:
+        label = "Avoid"
+    return {"iv_pct": iv_pct, "hv_pct": hv_pct, "ratio": round(ratio, 2), "label": label}
+
+
+def get_iv_trend_from_history(symbol, history):
+    """5/10/20-trading-day IV trend from the same iv_history.json used for IV Rank."""
+    series = sorted(history.get(symbol, []), key=lambda p: p["date"])
+    if len(series) < 2:
+        return None
+    today_iv = series[-1]["iv"]
+
+    def n_ago(n):
+        idx = len(series) - 1 - n
+        return series[idx]["iv"] if idx >= 0 else None
+
+    iv_5, iv_10, iv_20 = n_ago(5), n_ago(10), n_ago(20)
+    trend = "Stable"
+    if iv_5 is not None:
+        if today_iv > iv_5 * 1.05:
+            trend = "Rising"
+        elif today_iv < iv_5 * 0.95:
+            trend = "Falling"
+    return {"iv_now": today_iv, "iv_5d_ago": iv_5, "iv_10d_ago": iv_10, "iv_20d_ago": iv_20, "trend": trend}
+
+
+def expected_move(spot, atm_iv_pct, days_to_expiry):
+    """Expected Move = Spot x IV x sqrt(DTE/365). The standard 1-sigma range option sellers use
+    to decide whether a strike has enough of a cushion."""
+    if spot is None or atm_iv_pct is None or days_to_expiry is None:
+        return None
+    T = max(days_to_expiry, 0) / 365.0
+    em = spot * (atm_iv_pct / 100.0) * math.sqrt(T)
+    return {"expected_move": round(em, 2), "expected_move_pct": round(em / spot * 100, 2) if spot else None,
+            "upper": round(spot + em, 2), "lower": round(spot - em, 2)}
+
+
+def probability_of_touch(delta):
+    """Standard trading-desk approximation: POT is roughly 2x the delta of the strike (since
+    touching the strike at any point is roughly twice as likely as finishing beyond it at expiry)."""
+    if delta is None:
+        return None
+    return round(min(100.0, abs(delta) * 2 * 100), 1)
+
+
+def _ema(values, period):
+    if len(values) < period:
+        return None
+    ema = float(np.mean(values[:period]))
+    alpha = 2.0 / (period + 1)
+    for v in values[period:]:
+        ema = alpha * v + (1 - alpha) * ema
+    return ema
+
+
+def _rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100 - 100 / (1 + rs))
+
+
+def _rma(values, period):
+    """Wilder's smoothed moving average, used by ADX."""
+    if len(values) < period:
+        return np.array([])
+    rma = np.zeros(len(values) - period + 1)
+    rma[0] = np.mean(values[:period])
+    alpha = 1.0 / period
+    for i in range(1, len(rma)):
+        rma[i] = rma[i - 1] + alpha * (values[period - 1 + i] - rma[i - 1])
+    return rma
+
+
+def _adx(highs, lows, closes, period=14):
+    if len(closes) < period * 2 + 1:
+        return None
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = np.maximum(highs[1:] - lows[1:],
+                     np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
+    atr_rma, plus_rma, minus_rma = _rma(tr, period), _rma(plus_dm, period), _rma(minus_dm, period)
+    n = min(len(atr_rma), len(plus_rma), len(minus_rma))
+    if n == 0:
+        return None
+    atr_safe = np.where(atr_rma[-n:] == 0, 1e-9, atr_rma[-n:])
+    plus_di = 100 * plus_rma[-n:] / atr_safe
+    minus_di = 100 * minus_rma[-n:] / atr_safe
+    dx = 100 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) == 0, 1e-9, (plus_di + minus_di))
+    if len(dx) < period:
+        return float(np.mean(dx))
+    adx_series = _rma(dx, period)
+    return float(adx_series[-1]) if len(adx_series) else float(np.mean(dx))
+
+
+def resolve_token_for_symbol(symbol):
+    """Shared instrument-token lookup for stocks AND indices (used by trend detection)."""
+    symbol = symbol.upper()
+    _, nse = get_instruments()
+    if symbol in INDEX_SYMBOLS:
+        wanted = INDEX_SYMBOLS[symbol].split(":")[1]
+        for i in nse:
+            if i["segment"] == "INDICES" and i["tradingsymbol"] == wanted:
+                return i["instrument_token"], None
+        return None, f"Could not resolve index token for {symbol}"
+    matches = [i for i in nse if i["exchange"] == "NSE" and i["tradingsymbol"] == symbol]
+    if not matches:
+        return None, f"{symbol} not found on NSE"
+    return matches[0]["instrument_token"], None
+
+
+def classify_trend_regime(ema20, ema50, ema100, adx, rsi):
+    trending = adx is not None and adx >= 25
+    bullish_stack = ema50 is not None and ema20 > ema50 and (ema100 is None or ema50 > ema100)
+    bearish_stack = ema50 is not None and ema20 < ema50 and (ema100 is None or ema50 < ema100)
+    if trending and bullish_stack and rsi is not None and rsi > 55:
+        return "Strong Uptrend", True
+    if trending and bearish_stack and rsi is not None and rsi < 45:
+        return "Strong Downtrend", True
+    if adx is not None and adx < 20 and rsi is not None and 40 <= rsi <= 60:
+        return "Range Bound", False
+    if adx is not None and 20 <= adx < 25:
+        return "Transitioning", False
+    return "Volatile / Mixed", False
+
+
+def get_trend_regime(symbol):
+    """EMA20/50/100 + ADX14 + RSI14 off ~220 days of daily candles. Premium selling (Iron
+    Condor/Strangle) works best in Range Bound markets — strong trends should generally be
+    avoided or handled with directional spreads instead."""
+    token, err = resolve_token_for_symbol(symbol)
+    if err:
+        return {"error": err}
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=220)
+    try:
+        candles = kite.historical_data(token, from_date, to_date, "day")
+    except Exception as e:
+        return {"error": f"Historical data fetch failed: {e}"}
+    if len(candles) < 30:
+        return {"error": "Not enough historical data to classify trend (need 30+ trading days)"}
+    closes = np.array([c["close"] for c in candles])
+    highs = np.array([c["high"] for c in candles])
+    lows = np.array([c["low"] for c in candles])
+    ema20, ema50, ema100 = _ema(closes, 20), _ema(closes, 50), _ema(closes, 100)
+    adx, rsi = _adx(highs, lows, closes, 14), _rsi(closes, 14)
+    if ema20 is None or adx is None or rsi is None:
+        return {"error": "Not enough historical data for a reliable trend read"}
+    regime, avoid_selling = classify_trend_regime(ema20, ema50, ema100, adx, rsi)
+    return {"symbol": symbol.upper(), "ema20": round(ema20, 2),
+            "ema50": round(ema50, 2) if ema50 is not None else None,
+            "ema100": round(ema100, 2) if ema100 is not None else None,
+            "adx14": round(adx, 1), "rsi14": round(rsi, 1),
+            "regime": regime, "avoid_premium_selling": avoid_selling,
+            "note": "Heuristic (EMA slope + ADX strength + RSI), not a guaranteed signal."}
+
+
+def get_india_vix():
+    try:
+        q = kite.quote(["NSE:INDIA VIX"])["NSE:INDIA VIX"]
+        return q["last_price"], None
+    except Exception as e:
+        return None, str(e)
+
+
+def classify_volatility_regime(vix, iv_rank_pct):
+    """Commonly-cited India VIX bands. Thresholds are approximate conventions, not a rule
+    from any exchange — re-check against current market context."""
+    if vix is None:
+        return {"label": "Unknown", "recommendation": "Suitable",
+                "note": "India VIX unavailable right now; regime not classified."}
+    if vix < 12:
+        label = "Low Volatility"
+    elif vix < 18:
+        label = "Normal"
+    elif vix < 25:
+        label = "High Volatility"
+    else:
+        label = "Extreme"
+    if label == "Low Volatility":
+        rec = "Reduce Size" if (iv_rank_pct is not None and iv_rank_pct < 30) else "Suitable"
+    elif label == "Normal":
+        rec = "Suitable"
+    elif label == "High Volatility":
+        rec = "Reduce Size"
+    else:
+        rec = "Avoid"
+    return {"label": label, "india_vix": round(vix, 2), "recommendation": rec}
+
+
+def suggest_strategy_family(iv_rank_pct, trend):
+    """Simple rule table: strong trend -> directional spread; otherwise pick the non-directional
+    structure that fits the current IV regime."""
+    trend_label = trend.get("regime") if trend and not trend.get("error") else None
+    if trend_label in ("Strong Uptrend", "Strong Downtrend"):
+        base = "Bull Put Spread (directional credit spread)" if trend_label == "Strong Uptrend" \
+            else "Bear Call Spread (directional credit spread)"
+        return {"suggested": base,
+                "reason": f"{trend_label} detected — avoid non-directional premium selling "
+                          f"(Iron Condor/Strangle) into a strong trend."}
+    if iv_rank_pct is None:
+        return {"suggested": None,
+                "reason": "IV rank unavailable (run the Screener first) — can't classify IV regime yet."}
+    if iv_rank_pct >= 70:
+        return {"suggested": "Short Strangle or Iron Fly",
+                "reason": f"IV rank {iv_rank_pct}% is high — rich premium supports a more aggressive structure."}
+    if iv_rank_pct >= 40:
+        return {"suggested": "Iron Condor",
+                "reason": f"IV rank {iv_rank_pct}% is moderate — a defined-risk Iron Condor is the standard fit."}
+    return {"suggested": "Single-side Credit Spread, or skip",
+            "reason": f"IV rank {iv_rank_pct}% is low — premium is thin here."}
+
+
+def recommended_position_size(capital, risk_pct, max_loss_per_lot):
+    if not capital or not risk_pct or not max_loss_per_lot or max_loss_per_lot <= 0:
+        return None
+    max_risk_amount = capital * risk_pct / 100.0
+    lots = int(max_risk_amount // max_loss_per_lot)
+    return {"max_risk_amount": round(max_risk_amount, 2), "recommended_lots": max(lots, 0)}
+
+
 def extract_price(quote):
     """Fall back to bid/ask midpoint when last_price is 0 (illiquid/deep-OTM contracts that
     haven't traded today but still have resting orders) instead of silently dropping the strike."""
@@ -835,6 +1085,7 @@ def screener():
         r["iv_rank_history_days"] = hist_days
         r["liquidity_ok"] = (info["atm_oi_total"] >= MIN_ATM_TOTAL_OI and
                               info["atm_spread_pct"] is not None and info["atm_spread_pct"] <= MAX_ATM_SPREAD_PCT)
+        r["iv_hv"] = classify_iv_hv(r.get("atm_iv_pct"), r.get("hv_annualized_pct"))
     save_iv_history(iv_history)
 
     # --- Pass 3: best-effort F&O ban list, excludes banned symbols from top picks ---
@@ -889,6 +1140,8 @@ def screener():
     if include_news:
         for r in top[:NEWS_FOR_TOP_N]:
             r["headlines"], r["headlines_error"] = _get_headlines_best_effort(r["symbol"])
+    for r in top[:NEWS_FOR_TOP_N]:
+        r["iv_trend"] = get_iv_trend_from_history(r["symbol"], iv_history)
 
     SCREENER_CACHE["results"] = eligible + excluded
     SCREENER_CACHE["fetched_at"] = datetime.now()
@@ -1009,6 +1262,36 @@ def get_chain_for_symbol(symbol, expiry_str=None):
             "all_expiries": [str(e) for e in all_expiries]}, None
 
 
+def compute_pcr_and_max_pain(chain):
+    """Put/Call Ratio (by OI) and Max Pain strike, computed across the FULL fetched chain
+    (not just the strikes shown in the UI's +/-25% window) so both are based on complete OI."""
+    calls = [o for o in chain if o["instrument_type"] == "CE"]
+    puts = [o for o in chain if o["instrument_type"] == "PE"]
+    total_call_oi = sum(o["oi"] for o in calls)
+    total_put_oi = sum(o["oi"] for o in puts)
+    pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi else None
+
+    strikes = sorted({o["strike"] for o in chain})
+    max_pain_strike, min_pain = None, None
+    for k in strikes:
+        pain = 0.0
+        for o in calls:
+            if k > o["strike"]:
+                pain += (k - o["strike"]) * o["oi"]
+        for o in puts:
+            if k < o["strike"]:
+                pain += (o["strike"] - k) * o["oi"]
+        if min_pain is None or pain < min_pain:
+            min_pain, max_pain_strike = pain, k
+
+    return {"pcr": pcr, "total_call_oi": int(total_call_oi), "total_put_oi": int(total_put_oi),
+            "max_pain_strike": max_pain_strike,
+            "note": "PCR > 1 is traditionally read as bullish/support-building, < 1 as bearish — "
+                    "a rough sentiment gauge, not a price target. Max Pain is the strike where option "
+                    "writers' aggregate payout is lowest at expiry; a commonly-watched but unreliable-alone "
+                    "expiry-pinning heuristic."}
+
+
 @app.route("/api/optionchain/<symbol>")
 def option_chain(symbol):
     if not require_session():
@@ -1018,6 +1301,7 @@ def option_chain(symbol):
     if err:
         return jsonify(err), 404
 
+    oi_summary = compute_pcr_and_max_pain(data["chain"])
     spot = data["spot"]
     lo = spot * (1 - CHAIN_STRIKE_RANGE_PCT)
     hi = spot * (1 + CHAIN_STRIKE_RANGE_PCT)
@@ -1030,7 +1314,7 @@ def option_chain(symbol):
 
     return jsonify({
         "symbol": symbol.upper(), "spot": spot, "expiry": str(data["expiry"]), "lot_size": data["lot_size"],
-        "all_expiries": data["all_expiries"],
+        "all_expiries": data["all_expiries"], "oi_summary": oi_summary,
         "calls": [slim(o) for o in calls], "puts": [slim(o) for o in puts]
     })
 
@@ -1150,6 +1434,77 @@ def build_strategy(symbol, target_delta=DEFAULT_TARGET_DELTA, wing_width_pct=DEF
                                "before expiry, exit-side charges apply too — see the Trade Section for "
                                "the running round-trip estimate once tracked. Approximate; verify against "
                                "your Kite contract note.")
+
+    # --- Enhanced trading logic: IV/HV, Expected Move, POT/POP, Trend, Vol Regime, Score ---
+    rank_info = result["rank_info"]
+    iv_hv = classify_iv_hv(rank_info.get("atm_iv_pct") if rank_info else None,
+                            rank_info.get("hv_annualized_pct") if rank_info else None)
+    result["iv_hv"] = iv_hv
+    if iv_hv is None:
+        result["iv_hv_note"] = "Run the Screener (section 1) first so IV/HV data is cached for this symbol."
+
+    em = expected_move(spot, rank_info.get("atm_iv_pct") if rank_info else None, result["days_to_expiry"])
+    result["expected_move"] = em
+    if em and "sell_call" in result["legs"] and "sell_put" in result["legs"]:
+        sc_strike = result["legs"]["sell_call"]["strike"]
+        sp_strike = result["legs"]["sell_put"]["strike"]
+        inside_em = sc_strike < em["upper"] or sp_strike > em["lower"]
+        result["short_strikes_inside_expected_move"] = inside_em
+        if inside_em:
+            result["expected_move_warning"] = (
+                f"Short strike(s) fall INSIDE the {result['days_to_expiry']}-day expected move "
+                f"(±₹{em['expected_move']}, range {em['lower']}–{em['upper']}) — higher chance of being "
+                f"tested before expiry. Consider wider strikes.")
+
+    for k in ("sell_call", "sell_put"):
+        if k in result["legs"]:
+            result["legs"][k]["probability_of_touch_pct"] = probability_of_touch(result["legs"][k]["delta"])
+
+    if "sell_call" in result["legs"] and "sell_put" in result["legs"]:
+        dc = abs(result["legs"]["sell_call"]["delta"])
+        dp = abs(result["legs"]["sell_put"]["delta"])
+        result["probability_of_profit_pct"] = round(max(0.0, (1 - dc - dp)) * 100, 1)
+
+    trend = get_trend_regime(symbol)
+    result["trend"] = None if trend.get("error") else trend
+    if trend.get("error"):
+        result["trend_note"] = trend["error"]
+
+    vix, vix_err = get_india_vix()
+    iv_rank_for_regime = rank_info.get("iv_rank_pct") if rank_info else None
+    result["volatility_regime"] = classify_volatility_regime(vix, iv_rank_for_regime)
+    if vix_err:
+        result["volatility_regime"]["note"] = f"India VIX fetch failed ({vix_err}); classification unavailable."
+
+    score_components = []
+    if iv_hv:
+        score_components.append({"excellent": 95, "good": 80, "fair": 60, "avoid": 25}.get(iv_hv["label"].lower(), 50))
+    if rank_info and rank_info.get("composite_score") is not None:
+        score_components.append(rank_info["composite_score"])
+    if trend and not trend.get("error"):
+        score_components.append(30 if trend.get("avoid_premium_selling") else 75)
+    if result["volatility_regime"]["label"] != "Unknown":
+        vr_score = {"Low Volatility": 55, "Normal": 80, "High Volatility": 70, "Extreme": 20}.get(
+            result["volatility_regime"]["label"], 50)
+        score_components.append(vr_score)
+    if rank_info and rank_info.get("fo_banned_today"):
+        score_components.append(0)
+    trade_quality_score = round(sum(score_components) / len(score_components), 1) if score_components else None
+    result["trade_quality_score"] = trade_quality_score
+    if trade_quality_score is not None:
+        if trade_quality_score >= 80:
+            result["trade_quality_label"] = "Excellent"
+        elif trade_quality_score >= 60:
+            result["trade_quality_label"] = "Good"
+        elif trade_quality_score >= 40:
+            result["trade_quality_label"] = "Average"
+        else:
+            result["trade_quality_label"] = "Avoid"
+    result["trade_quality_note"] = ("Heuristic score blending IV/HV richness, screener composite, trend regime, "
+                                     "and volatility regime (equal-weighted average of whichever signals are "
+                                     "available). Not a probability, not backtested — a rough triage aid only.")
+
+    result["suggested_strategy"] = suggest_strategy_family(iv_rank_for_regime, trend)
     return result
 
 
@@ -1166,6 +1521,173 @@ def strategy(symbol):
     if "error" in result:
         return jsonify(result), 404
     return jsonify(result)
+
+
+@app.route("/api/trend/<symbol>")
+def trend(symbol):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    result = get_trend_regime(symbol)
+    if result.get("error"):
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+@app.route("/api/position-sizing")
+def position_sizing():
+    """Dynamic position sizing (fixed-fractional): given total capital, risk-per-trade %, and
+    the max loss of ONE lot of the trade you're considering, returns how many lots keep you
+    within that risk budget."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    try:
+        capital = float(request.args.get("capital"))
+        risk_pct = float(request.args.get("risk_pct"))
+        max_loss_per_lot = float(request.args.get("max_loss_per_lot"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "capital, risk_pct, and max_loss_per_lot are all required numeric params"}), 400
+    result = recommended_position_size(capital, risk_pct, max_loss_per_lot)
+    if result is None:
+        return jsonify({"error": "Invalid inputs — all values must be positive numbers"}), 400
+    result["note"] = ("recommended_lots = floor((capital x risk_pct%) / max_loss_per_lot). This caps your RISK "
+                       "budget only — it does not check margin availability. Always confirm actual margin "
+                       "required (shown in the Strategy Builder) is within your free cash too.")
+    return jsonify(result)
+
+
+def position_greeks(position):
+    """Per-position net Greeks via Black-Scholes at current quotes (Kite doesn't publish Greeks
+    itself). Gamma/Vega/Theta are estimated by bump-and-reprice off the same bs_price/bs_delta
+    helpers used everywhere else in this file."""
+    strategy_type = position.get("strategy_type", "iron_condor")
+    leg_keys = ["sell_call", "buy_call", "sell_put", "buy_put"] if strategy_type == "iron_condor" \
+        else ["sell_call", "sell_put"]
+    quantity = position.get("quantity", position["lot_size"])
+    spot, err = get_spot_price(position["symbol"])
+    if err:
+        return {"error": err["error"]}
+    expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    days_left = max((expiry_date - datetime.now().date()).days, 0)
+    T = days_left / 365.0
+    if T <= 0:
+        return {"error": "Position has expired"}
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    try:
+        quotes = kite.quote(inst_keys)
+    except Exception as e:
+        return {"error": str(e)}
+
+    net_delta = net_theta = net_vega = net_gamma = 0.0
+    for k in leg_keys:
+        strike = position["legs"][k]["strike"]
+        opt_type = "CE" if "call" in k else "PE"
+        ltp = extract_price(quotes.get(f"NFO:{position['legs'][k]['tradingsymbol']}"))
+        if ltp is None:
+            return {"error": f"No usable price for {k}"}
+        iv = implied_vol(ltp, spot, strike, T, opt_type)
+        delta = bs_delta(spot, strike, T, RISK_FREE_RATE, iv, opt_type)
+        bump_s = spot * 0.01
+        delta_up = bs_delta(spot + bump_s, strike, T, RISK_FREE_RATE, iv, opt_type)
+        gamma = (delta_up - delta) / bump_s if bump_s else 0.0
+        vega = (bs_price(spot, strike, T, RISK_FREE_RATE, iv + 0.01, opt_type)
+                - bs_price(spot, strike, T, RISK_FREE_RATE, iv, opt_type))
+        theta = -(bs_price(spot, strike, max(T - 1 / 365, 0), RISK_FREE_RATE, iv, opt_type)
+                  - bs_price(spot, strike, T, RISK_FREE_RATE, iv, opt_type))
+        sign = -1 if k.startswith("sell") else 1
+        net_delta += sign * delta * quantity
+        net_gamma += sign * gamma * quantity
+        net_vega += sign * vega * quantity
+        net_theta += sign * theta * quantity
+
+    return {"net_delta": round(net_delta, 2), "net_gamma": round(net_gamma, 4),
+            "net_vega": round(net_vega, 2), "net_theta": round(net_theta, 2)}
+
+
+@app.route("/api/portfolio-greeks")
+def portfolio_greeks():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    positions = load_positions()
+    total_delta = total_theta = total_vega = total_gamma = 0.0
+    details, errors = [], []
+    for p in positions:
+        g = position_greeks(p)
+        if g.get("error"):
+            errors.append({"id": p["id"], "symbol": p["symbol"], "error": g["error"]})
+            continue
+        total_delta += g["net_delta"]; total_gamma += g["net_gamma"]
+        total_vega += g["net_vega"]; total_theta += g["net_theta"]
+        details.append({"id": p["id"], "symbol": p["symbol"], **g})
+    return jsonify({
+        "net_delta": round(total_delta, 2), "net_gamma": round(total_gamma, 4),
+        "net_vega": round(total_vega, 2), "net_theta": round(total_theta, 2),
+        "positions": details, "errors": errors,
+        "note": "Estimated via Black-Scholes at current quotes/implied vol — an approximation, not "
+                "Kite's own Greeks (Kite doesn't publish them). Theta is per-day time decay; Vega is "
+                "per 1-point (1%) change in IV.",
+    })
+
+
+@app.route("/api/best-trade")
+def best_trade():
+    """Rule-based 'Today's Best Trade' — combines the current Screener ranking with the Strategy
+    Builder's enhanced output (IV/HV, expected move, trend, volatility regime) into one summary.
+    This is NOT a machine-learning prediction and is NOT validated by backtesting — it's a
+    transparent aggregation of the same signals shown elsewhere in this dashboard."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    if not SCREENER_CACHE["results"]:
+        return jsonify({"error": "Run the Screener (section 1) first."}), 400
+    eligible = [r for r in SCREENER_CACHE["results"] if r.get("rank")]
+    if not eligible:
+        return jsonify({"error": "No eligible stocks in the last screener run."}), 400
+    eligible.sort(key=lambda r: r["rank"])
+    top = eligible[0]
+    strategy_type = request.args.get("strategy_type", "iron_condor")
+
+    built = build_strategy(top["symbol"], strategy_type=strategy_type)
+    if "error" in built:
+        return jsonify({"error": f"Could not build a strategy for top pick {top['symbol']}: {built['error']}"}), 400
+
+    reasons = []
+    if built.get("iv_hv"):
+        reasons.append(f"IV/HV ratio {built['iv_hv']['ratio']} ({built['iv_hv']['label']}).")
+    if built.get("trend"):
+        reasons.append(f"Trend regime: {built['trend']['regime']}.")
+    if built.get("volatility_regime"):
+        reasons.append(f"Volatility regime: {built['volatility_regime']['label']} "
+                        f"(recommendation: {built['volatility_regime']['recommendation']}).")
+    if built.get("suggested_strategy", {}).get("reason"):
+        reasons.append(built["suggested_strategy"]["reason"])
+    if built.get("expected_move_warning"):
+        reasons.append(built["expected_move_warning"])
+
+    risks = []
+    if built.get("entry_event_warning"):
+        risks.append(built["entry_event_warning"])
+    if built.get("event_before_expiry"):
+        risks.append(f"{built['event_before_expiry']['label']} on {built['event_before_expiry']['date']} "
+                      f"falls before this expiry.")
+    if built["strategy_type"] == "naked_strangle":
+        risks.append("Naked strangle: unlimited risk on the call side.")
+
+    max_profit = built.get("max_profit")
+    return jsonify({
+        "symbol": built["symbol"], "screener_rank": top["rank"], "strategy": built,
+        "why_this_trade": reasons, "risks": risks,
+        "expected_return": built.get("net_profit_after_entry_charges"),
+        "probability_of_profit_pct": built.get("probability_of_profit_pct"),
+        "max_risk": built.get("max_loss"),
+        "suggested_exit_plan": [
+            f"Profit target: exit at 50% of max profit"
+            + (f" (₹{round(max_profit * 0.5, 2)})." if max_profit else "."),
+            f"Time exit: close 3 days before expiry ({built['expiry']}) if still open.",
+            f"Delta exit: exit a short leg if its delta rises to ≥{STOP_LOSS_DELTA_THRESHOLD}.",
+        ],
+        "note": "Rule-based triage using the current Screener + Strategy Builder output — NOT a "
+                "machine-learning prediction, NOT investment advice, and NOT validated by backtesting. "
+                "Verify everything before trading real money.",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1333,8 +1855,10 @@ def mark_to_market(position):
         }
         if k == "sell_call" and delta_call is not None:
             leg_details[k]["current_delta"] = round(delta_call, 3)
+            leg_details[k]["probability_of_touch_pct"] = probability_of_touch(delta_call)
         if k == "sell_put" and delta_put is not None:
             leg_details[k]["current_delta"] = round(delta_put, 3)
+            leg_details[k]["probability_of_touch_pct"] = probability_of_touch(delta_put)
 
     return {
         "spot": spot, "pnl": pnl, "current_debit_per_share": round(current_debit_per_share, 2),
