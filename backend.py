@@ -70,6 +70,20 @@ DEFAULT_TARGET_DELTA = 0.18
 DEFAULT_WING_WIDTH_PCT = 0.05
 CHAIN_STRIKE_RANGE_PCT = 0.25
 
+# --- Double Calendar Spread defaults ---
+# A double calendar is: SELL a near-term call + SELL a near-term put (usually a bit OTM each side),
+# and BUY a far-term call + far-term put at the SAME two strikes. It's a net-DEBIT, defined-risk
+# trade that profits from the near leg decaying faster than the far leg (positive theta, long vega) —
+# the "sweet spot" is the underlying sitting between the two short strikes at near expiry.
+DEFAULT_CALENDAR_OTM_PCT = 0.03      # each strike this far OTM from spot, in "otm_pct" strike mode
+DEFAULT_CALENDAR_TARGET_DELTA = 0.25 # used instead of otm_pct in "delta" strike mode
+CALENDAR_TARGET_GAP_DAYS = 30        # preferred day-gap between near and far expiry when auto-picking
+CALENDAR_CURVE_POINTS = 41           # number of spot points sampled for the payoff curve
+CALENDAR_CURVE_RANGE_PCT = 0.15      # curve spans spot x (1 +/- this), i.e. +/-15% around current spot
+# Exit-suggestion thresholds for tracked calendar positions (informational only, never auto-exits)
+CALENDAR_STOP_LOSS_DEBIT_MULTIPLE = 0.5   # suggest exit if loss reaches this multiple of debit paid
+CALENDAR_NEAR_EXPIRY_DAYS_WARNING = 3     # suggest exit/roll when this close to near-leg expiry (gamma risk)
+
 # --- Exit / stop-loss suggestion rule (informational only — this tool never auto-exits) ---
 # Trigger a suggested-exit flag when EITHER condition is met, whichever occurs first:
 #   1) total position loss reaches this multiple of the premium originally received, or
@@ -1029,6 +1043,20 @@ def historical_vol_and_atr(nse_token, days=60):
     return hv_annualized, atr_pct, last_close
 
 
+@app.route("/api/fo-universe")
+def fo_universe_route():
+    """Indices + the real, current list of individual F&O stocks -- used by the Auto Trade tab's
+    universe picker so you're selecting symbols that actually have tradable options, instead of
+    typing a symbol blind and having it silently fail to scan."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    try:
+        stocks = fo_stock_universe()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"indices": list(INDEX_SYMBOLS.keys()), "stocks": stocks})
+
+
 @app.route("/api/screener")
 def screener():
     if not require_session():
@@ -1523,6 +1551,298 @@ def strategy(symbol):
     return jsonify(result)
 
 
+# ---------------------------------------------------------------------------
+# Strategy builder — Double Calendar Spread (sell near-term call+put, buy far-term
+# call+put at the same two strikes). Net debit, defined risk, long vega / positive theta.
+# ---------------------------------------------------------------------------
+def pick_calendar_expiries(all_expiries_str, near_expiry_str_override=None, far_expiry_str_override=None):
+    """Auto-picks a sensible near/far expiry pair from the full expiry list (strings 'YYYY-MM-DD').
+    Near = nearest expiry beyond MIN_DAYS_TO_EXPIRY (same rule as the other strategy builders).
+    Far = the available expiry whose gap from Near is closest to CALENDAR_TARGET_GAP_DAYS (and
+    strictly after Near) — this is what "automatically pick which expiries" means in practice:
+    typically the current/next-week expiry paired with the next monthly one or two out.
+    Returns (near_str, far_str) or (None, None, error_dict)."""
+    today = datetime.now().date()
+    all_expiries = sorted(datetime.strptime(e, "%Y-%m-%d").date() for e in all_expiries_str)
+
+    if near_expiry_str_override:
+        try:
+            near = datetime.strptime(near_expiry_str_override, "%Y-%m-%d").date()
+        except ValueError:
+            return None, None, {"error": f"Invalid near_expiry format '{near_expiry_str_override}'"}
+        if near not in all_expiries:
+            return None, None, {"error": f"{near_expiry_str_override} is not a valid expiry for this symbol"}
+    else:
+        valid = [e for e in all_expiries if (e - today).days >= MIN_DAYS_TO_EXPIRY]
+        if not valid:
+            return None, None, {"error": "No near expiry beyond minimum days-to-expiry filter"}
+        near = valid[0]
+
+    later = [e for e in all_expiries if e > near]
+    if not later:
+        return None, None, {"error": f"No later expiry available beyond near expiry {near} to use as the far leg"}
+
+    if far_expiry_str_override:
+        try:
+            far = datetime.strptime(far_expiry_str_override, "%Y-%m-%d").date()
+        except ValueError:
+            return None, None, {"error": f"Invalid far_expiry format '{far_expiry_str_override}'"}
+        if far not in later:
+            return None, None, {"error": f"{far_expiry_str_override} must be a valid expiry strictly after {near}"}
+    else:
+        far = min(later, key=lambda e: abs((e - near).days - CALENDAR_TARGET_GAP_DAYS))
+
+    return str(near), str(far), None
+
+
+def build_double_calendar_strategy(symbol, strike_mode="otm_pct", otm_pct=DEFAULT_CALENDAR_OTM_PCT,
+                                    target_delta=DEFAULT_CALENDAR_TARGET_DELTA,
+                                    near_expiry_str=None, far_expiry_str=None, lots=1):
+    symbol = symbol.upper()
+    today = datetime.now().date()
+
+    # Resolve which two expiries to use (auto-picked unless the user overrode one/both).
+    nfo, _ = get_instruments()
+    opts = [i for i in nfo if i["name"] == symbol and i["segment"] == "NFO-OPT"]
+    if not opts:
+        return {"error": f"No options found for {symbol}"}
+    all_expiries_str = [str(e) for e in sorted({o["expiry"] for o in opts})]
+    near_expiry_str, far_expiry_str, err = pick_calendar_expiries(all_expiries_str, near_expiry_str, far_expiry_str)
+    if err:
+        return err
+
+    near_data, err = get_chain_for_symbol(symbol, near_expiry_str)
+    if err:
+        return err
+    far_data, err = get_chain_for_symbol(symbol, far_expiry_str)
+    if err:
+        return err
+
+    spot = near_data["spot"]
+    lot_size = near_data["lot_size"]
+    quantity = lot_size * max(1, int(lots))
+    near_expiry = near_data["expiry"]
+    far_expiry = far_data["expiry"]
+    days_to_near = (near_expiry - today).days
+    days_between = (far_expiry - near_expiry).days
+    if days_between <= 0:
+        return {"error": "Far expiry must be strictly after near expiry"}
+
+    near_calls = sorted([o for o in near_data["chain"] if o["instrument_type"] == "CE"], key=lambda x: x["strike"])
+    near_puts = sorted([o for o in near_data["chain"] if o["instrument_type"] == "PE"], key=lambda x: x["strike"])
+    far_calls = sorted([o for o in far_data["chain"] if o["instrument_type"] == "CE"], key=lambda x: x["strike"])
+    far_puts = sorted([o for o in far_data["chain"] if o["instrument_type"] == "PE"], key=lambda x: x["strike"])
+    if not near_calls or not near_puts or not far_calls or not far_puts:
+        return {"error": "Could not load a complete call/put chain for both expiries"}
+
+    def closest_strike(options, target):
+        return min(options, key=lambda o: abs(o["strike"] - target))
+
+    def closest_by_delta(options, target, sign):
+        return min(options, key=lambda o: abs(o["delta"] - sign * target))
+
+    if strike_mode == "atm":
+        call_strike_target = put_strike_target = spot
+        near_call = closest_strike(near_calls, call_strike_target)
+        near_put = closest_strike(near_puts, put_strike_target)
+    elif strike_mode == "delta":
+        near_call = closest_by_delta(near_calls, target_delta, +1)
+        near_put = closest_by_delta(near_puts, target_delta, -1)
+    else:  # "otm_pct" (default)
+        near_call = closest_strike(near_calls, spot * (1 + otm_pct))
+        near_put = closest_strike(near_puts, spot * (1 - otm_pct))
+
+    # Match the SAME strikes on the far expiry (nearest available if strikes differ slightly).
+    far_call = closest_strike(far_calls, near_call["strike"])
+    far_put = closest_strike(far_puts, near_put["strike"])
+
+    def leg(o):
+        return {"strike": o["strike"], "ltp": o["ltp"], "delta": o["delta"], "iv_pct": o["iv"],
+                "tradingsymbol": o["tradingsymbol"]}
+
+    legs = {"sell_call_near": leg(near_call), "sell_put_near": leg(near_put),
+            "buy_call_far": leg(far_call), "buy_put_far": leg(far_put)}
+
+    net_debit_per_share = ((far_call["ltp"] + far_put["ltp"]) - (near_call["ltp"] + near_put["ltp"]))
+    max_loss_per_share = max(net_debit_per_share, 0.0)  # defined risk: worst case both near legs expire
+    # worthless and you simply own the far legs, having overpaid the debit — you lose at most the debit.
+
+    # --- Model-based P&L curve at NEAR expiry, across a range of assumed spot outcomes ---
+    # At near expiry: the short near-leg is worth its intrinsic value (you owe that to close it);
+    # the long far-leg still has (far_expiry - near_expiry) days left, valued via Black-Scholes at
+    # today's implied vol for that leg (assumes IV holds roughly steady — the standard simplifying
+    # assumption for calendar-spread payoff diagrams; real IV can/does change).
+    T_far_remaining = days_between / 365.0
+    call_iv = far_call["iv"] / 100.0
+    put_iv = far_put["iv"] / 100.0
+    call_strike, put_strike = near_call["strike"], near_put["strike"]
+
+    def pnl_at_spot(s_t):
+        near_call_intrinsic = max(s_t - call_strike, 0.0)
+        near_put_intrinsic = max(put_strike - s_t, 0.0)
+        far_call_value = bs_price(s_t, call_strike, T_far_remaining, RISK_FREE_RATE, call_iv, "CE")
+        far_put_value = bs_price(s_t, put_strike, T_far_remaining, RISK_FREE_RATE, put_iv, "PE")
+        position_value = (far_call_value - near_call_intrinsic) + (far_put_value - near_put_intrinsic)
+        return position_value - net_debit_per_share
+
+    lo = spot * (1 - CALENDAR_CURVE_RANGE_PCT)
+    hi = spot * (1 + CALENDAR_CURVE_RANGE_PCT)
+    step = (hi - lo) / (CALENDAR_CURVE_POINTS - 1)
+    curve = []
+    for i in range(CALENDAR_CURVE_POINTS):
+        s_t = lo + i * step
+        pnl_per_share = pnl_at_spot(s_t)
+        curve.append({"spot": round(s_t, 2), "pnl": round(pnl_per_share * quantity, 2)})
+
+    max_profit_point = max(curve, key=lambda pt: pt["pnl"])
+    max_profit_estimated = max_profit_point["pnl"]
+
+    # Breakevens: spot values where the curve crosses zero (linear interpolation between samples).
+    breakevens = []
+    for i in range(len(curve) - 1):
+        p1, p2 = curve[i], curve[i + 1]
+        if (p1["pnl"] <= 0 <= p2["pnl"]) or (p1["pnl"] >= 0 >= p2["pnl"]):
+            if p2["pnl"] != p1["pnl"]:
+                frac = -p1["pnl"] / (p2["pnl"] - p1["pnl"])
+                be_spot = p1["spot"] + frac * (p2["spot"] - p1["spot"])
+                breakevens.append(round(be_spot, 2))
+    # de-dupe near-identical crossings
+    dedup_breakevens = []
+    for b in breakevens:
+        if not any(abs(b - x) < 0.5 for x in dedup_breakevens):
+            dedup_breakevens.append(b)
+
+    result = {
+        "symbol": symbol, "spot": spot, "lot_size": lot_size, "lots": lots, "quantity": quantity,
+        "strategy_type": "double_calendar", "strike_mode": strike_mode,
+        "near_expiry": str(near_expiry), "far_expiry": str(far_expiry),
+        "days_to_near_expiry": days_to_near, "days_between_expiries": days_between,
+        "all_expiries": all_expiries_str,
+        "legs": legs,
+        "net_debit_per_share": round(net_debit_per_share, 2),
+        "max_loss": round(max_loss_per_share * quantity, 2),
+        "max_profit_estimated": round(max_profit_estimated, 2),
+        "breakevens": dedup_breakevens,
+        "sweet_spot_range": [near_put["strike"], near_call["strike"]],
+        "curve": curve,
+        "note": ("DOUBLE CALENDAR SPREAD: net-debit, defined-risk trade. Max loss is capped at the debit "
+                 "paid; max profit is a MODEL ESTIMATE (Black-Scholes value of the far leg at near expiry, "
+                 "assuming today's IV holds) — not guaranteed, since realized IV and the exact time of exit "
+                 "both move the actual P&L. Profit is maximized if spot sits between the two short strikes "
+                 "at near expiry; sharp moves in either direction erode it. Educational calculation only — "
+                 "not a trade recommendation. Verify prices, margin, and lot size on your broker terminal.")
+    }
+
+    legs_for_margin = [
+        {"tradingsymbol": legs["sell_call_near"]["tradingsymbol"], "transaction_type": "SELL"},
+        {"tradingsymbol": legs["sell_put_near"]["tradingsymbol"], "transaction_type": "SELL"},
+        {"tradingsymbol": legs["buy_call_far"]["tradingsymbol"], "transaction_type": "BUY"},
+        {"tradingsymbol": legs["buy_put_far"]["tradingsymbol"], "transaction_type": "BUY"},
+    ]
+    margin_required, margin_error = compute_margin(legs_for_margin, quantity)
+    result["margin_required"] = margin_required
+    result["margin_error"] = margin_error
+    result["entry_event_warning"] = get_entry_warning()
+    result["event_before_expiry"] = get_event_before_expiry(result["near_expiry"])
+
+    entry_orders_for_charges = [
+        {"price": legs["sell_call_near"]["ltp"], "quantity": quantity, "transaction_type": "SELL"},
+        {"price": legs["sell_put_near"]["ltp"], "quantity": quantity, "transaction_type": "SELL"},
+        {"price": legs["buy_call_far"]["ltp"], "quantity": quantity, "transaction_type": "BUY"},
+        {"price": legs["buy_put_far"]["ltp"], "quantity": quantity, "transaction_type": "BUY"},
+    ]
+    entry_charges = estimate_charges(entry_orders_for_charges)
+    result["estimated_entry_charges"] = entry_charges
+    result["charges_note"] = ("Entry-side charges only. If you square off before near expiry, exit-side "
+                               "charges apply too — see the Track Positions section for the running "
+                               "round-trip estimate once tracked.")
+
+    # --- Reuse the same trading-logic layer as the Iron Condor/Strangle builder ---
+    rank_info = get_stock_rank(symbol)
+    result["rank_info"] = rank_info
+    iv_hv = classify_iv_hv(rank_info.get("atm_iv_pct") if rank_info else None,
+                            rank_info.get("hv_annualized_pct") if rank_info else None)
+    result["iv_hv"] = iv_hv
+    if iv_hv is None:
+        result["iv_hv_note"] = "Run the Screener (section 1) first so IV/HV data is cached for this symbol."
+
+    em = expected_move(spot, rank_info.get("atm_iv_pct") if rank_info else None, days_to_near)
+    result["expected_move"] = em
+    if em:
+        outside_sweet_spot = em["upper"] > near_call["strike"] or em["lower"] < near_put["strike"]
+        result["expected_move_vs_sweet_spot"] = (
+            f"{days_to_near}-day expected move (±₹{em['expected_move']}, range {em['lower']}–{em['upper']}) "
+            + ("extends BEYOND the short strikes (" + f"{near_put['strike']}–{near_call['strike']}"
+               + ") — a normal move could already erode profit before near expiry."
+               if outside_sweet_spot else
+               "comfortably stays WITHIN the short strikes (" + f"{near_put['strike']}–{near_call['strike']}"
+               + ") — favorable for this trade."))
+
+    trend = get_trend_regime(symbol)
+    result["trend"] = None if trend.get("error") else trend
+    if trend.get("error"):
+        result["trend_note"] = trend["error"]
+    if trend and not trend.get("error") and trend.get("avoid_premium_selling"):
+        result["trend_warning"] = (f"{trend['regime']} detected — calendars do best in range-bound/low-trend "
+                                    f"conditions; a strong trend risks pushing spot outside the sweet spot.")
+
+    vix, vix_err = get_india_vix()
+    iv_rank_for_regime = rank_info.get("iv_rank_pct") if rank_info else None
+    result["volatility_regime"] = classify_volatility_regime(vix, iv_rank_for_regime)
+    if vix_err:
+        result["volatility_regime"]["note"] = f"India VIX fetch failed ({vix_err}); classification unavailable."
+    # Calendars are LONG vega (unlike condors/strangles which are short vega) — a rising-IV regime
+    # after entry helps this trade, so flip the usual "avoid high vol" framing into a note here.
+    result["vega_note"] = ("This trade is net LONG vega (benefits if IV rises after entry) and net SHORT "
+                            "gamma near-term — opposite of the Iron Condor/Strangle builder's exposure. "
+                            "A low-IV entry (cheap far-month vega) with room for IV to expand is typically "
+                            "more favorable than entering when IV is already elevated.")
+
+    score_components = []
+    if iv_hv:
+        # For a long-vega trade, a LOW iv/hv ratio (calm now, room to expand) scores better — inverse
+        # of the condor/strangle scoring, which wants rich IV to sell.
+        inv_label = {"avoid": 90, "fair": 70, "good": 55, "excellent": 35}.get(iv_hv["label"].lower(), 50)
+        score_components.append(inv_label)
+    if trend and not trend.get("error"):
+        score_components.append(25 if trend.get("avoid_premium_selling") else 80)
+    if result["volatility_regime"]["label"] != "Unknown":
+        vr_score = {"Low Volatility": 80, "Normal": 65, "High Volatility": 35, "Extreme": 15}.get(
+            result["volatility_regime"]["label"], 50)
+        score_components.append(vr_score)
+    if rank_info and rank_info.get("fo_banned_today"):
+        score_components.append(0)
+    trade_quality_score = round(sum(score_components) / len(score_components), 1) if score_components else None
+    result["trade_quality_score"] = trade_quality_score
+    if trade_quality_score is not None:
+        result["trade_quality_label"] = ("Excellent" if trade_quality_score >= 80 else
+                                          "Good" if trade_quality_score >= 60 else
+                                          "Average" if trade_quality_score >= 40 else "Avoid")
+    result["trade_quality_note"] = ("Heuristic score for a LONG-VEGA/theta trade: rewards calm current IV "
+                                     "with room to rise, range-bound trend, and low-to-normal volatility "
+                                     "regime — the inverse of the premium-selling score elsewhere in this "
+                                     "dashboard. Not a probability, not backtested — a rough triage aid only.")
+
+    return result
+
+
+@app.route("/api/calendar-strategy/<symbol>")
+def calendar_strategy(symbol):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    strike_mode = request.args.get("strike_mode", "otm_pct")
+    otm_pct = float(request.args.get("otm_pct", DEFAULT_CALENDAR_OTM_PCT))
+    target_delta = float(request.args.get("target_delta", DEFAULT_CALENDAR_TARGET_DELTA))
+    near_expiry = request.args.get("near_expiry")
+    far_expiry = request.args.get("far_expiry")
+    lots = int(request.args.get("lots", 1))
+    result = build_double_calendar_strategy(symbol, strike_mode, otm_pct, target_delta,
+                                             near_expiry, far_expiry, lots)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
 @app.route("/api/trend/<symbol>")
 def trend(symbol):
     if not require_session():
@@ -1558,19 +1878,29 @@ def position_sizing():
 def position_greeks(position):
     """Per-position net Greeks via Black-Scholes at current quotes (Kite doesn't publish Greeks
     itself). Gamma/Vega/Theta are estimated by bump-and-reprice off the same bs_price/bs_delta
-    helpers used everywhere else in this file."""
+    helpers used everywhere else in this file. Handles double_calendar's two different expiries
+    (near legs use position['expiry'], far legs use position['far_expiry'])."""
     strategy_type = position.get("strategy_type", "iron_condor")
-    leg_keys = ["sell_call", "buy_call", "sell_put", "buy_put"] if strategy_type == "iron_condor" \
-        else ["sell_call", "sell_put"]
+    leg_keys = leg_keys_for(position)
     quantity = position.get("quantity", position["lot_size"])
     spot, err = get_spot_price(position["symbol"])
     if err:
         return {"error": err["error"]}
-    expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
-    days_left = max((expiry_date - datetime.now().date()).days, 0)
-    T = days_left / 365.0
-    if T <= 0:
-        return {"error": "Position has expired"}
+
+    today = datetime.now().date()
+    near_expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    days_left_near = max((near_expiry_date - today).days, 0)
+    far_expiry_date = None
+    days_left_far = None
+    if strategy_type == "double_calendar":
+        far_expiry_date = datetime.strptime(position["far_expiry"], "%Y-%m-%d").date()
+        days_left_far = max((far_expiry_date - today).days, 0)
+        if days_left_near <= 0 and days_left_far <= 0:
+            return {"error": "Position has expired"}
+    else:
+        if days_left_near <= 0:
+            return {"error": "Position has expired"}
+
     inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
     try:
         quotes = kite.quote(inst_keys)
@@ -1581,6 +1911,12 @@ def position_greeks(position):
     for k in leg_keys:
         strike = position["legs"][k]["strike"]
         opt_type = "CE" if "call" in k else "PE"
+        # calendars: near legs (sell_*_near) decay against the near expiry; far legs (buy_*_far)
+        # against the far expiry. Everything else (iron_condor/strangle) has a single shared expiry.
+        T = (days_left_far if (strategy_type == "double_calendar" and k.endswith("_far"))
+             else days_left_near) / 365.0
+        if T <= 0:
+            continue
         ltp = extract_price(quotes.get(f"NFO:{position['legs'][k]['tradingsymbol']}"))
         if ltp is None:
             return {"error": f"No usable price for {k}"}
@@ -1601,6 +1937,7 @@ def position_greeks(position):
 
     return {"net_delta": round(net_delta, 2), "net_gamma": round(net_gamma, 4),
             "net_vega": round(net_vega, 2), "net_theta": round(net_theta, 2)}
+
 
 
 @app.route("/api/portfolio-greeks")
@@ -1739,6 +2076,130 @@ def watchlist_add():
     return jsonify({"ok": True, "position": position})
 
 
+@app.route("/api/calendar-watchlist/add", methods=["POST"])
+def calendar_watchlist_add():
+    """Track-a-position counterpart of /api/watchlist/add, for Double Calendar Spreads. Kept as its
+    own endpoint (rather than overloading /api/watchlist/add) since the position shape is different
+    enough (two expiries, four legs with different leg-key names, debit instead of credit) to be
+    clearer as a separate, explicit flow — mirrors how this dashboard keeps the Calendar tab separate."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    symbol = body.get("symbol", "").upper()
+    strike_mode = body.get("strike_mode", "otm_pct")
+    otm_pct = float(body.get("otm_pct", DEFAULT_CALENDAR_OTM_PCT))
+    target_delta = float(body.get("target_delta", DEFAULT_CALENDAR_TARGET_DELTA))
+    near_expiry = body.get("near_expiry")
+    far_expiry = body.get("far_expiry")
+    lots = int(body.get("lots", 1))
+
+    built = build_double_calendar_strategy(symbol, strike_mode, otm_pct, target_delta,
+                                            near_expiry, far_expiry, lots)
+    if "error" in built:
+        return jsonify(built), 404
+
+    today_str = datetime.now().date().isoformat()
+    position = {
+        "id": f"{symbol}_CAL_{int(time.time())}",
+        "symbol": symbol,
+        "added_on": today_str,
+        "entry_spot": built["spot"],
+        "strategy_type": "double_calendar",
+        "strike_mode": built["strike_mode"],
+        "expiry": built["near_expiry"],          # "expiry" = the near/critical management date
+        "far_expiry": built["far_expiry"],
+        "lot_size": built["lot_size"],
+        "lots": built["lots"],
+        "quantity": built["quantity"],
+        "legs": built["legs"],
+        "entry_net_debit_per_share": built["net_debit_per_share"],
+        "entry_max_loss": built["max_loss"],
+        "entry_max_profit_estimated": built["max_profit_estimated"],
+        "entry_margin_required": built.get("margin_required"),
+        "entry_margin_error": built.get("margin_error"),
+        "entry_estimated_charges": built.get("estimated_entry_charges", {}).get("total"),
+        "breakevens": built["breakevens"],
+        "sweet_spot_range": built["sweet_spot_range"],
+        "broker_orders": [],
+        "history": [{"date": today_str, "spot": built["spot"],
+                     "pnl": 0.0, "current_debit_per_share": built["net_debit_per_share"]}],
+    }
+    positions = load_positions()
+    positions.append(position)
+    save_positions(positions)
+    return jsonify({"ok": True, "position": position})
+
+
+@app.route("/api/calendar-watchlist/<pos_id>/curve")
+def calendar_watchlist_curve(pos_id):
+    """Regenerates a LIVE payoff curve for an already-tracked calendar position, using current spot
+    and current far-leg IV (rather than the IV at entry time) — lets the Track Positions tab show how
+    the expected max-profit/max-loss shape has shifted since entry, not just the frozen entry-day curve."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    position = find_position(pos_id)
+    if not position or position.get("strategy_type") != "double_calendar":
+        return jsonify({"error": "Calendar position not found"}), 404
+
+    spot, err = get_spot_price(position["symbol"])
+    if err:
+        return jsonify(err), 404
+
+    today = datetime.now().date()
+    near_expiry = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    far_expiry = datetime.strptime(position["far_expiry"], "%Y-%m-%d").date()
+    days_to_near = max((near_expiry - today).days, 0)
+    days_between = max((far_expiry - near_expiry).days, 1)
+
+    call_strike = position["legs"]["sell_call_near"]["strike"]
+    put_strike = position["legs"]["sell_put_near"]["strike"]
+    quantity = position.get("quantity", position["lot_size"])
+
+    inst_keys = [f"NFO:{position['legs']['buy_call_far']['tradingsymbol']}",
+                 f"NFO:{position['legs']['buy_put_far']['tradingsymbol']}"]
+    try:
+        quotes = kite.quote(inst_keys)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    T_near_remaining = days_to_near / 365.0
+    far_call_ltp = extract_price(quotes.get(inst_keys[0]))
+    far_put_ltp = extract_price(quotes.get(inst_keys[1]))
+    if far_call_ltp is None or far_put_ltp is None:
+        return jsonify({"error": "No usable live price for one or both far legs"}), 400
+    call_iv = implied_vol(far_call_ltp, spot, call_strike, T_near_remaining + days_between / 365.0, "CE")
+    put_iv = implied_vol(far_put_ltp, spot, put_strike, T_near_remaining + days_between / 365.0, "PE")
+
+    entry_debit = position["entry_net_debit_per_share"]
+    T_far_remaining = days_between / 365.0
+
+    def pnl_at_spot(s_t):
+        near_call_intrinsic = max(s_t - call_strike, 0.0)
+        near_put_intrinsic = max(put_strike - s_t, 0.0)
+        far_call_value = bs_price(s_t, call_strike, T_far_remaining, RISK_FREE_RATE, call_iv, "CE")
+        far_put_value = bs_price(s_t, put_strike, T_far_remaining, RISK_FREE_RATE, put_iv, "PE")
+        position_value = (far_call_value - near_call_intrinsic) + (far_put_value - near_put_intrinsic)
+        return position_value - entry_debit
+
+    lo = spot * (1 - CALENDAR_CURVE_RANGE_PCT)
+    hi = spot * (1 + CALENDAR_CURVE_RANGE_PCT)
+    step = (hi - lo) / (CALENDAR_CURVE_POINTS - 1)
+    curve = []
+    for i in range(CALENDAR_CURVE_POINTS):
+        s_t = lo + i * step
+        curve.append({"spot": round(s_t, 2), "pnl": round(pnl_at_spot(s_t) * quantity, 2)})
+
+    return jsonify({
+        "position_id": pos_id, "spot": spot, "days_to_near_expiry": days_to_near,
+        "curve": curve, "sweet_spot_range": [put_strike, call_strike],
+        "note": "Live re-estimate using current spot and today's implied vol on the far legs — the "
+                "curve shape will keep shifting daily as time passes and IV moves; treat it as a "
+                "current best-guess snapshot, not a fixed prediction."
+    })
+
+
+
+
 @app.route("/api/watchlist/<pos_id>", methods=["DELETE"])
 def watchlist_remove(pos_id):
     positions = load_positions()
@@ -1747,7 +2208,143 @@ def watchlist_remove(pos_id):
     return jsonify({"ok": True})
 
 
+def mark_to_market_calendar(position):
+    """Double Calendar equivalent of mark_to_market() below — kept separate because the P&L math,
+    zone logic, and exit rules are genuinely different for a debit calendar vs a credit condor/strangle
+    (two expiries, model-based re-valuation of the far leg instead of a simple credit/debit diff)."""
+    quantity = position.get("quantity", position["lot_size"])
+    leg_keys = ["sell_call_near", "sell_put_near", "buy_call_far", "buy_put_far"]
+
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    quotes = kite.quote(inst_keys)
+
+    prices, missing_legs = {}, []
+    for k in leg_keys:
+        key = f"NFO:{position['legs'][k]['tradingsymbol']}"
+        price = extract_price(quotes.get(key))
+        prices[k] = price
+        if price is None:
+            missing_legs.append(f"{k} ({position['legs'][k]['tradingsymbol']})")
+    if missing_legs:
+        return {"__error__": "No usable price for: " + ", ".join(missing_legs) +
+                              ". Contract may be expired/delisted, or market closed with no resting orders."}
+
+    # Current cost to CLOSE this spread: sell the far longs at their ltp, buy back the near shorts
+    # at their ltp. Position value rising above the entry debit is what "profit" means here.
+    current_value_per_share = ((prices["buy_call_far"] - prices["sell_call_near"]) +
+                                (prices["buy_put_far"] - prices["sell_put_near"]))
+    entry_debit = position["entry_net_debit_per_share"]
+    pnl_per_share = current_value_per_share - entry_debit
+    pnl = round(pnl_per_share * quantity, 2)
+    current_position_value = round(current_value_per_share * quantity, 2)
+
+    spot, err = get_spot_price(position["symbol"])
+    if err:
+        return {"__error__": err["error"]}
+
+    today = datetime.now().date()
+    near_expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    far_expiry_date = datetime.strptime(position["far_expiry"], "%Y-%m-%d").date()
+    days_left = (near_expiry_date - today).days
+    T_near_remaining = max(days_left, 0) / 365.0
+
+    call_strike = position["legs"]["sell_call_near"]["strike"]
+    put_strike = position["legs"]["sell_put_near"]["strike"]
+    sweet_spot_lo, sweet_spot_hi = put_strike, call_strike
+
+    zone = "safe"
+    if spot > sweet_spot_hi or spot < sweet_spot_lo:
+        zone = "outside_sweet_spot"
+    if days_left <= CALENDAR_NEAR_EXPIRY_DAYS_WARNING:
+        zone = "near_expiry"
+
+    delta_call = delta_put = None
+    if days_left > 0:
+        iv_call = implied_vol(prices["sell_call_near"], spot, call_strike, T_near_remaining, "CE")
+        iv_put = implied_vol(prices["sell_put_near"], spot, put_strike, T_near_remaining, "PE")
+        delta_call = bs_delta(spot, call_strike, T_near_remaining, RISK_FREE_RATE, iv_call, "CE")
+        delta_put = bs_delta(spot, put_strike, T_near_remaining, RISK_FREE_RATE, iv_put, "PE")
+
+    # Probability spot is still WITHIN the sweet spot (between the two short strikes) at near expiry —
+    # lognormal approx using the same expected-move machinery used elsewhere in this file.
+    probability_in_sweet_spot = None
+    rank_info = get_stock_rank(position["symbol"])
+    atm_iv_pct = rank_info.get("atm_iv_pct") if rank_info else None
+    if atm_iv_pct and days_left > 0 and spot:
+        sigma = atm_iv_pct / 100.0
+        T = days_left / 365.0
+        if sigma > 0 and T > 0:
+            d_hi = (math.log(sweet_spot_hi / spot)) / (sigma * math.sqrt(T))
+            d_lo = (math.log(sweet_spot_lo / spot)) / (sigma * math.sqrt(T))
+            probability_in_sweet_spot = round((norm_cdf(d_hi) - norm_cdf(d_lo)) * 100, 1)
+    elif days_left <= 0:
+        probability_in_sweet_spot = 100.0 if zone == "safe" else 0.0
+
+    # --- Exit suggestion (informational only) ---
+    exit_suggested, exit_reasons = False, []
+    entry_debit_total = abs(entry_debit * quantity)
+    if entry_debit_total and pnl <= -CALENDAR_STOP_LOSS_DEBIT_MULTIPLE * entry_debit_total:
+        exit_suggested = True
+        exit_reasons.append(f"Loss (₹{abs(pnl)}) has reached {CALENDAR_STOP_LOSS_DEBIT_MULTIPLE}x the debit "
+                             f"paid (₹{round(entry_debit_total,2)}).")
+    if zone == "outside_sweet_spot":
+        exit_suggested = True
+        exit_reasons.append(f"Spot (₹{spot}) has moved outside the sweet spot range "
+                             f"({sweet_spot_lo}–{sweet_spot_hi}) — the near leg is losing its edge.")
+    if days_left <= CALENDAR_NEAR_EXPIRY_DAYS_WARNING and days_left >= 0:
+        exit_suggested = True
+        exit_reasons.append(f"Only {days_left} day(s) to near-leg expiry — consider closing or rolling "
+                             f"the near leg to manage gamma/assignment risk.")
+
+    event_flag = get_event_before_expiry(position["expiry"])
+
+    exit_orders_for_charges = [
+        {"price": prices["sell_call_near"], "quantity": quantity, "transaction_type": "BUY"},
+        {"price": prices["sell_put_near"], "quantity": quantity, "transaction_type": "BUY"},
+        {"price": prices["buy_call_far"], "quantity": quantity, "transaction_type": "SELL"},
+        {"price": prices["buy_put_far"], "quantity": quantity, "transaction_type": "SELL"},
+    ]
+    exit_charges = estimate_charges(exit_orders_for_charges)
+    entry_charges_total = position.get("entry_estimated_charges") or 0
+    round_trip_charges = round(entry_charges_total + exit_charges["total"], 2)
+    net_pnl_after_charges = round(pnl - round_trip_charges, 2)
+
+    leg_details = {}
+    for k in leg_keys:
+        entry_price = position["legs"][k]["ltp"]
+        current_price = prices[k]
+        is_sell = k.startswith("sell")
+        per_share = (entry_price - current_price) if is_sell else (current_price - entry_price)
+        leg_details[k] = {
+            "tradingsymbol": position["legs"][k]["tradingsymbol"],
+            "strike": position["legs"][k]["strike"],
+            "entry_price": entry_price, "current_price": round(current_price, 2),
+            "pnl": round(per_share * quantity, 2),
+        }
+        if k == "sell_call_near" and delta_call is not None:
+            leg_details[k]["current_delta"] = round(delta_call, 3)
+        if k == "sell_put_near" and delta_put is not None:
+            leg_details[k]["current_delta"] = round(delta_put, 3)
+
+    entry_max_profit = position.get("entry_max_profit_estimated")
+    return {
+        "spot": spot, "pnl": pnl, "current_debit_per_share": round(current_value_per_share, 2),
+        "current_position_value": current_position_value, "legs_current": leg_details,
+        "days_left": days_left, "zone": zone,
+        "probability_in_sweet_spot_pct": probability_in_sweet_spot,
+        "pct_of_max_profit": round((pnl / entry_max_profit * 100), 1) if entry_max_profit else None,
+        "exit_suggested": exit_suggested, "exit_reasons": exit_reasons,
+        "event_before_expiry": event_flag,
+        "entry_charges": entry_charges_total, "estimated_exit_charges": exit_charges["total"],
+        "estimated_round_trip_charges": round_trip_charges, "net_pnl_after_charges": net_pnl_after_charges,
+        "sweet_spot_range": [sweet_spot_lo, sweet_spot_hi],
+    }
+
+
 def mark_to_market(position):
+    if position.get("strategy_type") == "double_calendar":
+        return mark_to_market_calendar(position)
+
     strategy_type = position.get("strategy_type", "iron_condor")
     leg_keys = ["sell_call", "buy_call", "sell_put", "buy_put"] if strategy_type == "iron_condor" \
         else ["sell_call", "sell_put"]
@@ -1903,8 +2500,12 @@ def watchlist():
 # Order execution — preview (no side effects) then confirm (places real orders)
 # ---------------------------------------------------------------------------
 def leg_keys_for(position):
-    return ["sell_call", "buy_call", "sell_put", "buy_put"] if position.get("strategy_type") == "iron_condor" \
-        else ["sell_call", "sell_put"]
+    st = position.get("strategy_type")
+    if st == "iron_condor":
+        return ["sell_call", "buy_call", "sell_put", "buy_put"]
+    if st == "double_calendar":
+        return ["sell_call_near", "sell_put_near", "buy_call_far", "buy_put_far"]
+    return ["sell_call", "sell_put"]
 
 
 ORDER_TERMINAL_STATUSES = ("COMPLETE", "REJECTED", "CANCELLED")
@@ -2427,8 +3028,22 @@ def chart(symbol):
     clamped = requested_days > max_days
 
     to_date = datetime.now()
-    from_date = to_date - timedelta(days=days + (15 if interval == "day" else 3))
+    from_date = to_date - timedelta(days=days + (15 if interval == "day" else 5))
     candles = kite.historical_data(token, from_date, to_date, interval)
+
+    if interval != "day":
+        # The window above is padded (weekends/holidays could otherwise leave fewer trading
+        # sessions than requested), so it can return MORE trading days than `days` asked for.
+        # Trim down to exactly the most recent `days` trading days so a short lookback (e.g. 1
+        # day) doesn't silently keep showing extra earlier sessions -- which is what made the
+        # chart look like it "wasn't updating" when you changed the lookback control.
+        by_day = {}
+        for c in candles:
+            d = c["date"]
+            key = d.date() if hasattr(d, "date") else str(d)[:10]
+            by_day.setdefault(key, []).append(c)
+        wanted_days = sorted(by_day.keys())[-days:]
+        candles = [c for day_key in wanted_days for c in by_day[day_key]]
 
     def fmt_date(c):
         d = c["date"]
@@ -2522,6 +3137,615 @@ def news(symbol):
                      "environment variable before running backend.py.")
     return jsonify({"symbol": symbol, "headlines": [],
                      "error": "Could not fetch news from any source. " + (error or "") + guidance})
+
+
+# ---------------------------------------------------------------------------
+# AUTO TRADE MODE — rule-based intraday breakout scanner + option buyer
+# ---------------------------------------------------------------------------
+# What this actually is, in plain terms:
+#   - It is NOT an AI making trading judgements. It is a simple, fully-visible technical rule:
+#     price breaks above/below its recent N-candle range (a Donchian-channel breakout), with a
+#     minimum move size in ATR units and (best-effort) volume confirmation.
+#   - On a qualifying breakout it buys the ATM option in the breakout direction (CE for an
+#     upside break, PE for a downside break) using MIS (intraday) product, sized off a rupee
+#     budget you set, then manages that ONE position with a premium-based stop-loss, a
+#     premium-based target, and a trailing stop once it's in profit — until SL/target/trailing
+#     stop hits, or the end-of-day square-off time, whichever comes first.
+#   - MANUAL mode: it scans continuously and shows you the ranked signal — nothing is ever sent
+#     to your broker until you click "Execute this signal".
+#   - AUTO mode: after you click OK on the confirmation dialog, it places that entry order the
+#     moment a qualifying signal appears, with no per-trade click. This is real money, unattended.
+#     Hard safety rails below (daily trade cap, daily loss cap, single-position-at-a-time, kill
+#     switch) exist specifically because of that — they are not optional and cannot be disabled
+#     from the UI.
+#   - Universe: either a hand-picked list, OR "scan_all_fo" mode, which rotates through the ENTIRE
+#     live F&O stock list (indices always included) a batch at a time, staying under Kite's
+#     historical-data rate limit -- see _effective_scan_universe().
+#   - Signal model: Donchian-channel breakout scored with THREE confirmation layers -- EMA9/21
+#     trend agreement, RSI(14) momentum, and continuous relative volume -- combined into one
+#     composite score. Still fully rules-based and transparent (see _detect_breakout()); it is
+#     NOT a proven or guaranteed-profitable strategy, and false breakouts remain one of the most
+#     common ways to lose money in intraday trading. Past behavior of this logic on any symbol
+#     says nothing about future results. Only ever risk capital you can afford to lose, and watch
+#     your Zerodha app while Auto mode is armed.
+# ---------------------------------------------------------------------------
+AUTOTRADE_FILE = os.path.join(os.path.dirname(__file__), "autotrade_state.json")
+AUTOTRADE_TRADES_FILE = os.path.join(os.path.dirname(__file__), "autotrade_trades.json")
+_autotrade_lock = threading.Lock()
+
+AUTOTRADE_MARKET_OPEN = "09:20"   # a few minutes after the 9:15 open, letting the opening range settle
+
+AUTOTRADE_DEFAULTS = {
+    "enabled": False,                 # is the scan/execute loop armed at all
+    "mode": "manual",                 # "manual" (show signal, wait for click) or "auto" (self-execute)
+    "universe": ["NIFTY", "BANKNIFTY", "FINNIFTY"],   # symbols to scan when scan_all_fo is OFF
+    "scan_all_fo": False,             # when True, scans the ENTIRE live F&O stock universe (every
+                                       # NFO-OPT name) instead of just `universe` above -- see
+                                       # _effective_scan_universe() for how this is rate-limited
+    "_fo_scan_cursor": 0,             # internal: rotation position through the full F&O list
+    "candle_interval": "5minute",
+    "breakout_lookback": 20,          # candles in the Donchian channel
+    "poll_seconds": 20,
+    "max_trades_per_day": 3,
+    "capital_per_trade": 15000,       # approx premium budget (Rs) used to size lots
+    "max_daily_loss": 5000,           # Rs; auto-disarms Auto mode the instant realized loss hits this
+    "sl_pct_of_premium": 30,          # stop-loss = premium paid minus this %
+    "target_pct_of_premium": 60,      # target = premium paid plus this %
+    "trail_after_pct": 30,            # once profit reaches this %, switch to trailing-stop mode
+    "trail_giveback_pct": 15,         # trailing stop = peak-profit% minus this many percentage points
+    "min_breakout_score": 0.5,        # minimum breakout size, in ATR multiples, to qualify as a signal
+    "square_off_time": "15:15",       # force-exit any open auto-trade by this time regardless of SL/target
+    "trades_today": 0,
+    "realized_pnl_today": 0.0,
+    "day": None,
+    "last_scan_at": None,
+    "last_scan_candidates": [],
+    "last_error": None,
+    "disarm_reason": None,
+}
+
+CONFIGURABLE_AUTOTRADE_KEYS = (
+    "universe", "scan_all_fo", "candle_interval", "breakout_lookback", "poll_seconds",
+    "max_trades_per_day", "capital_per_trade", "max_daily_loss", "sl_pct_of_premium",
+    "target_pct_of_premium", "trail_after_pct", "trail_giveback_pct", "min_breakout_score",
+    "square_off_time",
+)
+
+# --- "Scan all F&O stocks" mode ---
+# Kite's historical-data endpoint is rate-limited to roughly 3 requests/second. The live F&O stock
+# list is typically ~180-220 names, so scanning all of them in one go takes well over a minute and
+# would blow through that limit if it were retried every `poll_seconds`. Instead of scanning
+# everything every cycle, the loop rotates through the full list a chunk at a time (covering it all
+# every few minutes) and calls to Kite are staggered. The background loop also has a floor on how
+# often it's allowed to run while this mode is on.
+FO_SCAN_CHUNK_SIZE = 40            # symbols scanned per background poll cycle when scan_all_fo is on
+FO_SCAN_MIN_POLL_SECONDS = 45      # floor on poll_seconds while scan_all_fo is on
+HISTORICAL_CALL_STAGGER_SECONDS = 0.35   # ~2.8 req/sec between historical-data calls, under Kite's cap
+
+
+def _effective_scan_universe(state):
+    """Returns the symbols to scan THIS cycle. If scan_all_fo is off, that's just the configured
+    `universe`. If it's on, rotates through the full live F&O stock list (indices always included)
+    in FO_SCAN_CHUNK_SIZE-sized slices, advancing the cursor stored in state each call, so the
+    entire universe gets covered progressively across consecutive cycles rather than all at once."""
+    if not state.get("scan_all_fo"):
+        return state.get("universe") or list(AUTOTRADE_DEFAULTS["universe"])
+    try:
+        full = list(INDEX_SYMBOLS.keys()) + fo_stock_universe()
+    except Exception:
+        return state.get("universe") or list(AUTOTRADE_DEFAULTS["universe"])
+    if not full:
+        return state.get("universe") or list(AUTOTRADE_DEFAULTS["universe"])
+    cursor = state.get("_fo_scan_cursor", 0) % len(full)
+    rotated = full[cursor:] + full[:cursor]
+    chunk = rotated[:FO_SCAN_CHUNK_SIZE]
+    state["_fo_scan_cursor"] = (cursor + FO_SCAN_CHUNK_SIZE) % len(full)
+    return chunk
+
+
+def load_autotrade_state():
+    state = dict(AUTOTRADE_DEFAULTS)
+    if os.path.exists(AUTOTRADE_FILE):
+        try:
+            with open(AUTOTRADE_FILE, "r") as f:
+                state.update(json.load(f))
+        except Exception:
+            pass
+    return state
+
+
+def save_autotrade_state(state):
+    with _autotrade_lock:
+        with open(AUTOTRADE_FILE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+
+
+def load_autotrade_trades():
+    if not os.path.exists(AUTOTRADE_TRADES_FILE):
+        return []
+    try:
+        with open(AUTOTRADE_TRADES_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_autotrade_trades(trades):
+    with _autotrade_lock:
+        with open(AUTOTRADE_TRADES_FILE, "w") as f:
+            json.dump(trades, f, indent=2, default=str)
+
+
+def _autotrade_roll_day_if_needed(state):
+    """Resets the daily trade counter / P&L exactly once per calendar day. Does NOT touch any
+    currently-open trade -- that's handled by the end-of-day square-off check in the monitor loop."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if state.get("day") != today_str:
+        state["day"] = today_str
+        state["trades_today"] = 0
+        state["realized_pnl_today"] = 0.0
+        state["disarm_reason"] = None
+    return state
+
+
+def _fetch_recent_intraday(symbol, interval, lookback):
+    token, err = resolve_token_for_symbol(symbol)
+    if err:
+        return None, err
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=7)  # a bit more history so EMA21/RSI14 have enough bars
+    try:
+        candles = kite.historical_data(token, from_date, to_date, interval)
+    except Exception as e:
+        return None, str(e)
+    min_needed = max(lookback + 5, 30)
+    if len(candles) < min_needed:
+        return None, "Not enough intraday candles yet today for a reliable channel"
+    return candles, None
+
+
+def _ema(values, period):
+    """Simple exponential moving average over `values` (oldest-first), seeded with the first value."""
+    if len(values) < period:
+        return None
+    alpha = 2.0 / (period + 1)
+    ema = float(values[0])
+    for v in values[1:]:
+        ema = alpha * float(v) + (1 - alpha) * ema
+    return ema
+
+
+def _rsi(closes, period=14):
+    """Wilder-style RSI (simple-average variant) over the trailing `period` bars."""
+    closes = np.asarray(closes, dtype=float)
+    if len(closes) < period + 1:
+        return None
+    deltas = np.diff(closes[-(period + 1):])
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain, avg_loss = float(np.mean(gains)), float(np.mean(losses))
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1 + rs))
+
+
+def _detect_breakout(candles, lookback):
+    """Donchian-channel breakout PLUS three confirmation layers, combined into one transparent
+    composite score (still fully rules-based -- every input is echoed in `reasoning`, no black box):
+
+      1. Breakout size   -- how far the close is outside the prior `lookback`-candle range, in ATR.
+      2. Trend alignment -- EMA9 vs EMA21: does the breakout agree with the prevailing short-term
+                             trend, or is it a counter-trend poke that's more likely to fail?
+      3. Momentum        -- RSI(14): is momentum actually pushing the same direction as the break?
+      4. Relative volume -- today's bar's volume vs the recent average, scaled continuously instead
+                             of a blunt above/below-average flag.
+
+    Returns None if there's no breakout at all."""
+    highs = np.array([c["high"] for c in candles], dtype=float)
+    lows = np.array([c["low"] for c in candles], dtype=float)
+    closes = np.array([c["close"] for c in candles], dtype=float)
+    volumes = np.array([c.get("volume", 0) or 0 for c in candles], dtype=float)
+
+    window_highs = highs[-(lookback + 1):-1]
+    window_lows = lows[-(lookback + 1):-1]
+    channel_high = float(np.max(window_highs))
+    channel_low = float(np.min(window_lows))
+    last_close = float(closes[-1])
+
+    tr = np.maximum(highs[1:] - lows[1:],
+                     np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
+    atr = float(np.mean(tr[-lookback:])) if len(tr) >= lookback else (float(np.mean(tr)) if len(tr) else 0.0)
+    if atr <= 0:
+        return None
+
+    prior_vol = volumes[-(lookback + 1):-1]
+    avg_vol = float(np.mean(prior_vol)) if prior_vol.size else 0.0
+    last_vol = float(volumes[-1])
+    rel_volume = round(last_vol / avg_vol, 2) if avg_vol > 0 else None
+    vol_confirmed = (avg_vol == 0) or (last_vol >= avg_vol * 1.2)
+
+    direction, breakout_level = None, None
+    if last_close > channel_high:
+        direction, breakout_level = "CE", channel_high
+    elif last_close < channel_low:
+        direction, breakout_level = "PE", channel_low
+    if not direction:
+        return None
+
+    breakout_size_score = abs(last_close - breakout_level) / atr
+
+    ema_fast = _ema(closes[-min(len(closes), 60):], 9)
+    ema_slow = _ema(closes[-min(len(closes), 60):], 21)
+    trend_aligned = None
+    if ema_fast is not None and ema_slow is not None:
+        trend_aligned = (ema_fast > ema_slow) if direction == "CE" else (ema_fast < ema_slow)
+
+    rsi = _rsi(closes, 14)
+    momentum_aligned = None
+    if rsi is not None:
+        momentum_aligned = (rsi > 55) if direction == "CE" else (rsi < 45)
+
+    # Composite: breakout size is the base signal; trend agreement and momentum each scale it up,
+    # a counter-trend breakout gets heavily discounted (those fail far more often intraday), and
+    # relative volume scales it continuously rather than as a flat bonus.
+    composite = breakout_size_score
+    if trend_aligned is True:
+        composite *= 1.25
+    elif trend_aligned is False:
+        composite *= 0.6
+    if momentum_aligned is True:
+        composite *= 1.15
+    if rel_volume is not None:
+        composite *= min(max(rel_volume, 0.5), 2.5) / 1.2
+
+    score = round(composite, 2)
+
+    return {
+        "direction": direction, "score": score, "breakout_size_atr": round(breakout_size_score, 2),
+        "breakout_level": round(breakout_level, 2), "last_close": round(last_close, 2),
+        "atr": round(atr, 2), "volume_confirmed": bool(vol_confirmed), "rel_volume": rel_volume,
+        "trend_aligned": trend_aligned, "momentum_aligned": momentum_aligned,
+        "rsi": round(rsi, 1) if rsi is not None else None,
+        "channel_high": round(channel_high, 2), "channel_low": round(channel_low, 2),
+    }
+
+
+def scan_breakouts(universe, interval, lookback):
+    """Ranked, fully-transparent list of breakout candidates across the given universe. Every
+    candidate carries a plain-English `reasoning` string -- this IS the "why" shown in the UI, there
+    is no hidden model behind it. Calls are staggered to stay under Kite's historical-data rate
+    limit when scanning long lists (e.g. the full F&O universe)."""
+    candidates, errors = [], []
+    for idx, symbol in enumerate(universe):
+        if idx > 0:
+            time.sleep(HISTORICAL_CALL_STAGGER_SECONDS)
+        candles, err = _fetch_recent_intraday(symbol, interval, lookback)
+        if err:
+            errors.append(f"{symbol}: {err}")
+            continue
+        result = _detect_breakout(candles, lookback)
+        if not result:
+            continue
+        result["symbol"] = symbol
+        direction_word = "broke above" if result["direction"] == "CE" else "broke below"
+        trend_note = ("EMA9/21 trend agrees" if result["trend_aligned"] is True else
+                       "EMA9/21 trend disagrees (counter-trend, discounted)" if result["trend_aligned"] is False
+                       else "trend unavailable")
+        momentum_note = (f"RSI {result['rsi']} agrees" if result["momentum_aligned"] is True else
+                          f"RSI {result['rsi']} disagrees" if result["momentum_aligned"] is False
+                          else "RSI unavailable")
+        vol_note = (f"relative volume {result['rel_volume']}x average" if result["rel_volume"] is not None
+                    else "no average-volume baseline yet")
+        result["reasoning"] = (
+            f"{symbol}: price {direction_word} its {lookback}-candle range ({result['breakout_level']}), "
+            f"now at {result['last_close']} -- {result['breakout_size_atr']}x ATR raw move; "
+            f"{trend_note}; {momentum_note}; {vol_note}. Composite score {result['score']}."
+        )
+        candidates.append(result)
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates, errors
+
+
+def _build_autotrade_order(candidate_symbol, direction, capital_per_trade):
+    return _build_autotrade_order_impl(candidate_symbol, direction, capital_per_trade)
+
+
+def _build_autotrade_order_impl(symbol, direction, capital_per_trade):
+    data, err = get_chain_for_symbol(symbol)
+    if err:
+        return None, err.get("error", str(err))
+    chain, lot_size, spot = data["chain"], data["lot_size"], data["spot"]
+    opts = [o for o in chain if o["instrument_type"] == direction]
+    if not opts:
+        return None, f"No {direction} contracts found for {symbol}"
+    atm = min(opts, key=lambda o: abs(o["strike"] - spot))
+    if not atm.get("ltp") or atm["ltp"] <= 0:
+        return None, "Could not get a valid live price for the ATM option"
+    premium = atm["ltp"]
+    lots = max(1, int(capital_per_trade // (premium * lot_size)))
+    return {
+        "symbol": symbol, "direction": direction, "tradingsymbol": atm["tradingsymbol"],
+        "strike": atm["strike"], "expiry": str(data["expiry"]), "lot_size": lot_size,
+        "lots": lots, "quantity": lots * lot_size, "premium": premium, "spot": spot,
+    }, None
+
+
+def _execute_autotrade_entry(candidate, state):
+    order_info, err = _build_autotrade_order(candidate["symbol"], candidate["direction"], state["capital_per_trade"])
+    if err:
+        return None, err
+    leg = {"leg": "auto_entry", "tradingsymbol": order_info["tradingsymbol"],
+           "transaction_type": "BUY", "quantity": order_info["quantity"]}
+    # MIS (intraday) product on purpose for auto-trades: it carries the broker's OWN automatic
+    # end-of-day square-off as a second, independent safety net on top of ours.
+    results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+    result = results[0] if results else {"status": "failed", "error": "No result returned"}
+    if result["status"] != "placed":
+        return None, result.get("error", "Order failed")
+
+    premium = order_info["premium"]
+    sl_price = round(premium * (1 - state["sl_pct_of_premium"] / 100.0), 2)
+    target_price = round(premium * (1 + state["target_pct_of_premium"] / 100.0), 2)
+    trade = {
+        "id": f"AT{int(time.time() * 1000)}", "symbol": order_info["symbol"], "direction": order_info["direction"],
+        "tradingsymbol": order_info["tradingsymbol"], "strike": order_info["strike"], "expiry": order_info["expiry"],
+        "quantity": order_info["quantity"], "lot_size": order_info["lot_size"], "entry_price": premium,
+        "sl_price": sl_price, "target_price": target_price, "trail_active": False,
+        "breakout_level": candidate["breakout_level"], "reasoning": candidate["reasoning"],
+        "order_id": result.get("order_id"), "status": "open", "opened_at": datetime.now().isoformat(),
+        "closed_at": None, "exit_reason": None, "exit_price": None, "realized_pnl": None,
+        "last_ltp": premium, "mode": state["mode"],
+    }
+    return trade, None
+
+
+def _execute_autotrade_exit(trade, reason):
+    leg = {"leg": "auto_exit", "tradingsymbol": trade["tradingsymbol"],
+           "transaction_type": "SELL", "quantity": trade["quantity"]}
+    results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+    result = results[0] if results else {"status": "failed", "error": "No result returned"}
+    trade["status"] = "closed"
+    trade["closed_at"] = datetime.now().isoformat()
+    trade["exit_order_status"] = result["status"]
+    if result["status"] != "placed":
+        trade["exit_reason"] = reason + " -- EXIT ORDER FAILED, check your Zerodha app IMMEDIATELY"
+        trade["exit_price"], trade["realized_pnl"] = None, None
+        return trade
+    exit_price = trade.get("last_ltp", trade["entry_price"])
+    trade["exit_reason"] = reason
+    trade["exit_price"] = exit_price
+    trade["realized_pnl"] = round((exit_price - trade["entry_price"]) * trade["quantity"], 2)
+    return trade
+
+
+def _monitor_autotrade_positions(state, trades):
+    """Checks every open auto-trade against SL / target / trailing-stop / EOD square-off, and
+    exits it immediately (real market order) the instant any condition trips."""
+    changed = False
+    for trade in trades:
+        if trade["status"] != "open":
+            continue
+        try:
+            q = kite.quote([f"NFO:{trade['tradingsymbol']}"]).get(f"NFO:{trade['tradingsymbol']}")
+            ltp = extract_price(q)
+        except Exception as e:
+            state["last_error"] = f"Quote fetch failed for {trade['tradingsymbol']}: {e}"
+            continue
+        if not ltp:
+            continue
+        trade["last_ltp"] = ltp
+        pnl_pct = (ltp / trade["entry_price"] - 1) * 100.0
+
+        if pnl_pct >= state["trail_after_pct"]:
+            new_sl = trade["entry_price"] * (1 + (pnl_pct - state["trail_giveback_pct"]) / 100.0)
+            if new_sl > trade["sl_price"]:
+                trade["sl_price"] = round(new_sl, 2)
+                trade["trail_active"] = True
+
+        now_str = datetime.now().strftime("%H:%M")
+        reason = None
+        if ltp <= trade["sl_price"]:
+            reason = "Trailing stop hit" if trade["trail_active"] else "Stop loss hit"
+        elif ltp >= trade["target_price"] and not trade["trail_active"]:
+            reason = "Target hit"
+        elif now_str >= state.get("square_off_time", "15:15"):
+            reason = "End-of-day square-off"
+
+        if reason:
+            _execute_autotrade_exit(trade, reason)
+            state["realized_pnl_today"] = round(state.get("realized_pnl_today", 0.0) + (trade["realized_pnl"] or 0.0), 2)
+            changed = True
+    return changed
+
+
+def _autotrade_loop():
+    """Background daemon thread -- always running, but only acts once logged in AND armed
+    (state['enabled']). Sleeps state['poll_seconds'] between iterations."""
+    while True:
+        sleep_for = AUTOTRADE_DEFAULTS["poll_seconds"]
+        try:
+            if SESSION.get("access_token"):
+                state = load_autotrade_state()
+                state = _autotrade_roll_day_if_needed(state)
+                trades = load_autotrade_trades()
+                changed = _monitor_autotrade_positions(state, trades)
+
+                if state.get("realized_pnl_today", 0.0) <= -abs(state.get("max_daily_loss", 5000)) and state["enabled"]:
+                    state["enabled"] = False
+                    state["disarm_reason"] = (f"Daily loss limit of Rs {state['max_daily_loss']} reached "
+                                               f"(realized P&L today: Rs {state['realized_pnl_today']}). Auto mode disarmed.")
+                    changed = True
+
+                has_open = any(t["status"] == "open" for t in trades)
+                now_str = datetime.now().strftime("%H:%M")
+                within_hours = AUTOTRADE_MARKET_OPEN <= now_str <= state.get("square_off_time", "15:15")
+
+                if (state["enabled"] and not has_open and within_hours
+                        and state.get("trades_today", 0) < state.get("max_trades_per_day", 3)):
+                    scan_universe = _effective_scan_universe(state)
+                    candidates, errors = scan_breakouts(scan_universe, state["candle_interval"],
+                                                         state["breakout_lookback"])
+                    state["last_scan_at"] = datetime.now().isoformat()
+                    state["last_scan_candidates"] = candidates[:10]
+                    state["last_scan_universe_size"] = len(scan_universe)
+                    state["last_error"] = "; ".join(errors[:3]) if errors else state.get("last_error")
+                    changed = True
+
+                    # Advanced qualification: strong enough composite score, NOT counter-trend
+                    # (trend_aligned is False), and at least one of volume/momentum confirming.
+                    best = next((c for c in candidates if c["score"] >= state.get("min_breakout_score", 0.5)
+                                 and c.get("trend_aligned") is not False
+                                 and (c["volume_confirmed"] or c.get("momentum_aligned"))), None)
+                    if best and state["mode"] == "auto":
+                        trade, err = _execute_autotrade_entry(best, state)
+                        if trade:
+                            trades.append(trade)
+                            state["trades_today"] = state.get("trades_today", 0) + 1
+                        else:
+                            state["last_error"] = f"Auto-entry failed for {best['symbol']}: {err}"
+
+                if changed:
+                    save_autotrade_state(state)
+                    save_autotrade_trades(trades)
+                sleep_for = state.get("poll_seconds", 20)
+                if state.get("scan_all_fo"):
+                    sleep_for = max(sleep_for, FO_SCAN_MIN_POLL_SECONDS)
+        except Exception as e:
+            logger.exception("autotrade loop error")
+            try:
+                err_state = load_autotrade_state()
+                err_state["last_error"] = f"Loop error: {e}"
+                save_autotrade_state(err_state)
+            except Exception:
+                pass
+        time.sleep(max(5, sleep_for))
+
+
+@app.route("/api/autotrade/state")
+def autotrade_state_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    state = _autotrade_roll_day_if_needed(load_autotrade_state())
+    save_autotrade_state(state)
+    trades = load_autotrade_trades()
+    open_trades = [t for t in trades if t["status"] == "open"]
+    recent_trades = sorted(trades, key=lambda t: t["opened_at"], reverse=True)[:25]
+    return jsonify({"state": state, "open_trades": open_trades, "recent_trades": recent_trades})
+
+
+@app.route("/api/autotrade/config", methods=["POST"])
+def autotrade_config():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    state = load_autotrade_state()
+    for key in CONFIGURABLE_AUTOTRADE_KEYS:
+        if key in body:
+            state[key] = body[key]
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/autotrade/arm", methods=["POST"])
+def autotrade_arm():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    mode = body.get("mode", "manual")
+    if mode not in ("manual", "auto"):
+        return jsonify({"error": "mode must be 'manual' or 'auto'"}), 400
+    if mode == "auto" and body.get("ack") is not True:
+        return jsonify({"error": "Auto-execute mode requires explicit confirmation (ack: true) that "
+                                  "this places real orders automatically."}), 400
+    state = _autotrade_roll_day_if_needed(load_autotrade_state())
+    state["mode"], state["enabled"], state["disarm_reason"] = mode, True, None
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/autotrade/disarm", methods=["POST"])
+def autotrade_disarm():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    state = load_autotrade_state()
+    state["enabled"] = False
+    state["disarm_reason"] = "Manually stopped by user."
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/autotrade/close-all", methods=["POST"])
+def autotrade_close_all():
+    """Kill switch for POSITIONS (separate from /disarm, which only stops new entries): force-exits
+    any currently open auto-trade at market, right now."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    trades = load_autotrade_trades()
+    state = load_autotrade_state()
+    closed_any = False
+    for trade in trades:
+        if trade["status"] == "open":
+            try:
+                q = kite.quote([f"NFO:{trade['tradingsymbol']}"]).get(f"NFO:{trade['tradingsymbol']}")
+                trade["last_ltp"] = extract_price(q) or trade["last_ltp"]
+            except Exception:
+                pass
+            _execute_autotrade_exit(trade, "Manual kill-switch close-all")
+            state["realized_pnl_today"] = round(state.get("realized_pnl_today", 0.0) + (trade["realized_pnl"] or 0.0), 2)
+            closed_any = True
+    save_autotrade_trades(trades)
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "closed_any": closed_any, "trades": trades})
+
+
+@app.route("/api/autotrade/scan")
+def autotrade_scan():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    state = load_autotrade_state()
+    if state.get("scan_all_fo"):
+        # Explicit, on-demand "Scan now" click -- OK to scan the whole live F&O list in one go
+        # (unlike the background loop, this isn't repeated every poll_seconds); calls are still
+        # staggered inside scan_breakouts() to respect Kite's rate limit, so this can take up to
+        # roughly a minute for the full universe.
+        try:
+            universe = list(INDEX_SYMBOLS.keys()) + fo_stock_universe()
+        except Exception as e:
+            return jsonify({"error": f"Could not load full F&O universe: {e}"}), 500
+    else:
+        universe = state["universe"]
+    candidates, errors = scan_breakouts(universe, state["candle_interval"], state["breakout_lookback"])
+    return jsonify({"candidates": candidates, "errors": errors, "universe_size": len(universe)})
+
+
+@app.route("/api/autotrade/execute-signal", methods=["POST"])
+def autotrade_execute_signal():
+    """Manual-mode execution: places the ONE entry order for a candidate the user reviewed and
+    explicitly clicked 'Execute' on."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    if not body.get("confirmed"):
+        return jsonify({"error": "Confirmation flag not set -- nothing was placed."}), 400
+    candidate = body.get("candidate")
+    if not candidate or not candidate.get("symbol") or not candidate.get("direction"):
+        return jsonify({"error": "candidate with symbol/direction required"}), 400
+    state = _autotrade_roll_day_if_needed(load_autotrade_state())
+    trades = load_autotrade_trades()
+    if any(t["status"] == "open" for t in trades):
+        return jsonify({"error": "An auto-trade position is already open. Close it before opening another."}), 400
+    trade, err = _execute_autotrade_entry(candidate, state)
+    if err:
+        return jsonify({"error": err}), 400
+    trades.append(trade)
+    state["trades_today"] = state.get("trades_today", 0) + 1
+    save_autotrade_trades(trades)
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "trade": trade})
+
+
+threading.Thread(target=_autotrade_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
