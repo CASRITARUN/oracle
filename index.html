@@ -536,13 +536,19 @@
     </div>
     <div class="row" style="margin-top:14px;">
       <span id="autoStatusPill" class="pill warn">Not armed</span>
-      <button class="toggle" id="autoModeManualBtn" onclick="setAutoModeChoice('manual')">Manual (review &amp; click)</button>
-      <button class="toggle" id="autoModeAutoBtn" onclick="setAutoModeChoice('auto')">Auto (self-executing)</button>
     </div>
-    <div class="row" style="margin-top:10px;">
-      <button id="autoArmBtn" onclick="armAutoTrade()">Start</button>
+    <div class="row" style="margin-top:10px; align-items:flex-start; gap:16px;">
+      <button class="toggle" id="autoArmManualBtn" onclick="armAutoTrade('manual')">Start scanning — Manual</button>
+      <button class="toggle" id="autoArmAutoBtn" onclick="armAutoTrade('auto')">Start scanning — Auto</button>
       <button class="secondary" id="autoDisarmBtn" onclick="disarmAutoTrade()">Stop scanning</button>
       <button class="danger" id="autoCloseAllBtn" onclick="closeAllAutoTrades()">Kill switch — exit open position now</button>
+    </div>
+    <div class="legend" style="margin-top:8px; max-width:720px;">
+      "Start scanning" arms the continuous background scanner (it keeps running and re-scanning
+      every poll interval until you click Stop). "Manual" shows you each signal and waits for you to
+      click Execute; "Auto" places the entry itself the instant a signal qualifies — no click. Either
+      way, the "Scan now" button further down is separate: it's a one-off, no-commitment preview scan
+      you can run any time, armed or not, to see current candidates without starting anything.
     </div>
     <div class="metric-row" style="margin-top:14px;">
       <div class="metric"><div class="k">Trades today</div><div class="v" id="autoTradesToday">0 / 3</div></div>
@@ -2165,8 +2171,8 @@ setCalStrikeMode("otm_pct");
 // Auto Trade Mode tab
 // ============================================================================
 let autoChartInstance = null;
-let autoPendingMode = "manual";
 let autoStatePollTimer = null;
+let autoCurrentMode = null;
 let autoChartTimer = null;
 let autoLastCandidates = [];
 
@@ -2203,9 +2209,15 @@ function addAutoUniverseSymbol() {
   const input = document.getElementById("autoUniverseInput");
   const sym = input.value.trim().toUpperCase();
   if (!sym) return;
-  if (foUniverseAll.length && !foUniverseAll.includes(sym)) {
-    if (!confirm(`"${sym}" isn't in your fetched F&O instrument list (or that list hasn't loaded yet — ` +
-                 `connect your Kite account first). Add it anyway?`)) return;
+  if (foUniverseAll.length) {
+    if (!foUniverseAll.includes(sym)) {
+      alert(`"${sym}" doesn't have tradable F&O options (or isn't an index this scanner supports) — ` +
+            `pick from the dropdown suggestions instead.`);
+      return;
+    }
+  } else if (!confirm(`Couldn't load the valid symbol list yet (connect your Kite account first) — ` +
+                       `add "${sym}" anyway without validating it?`)) {
+    return;
   }
   if (!autoUniverseSymbols.includes(sym)) autoUniverseSymbols.push(sym);
   input.value = "";
@@ -2227,7 +2239,6 @@ function initAutoTradeTab() {
   document.getElementById("autoUniverseInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); addAutoUniverseSymbol(); }
   });
-  setAutoModeChoice("manual");
   pollAutoTradeState();
   loadAutoChart();
   autoStatePollTimer = setInterval(pollAutoTradeState, 5000);
@@ -2236,17 +2247,11 @@ function initAutoTradeTab() {
   }, 10000);
 }
 
-function setAutoModeChoice(mode) {
-  autoPendingMode = mode;
-  document.getElementById("autoModeManualBtn").classList.toggle("active", mode === "manual");
-  document.getElementById("autoModeAutoBtn").classList.toggle("active", mode === "auto");
-}
-
-async function armAutoTrade() {
+async function armAutoTrade(mode) {
   const loggedIn = await checkSession();
   if (!loggedIn) { alert("Connect your Kite account first."); return; }
-  const body = { mode: autoPendingMode };
-  if (autoPendingMode === "auto") {
+  const body = { mode };
+  if (mode === "auto") {
     const understood = confirm(
       "AUTO mode places REAL option-buy orders on your live Zerodha account with no per-trade " +
       "click, the instant a breakout signal qualifies.\n\nClick OK to arm it, or Cancel to stay in Manual mode."
@@ -2331,6 +2336,9 @@ async function pollAutoTradeState() {
     if (!s.enabled) { pill.className = "pill warn"; pill.textContent = "Not armed"; }
     else if (s.mode === "auto") { pill.className = "pill bad"; pill.textContent = "ARMED — Auto-executing"; }
     else { pill.className = "pill ok"; pill.textContent = "Scanning — Manual (review & click)"; }
+    autoCurrentMode = s.enabled ? s.mode : null;
+    document.getElementById("autoArmManualBtn").classList.toggle("active", s.enabled && s.mode === "manual");
+    document.getElementById("autoArmAutoBtn").classList.toggle("active", s.enabled && s.mode === "auto");
 
     document.getElementById("autoTradesToday").textContent = `${s.trades_today} / ${s.max_trades_per_day}`;
     const pnlEl = document.getElementById("autoPnlToday");
@@ -2398,15 +2406,34 @@ function renderAutoScanTable(candidates, mode) {
 async function executeAutoSignal(idx) {
   const candidate = autoLastCandidates[idx];
   if (!candidate) return;
-  if (!confirm(`Buy ATM ${candidate.direction} on ${candidate.symbol} right now at market, with your ` +
-               `configured stop-loss/target? This is a REAL order.`)) return;
+  let preview;
+  try {
+    const pr = await apiFetch("/api/autotrade/preview-signal", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({symbol: candidate.symbol, direction: candidate.direction})
+    });
+    preview = await pr.json();
+    if (preview.error) { alert("Couldn't resolve a contract to buy: " + preview.error); return; }
+  } catch (e) { alert("Couldn't reach the server to preview this trade: " + e); return; }
+
+  const o = preview.order_info;
+  const totalCost = Math.round(o.premium * o.quantity);
+  const confirmMsg =
+    `About to BUY (real order, market price):\n\n` +
+    `  ${o.tradingsymbol}\n` +
+    `  Strike ${o.strike} ${candidate.direction} · expiry ${o.expiry}\n` +
+    `  Qty ${o.quantity} (${o.lots} lot${o.lots > 1 ? "s" : ""} of ${o.lot_size})\n` +
+    `  Live premium ~₹${o.premium} · est. total ~₹${totalCost}\n\n` +
+    `Stop-loss/target will be managed automatically from here. Proceed?`;
+  if (!confirm(confirmMsg)) return;
+
   try {
     const r = await apiFetch("/api/autotrade/execute-signal", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({confirmed: true, candidate})
     });
     const d = await r.json();
-    if (d.error) { alert("Error: " + d.error); return; }
+    if (d.error) { alert("Order failed: " + d.error); return; }
     alert(`Placed: BUY ${d.trade.tradingsymbol} x${d.trade.quantity} @ ~₹${d.trade.entry_price}`);
     pollAutoTradeState();
   } catch (e) { alert("Request failed: " + e); }
@@ -2420,8 +2447,7 @@ async function scanAutoTradeNow() {
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     autoLastCandidates = d.candidates || [];
-    const modeBtn = document.getElementById("autoModeAutoBtn").classList.contains("active") ? "auto" : "manual";
-    renderAutoScanTable(autoLastCandidates, modeBtn);
+    renderAutoScanTable(autoLastCandidates, autoCurrentMode || "manual");
     status.textContent = d.errors && d.errors.length ? `Done, with notes: ${d.errors.join(" | ")}` : "Done.";
   } catch (e) { status.textContent = "Request failed: " + e; }
 }
