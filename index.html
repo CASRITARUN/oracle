@@ -87,6 +87,17 @@
   .warn-box { background:rgba(230,180,60,.12); border:1px solid rgba(230,180,60,.3); color:#e6b43c; padding:8px 12px; border-radius:8px; font-size:12px; margin-top:10px; }
   .why-list, .risk-list { margin:6px 0 0 18px; font-size:13px; }
   .risk-list li { color: var(--red); }
+  .top-tabs { display:flex; gap:6px; padding: 0 28px; border-bottom:1px solid var(--line); background:var(--bg); }
+  .top-tab-btn { background:transparent; border:none; border-bottom:2px solid transparent; color:var(--muted);
+    padding:14px 18px; font-size:13px; font-weight:600; border-radius:0; cursor:pointer; }
+  .top-tab-btn:hover { color:var(--text); opacity:1; }
+  .top-tab-btn.active { color:var(--text); border-bottom-color:var(--accent); }
+  .tab-page { display:none; }
+  .tab-page.active { display:block; }
+  .curve-legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+  .strike-mode-btn.active { background:var(--accent); color:white; border-color:var(--accent); }
+  .sweetspot-band { background:rgba(91,141,239,.10); border:1px dashed rgba(91,141,239,.4); padding:8px 12px; border-radius:8px; font-size:12px; color:var(--muted); margin-top:8px; }
+
 </style>
 </head>
 <body>
@@ -102,6 +113,13 @@
   </div>
 </header>
 
+<div class="top-tabs">
+  <button class="top-tab-btn active" id="tabBtnCondor" onclick="switchTopTab('condor')">Option Selling — Condor / Strangle</button>
+  <button class="top-tab-btn" id="tabBtnCalendar" onclick="switchTopTab('calendar')">Double Calendar Spread</button>
+  <button class="top-tab-btn" id="tabBtnAuto" onclick="switchTopTab('auto')">⚡ Auto Trade Mode</button>
+</div>
+
+<div class="tab-page active" id="tabPageCondor">
 <div class="wrap">
 
   <div class="panel">
@@ -369,6 +387,286 @@
   </div>
 
 </div>
+</div><!-- /tabPageCondor -->
+
+<div class="tab-page" id="tabPageCalendar">
+<div class="wrap">
+
+  <div class="panel">
+    <h2>Double Calendar Spread — Strategy Builder</h2>
+    <div class="legend" style="margin-bottom:12px;">
+      Sell a <b>near-term</b> call + put (a little OTM each side), buy the <b>same two strikes</b> in a
+      <b>far-term</b> expiry. Net DEBIT, defined risk (max loss = debit paid), long vega / positive theta.
+      Profit is maximized if price sits between the two short strikes ("sweet spot") when the near leg expires.
+      This tool auto-picks both expiries and both strikes for you — override either if you want manual control.
+    </div>
+    <div class="row">
+      <input type="text" id="calSymbolInput" placeholder="e.g. ITC, NIFTY" />
+      <button class="secondary index-btn" onclick="calQuickSymbol('NIFTY')">NIFTY</button>
+      <button class="secondary index-btn" onclick="calQuickSymbol('BANKNIFTY')">BANKNIFTY</button>
+      <button class="secondary index-btn" onclick="calQuickSymbol('FINNIFTY')">FINNIFTY</button>
+    </div>
+
+    <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:16px;">Which strikes to pick</h3>
+    <div class="row">
+      <button class="secondary strike-mode-btn active" id="calModeOtm" onclick="setCalStrikeMode('otm_pct')">% OTM each side (default)</button>
+      <button class="secondary strike-mode-btn" id="calModeDelta" onclick="setCalStrikeMode('delta')">Target delta</button>
+      <button class="secondary strike-mode-btn" id="calModeAtm" onclick="setCalStrikeMode('atm')">ATM straddle calendar</button>
+      <label class="inline" id="calOtmLabel">OTM % each side <input type="number" id="calOtmPct" value="3" step="0.5" min="0" max="20" style="width:70px;" /></label>
+      <label class="inline" id="calDeltaLabel" style="display:none;">Target delta <input type="number" id="calTargetDelta" value="0.25" step="0.01" min="0.01" max="0.49" style="width:70px;" /></label>
+    </div>
+
+    <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:16px;">Which expiries to take</h3>
+    <div class="row">
+      <label class="inline">Near expiry
+        <select id="calNearExpirySelect"><option value="">Auto (nearest valid)</option></select></label>
+      <label class="inline">Far expiry
+        <select id="calFarExpirySelect"><option value="">Auto (~30 days after near)</option></select></label>
+      <button class="secondary small-btn" id="calLoadExpiriesBtn">Load Expiries</button>
+      <label class="inline">Lots
+        <input type="number" id="calLotsInput" value="1" step="1" min="1" max="50" /></label>
+      <button id="calBuildBtn">Calculate</button>
+      <span id="calStrategyStatus" class="loading"></span>
+    </div>
+    <div class="legend">
+      "Auto" picks the nearest expiry with enough time left for the near leg, and the far expiry whose
+      gap from it is closest to ~30 days — the classic calendar spacing. Override either dropdown for
+      full manual control. Nothing is saved until you click "Track This Position".
+    </div>
+
+    <div id="calStrategyBox" style="display:none;">
+      <div class="rank-badge" id="cal_rank"></div>
+      <p style="color:var(--muted); font-size:13px;">
+        Spot: <b id="cal_spot" style="color:var(--text)"></b> ·
+        Near expiry: <b id="cal_near_expiry"></b> (<span id="cal_dte_near"></span>d) ·
+        Far expiry: <b id="cal_far_expiry"></b> (<span id="cal_gap_days"></span>d later) ·
+        Lot size: <b id="cal_lot"></b> · Lots: <b id="cal_lots"></b> · Qty: <b id="cal_qty"></b>
+      </p>
+
+      <div class="leg-grid" id="calLegGrid"></div>
+
+      <div class="metric-row">
+        <div class="metric loss"><div class="k">Max Loss (defined, = debit paid)</div><div class="v" id="cal_m_loss"></div></div>
+        <div class="metric profit"><div class="k">Max Profit (model estimate)</div><div class="v" id="cal_m_profit"></div></div>
+        <div class="metric"><div class="k">Net Debit Paid</div><div class="v" id="cal_m_debit"></div></div>
+        <div class="metric"><div class="k">Margin / Investment Required</div><div class="v" id="cal_m_margin"></div></div>
+        <div class="metric"><div class="k">Breakevens</div><div class="v" id="cal_m_be"></div></div>
+      </div>
+      <div class="sweetspot-band" id="cal_sweetspot"></div>
+
+      <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:18px;">P&amp;L Curve at Near Expiry (model estimate vs. spot)</h3>
+      <div class="chart-wrap" style="height:260px;"><canvas id="calCurveChart"></canvas></div>
+      <div class="legend">
+        Dashed vertical lines mark the two short strikes (sweet spot). Curve assumes today's implied
+        vol on the far legs holds steady until near expiry — a standard simplifying assumption, not a
+        guarantee. Shaded band (if shown) marks the expected move range.
+      </div>
+
+      <div id="cal_warnings"></div>
+
+      <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:18px;">Trading-logic insights</h3>
+      <div class="insight-grid">
+        <div class="insight-card"><div class="k">IV / HV Ratio</div><div class="v" id="cal_ins_ivhv">—</div></div>
+        <div class="insight-card"><div class="k">Expected Move (to near expiry)</div><div class="v" id="cal_ins_em">—</div></div>
+        <div class="insight-card"><div class="k">Trend Regime</div><div class="v" id="cal_ins_trend">—</div></div>
+        <div class="insight-card"><div class="k">Volatility Regime</div><div class="v" id="cal_ins_volregime">—</div></div>
+        <div class="insight-card"><div class="k">Trade Quality Score</div><div class="v" id="cal_ins_score">—</div></div>
+        <div class="insight-card" style="grid-column: 1 / -1;"><div class="k">Vega / Theta note</div><div class="v" id="cal_ins_vega" style="font-size:12px; font-weight:500;">—</div></div>
+      </div>
+      <div class="insight-note" id="cal_ins_note"></div>
+
+      <div class="track-row" style="margin-top:18px;">
+        <label class="inline">Capital ₹ <input type="number" id="calSizeCapital" placeholder="500000" style="width:110px;" /></label>
+        <label class="inline">Risk per trade % <input type="number" id="calSizeRiskPct" placeholder="2" step="0.5" style="width:70px;" /></label>
+        <button class="secondary small-btn" id="calSizeCalcBtn">Suggest Lots</button>
+        <span id="calSizeResult" style="color:var(--muted); font-size:12px;"></span>
+      </div>
+
+      <div class="track-row">
+        <button id="calTrackBtn">Track This Position</button>
+        <span id="calTrackStatus" class="loading"></span>
+      </div>
+
+      <div class="disclaimer" id="cal_note"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Track Positions — live P&amp;L for tracked Double Calendar Spreads</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button id="calRefreshWatchlistBtn">Refresh</button>
+      <span id="calWatchlistStatus" class="loading"></span>
+    </div>
+    <table id="calWatchlistTable" style="display:none;">
+      <thead>
+        <tr><th>Symbol</th><th>Qty</th><th>Near / Far Expiry</th><th>Days Left (near)</th>
+            <th>Entry Spot</th><th>Current Spot</th><th>Position Value</th><th>P&amp;L</th>
+            <th>Net P&amp;L (after charges)</th><th>Prob. in Sweet Spot</th><th>Max Loss</th>
+            <th>Max Profit (est.)</th><th>Zone</th><th></th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="legend" id="calWatchlistEmpty">No calendar positions tracked yet — build and track one above.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Order Execution — Double Calendar positions</h2>
+    <div class="legend">
+      Uses the same review-then-confirm order flow as the main dashboard: nothing is placed until you
+      explicitly confirm. Click "Execute" or "Close" on a tracked position above to open the order review
+      modal (shared with the rest of this dashboard, further down the page).
+    </div>
+  </div>
+
+</div>
+</div><!-- /tabPageCalendar -->
+
+<div class="tab-page" id="tabPageAuto">
+<div class="wrap">
+
+  <div class="panel">
+    <h2>⚡ Auto Trade Mode — status</h2>
+    <div class="warn-box" style="margin-top:0;">
+      This is a rule-based intraday <b>breakout scanner + option buyer</b> — not a guaranteed-profit
+      system. It watches your configured symbols for a price breakout above/below their recent
+      trading range, buys the ATM option in that direction, and manages stop-loss/target/trailing-stop
+      itself. In <b>Manual</b> mode nothing is ever sent to your broker until you click "Execute".
+      In <b>Auto</b> mode it places that entry the moment a signal qualifies — real money, no click.
+      Only arm Auto mode with capital you can afford to lose, and keep an eye on your Zerodha app.
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <span id="autoStatusPill" class="pill warn">Not armed</span>
+      <button class="toggle" id="autoModeManualBtn" onclick="setAutoModeChoice('manual')">Manual (review &amp; click)</button>
+      <button class="toggle" id="autoModeAutoBtn" onclick="setAutoModeChoice('auto')">Auto (self-executing)</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="autoArmBtn" onclick="armAutoTrade()">Start</button>
+      <button class="secondary" id="autoDisarmBtn" onclick="disarmAutoTrade()">Stop scanning</button>
+      <button class="danger" id="autoCloseAllBtn" onclick="closeAllAutoTrades()">Kill switch — exit open position now</button>
+    </div>
+    <div class="metric-row" style="margin-top:14px;">
+      <div class="metric"><div class="k">Trades today</div><div class="v" id="autoTradesToday">0 / 3</div></div>
+      <div class="metric" id="autoPnlMetric"><div class="k">Realized P&amp;L today</div><div class="v" id="autoPnlToday">₹0</div></div>
+      <div class="metric"><div class="k">Last scan</div><div class="v" id="autoLastScan" style="font-size:13px;">—</div></div>
+    </div>
+    <div id="autoDisarmReasonBox" class="warn-box" style="display:none; margin-top:10px;"></div>
+    <div id="autoErrorBox" class="warn-box" style="display:none; margin-top:10px; border-color: rgba(229,72,77,.4); color:var(--red); background:rgba(229,72,77,.1);"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Settings</h2>
+    <div class="row" style="align-items:flex-start;">
+      <div>
+        <label class="inline" style="display:flex; align-items:center; gap:8px;">
+          <input type="checkbox" id="autoScanAllFo" onchange="onScanAllFoToggle()" />
+          Scan the entire F&amp;O stock universe automatically (ignore the manual list below)
+        </label>
+        <div class="legend" style="margin-top:4px; max-width:640px;">
+          Scans every live F&amp;O stock (~180-220 names) instead of a hand-picked list. Kite's
+          historical-data API is rate-limited (~3 requests/sec), so the full list is scanned in
+          rotating batches of <span id="foChunkSizeNote">40</span> a cycle — it fully cycles through
+          every name every few minutes rather than all at once. While this is on, the background
+          poll interval is floored at <span id="foMinPollNote">45s</span> regardless of the setting
+          below, and a manual "Scan now" click does a single full pass (can take up to ~a minute).
+        </div>
+        <div id="autoManualUniverseBox" style="margin-top:10px;">
+          <label class="inline">Universe — indices &amp; F&amp;O stocks
+            <input type="text" id="autoUniverseInput" list="foUniverseList" placeholder="type to search, e.g. RELIANCE" style="width:220px;" />
+            <button class="secondary small-btn" onclick="addAutoUniverseSymbol()">Add</button>
+          </label>
+          <datalist id="foUniverseList"></datalist>
+          <div id="autoUniverseTags" class="row" style="margin-top:8px;"></div>
+          <div class="legend" style="margin-top:4px;">
+            Stock options are usually monthly-expiry only (indices also get weekly) and can be far less
+            liquid than NIFTY/BANKNIFTY — wider bid-ask spreads mean your real fill may be noticeably
+            worse than the LTP shown. Consider a smaller budget per trade for stocks until you've
+            watched a few go through.
+          </div>
+        </div>
+      </div>
+      <label class="inline">Candle interval
+        <select id="autoInterval"><option value="5minute">5 min</option><option value="15minute">15 min</option><option value="60minute">60 min</option></select></label>
+      <label class="inline">Channel lookback <input type="number" id="autoLookback" value="20" min="5" max="100" /></label>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label class="inline">Scan every (sec) <input type="number" id="autoPoll" value="20" min="10" max="300" /></label>
+      <label class="inline">Budget per trade (₹) <input type="number" id="autoCapital" value="15000" min="1000" step="500" /></label>
+      <label class="inline">Max trades / day <input type="number" id="autoMaxTrades" value="3" min="1" max="10" /></label>
+      <label class="inline">Max daily loss (₹) <input type="number" id="autoMaxLoss" value="5000" min="500" step="500" /></label>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label class="inline">Stop-loss (% of premium) <input type="number" id="autoSlPct" value="30" min="5" max="90" /></label>
+      <label class="inline">Target (% of premium) <input type="number" id="autoTargetPct" value="60" min="5" max="300" /></label>
+      <label class="inline">Start trailing after (%) <input type="number" id="autoTrailAfter" value="30" min="5" max="300" /></label>
+      <label class="inline">Trailing giveback (pts) <input type="number" id="autoTrailGiveback" value="15" min="5" max="100" /></label>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label class="inline">Min breakout size (x ATR) <input type="number" id="autoMinScore" value="0.5" min="0.1" max="5" step="0.1" /></label>
+      <label class="inline">Square-off time (24h) <input type="text" id="autoSquareOff" value="15:15" style="width:70px;" /></label>
+      <button class="secondary small-btn" onclick="saveAutoConfig()">Save settings</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Real-time chart</h2>
+    <div class="row" style="align-items:flex-end; gap:14px;">
+      <label class="inline">Symbol <select id="autoChartSymbol"></select></label>
+      <label class="inline">Interval
+        <select id="autoChartInterval">
+          <option value="5minute">5 min</option>
+          <option value="15minute">15 min</option>
+          <option value="60minute">60 min</option>
+        </select>
+      </label>
+      <label class="inline">Lookback days <input type="number" id="autoChartDays" value="3" min="1" max="30" style="width:60px;" /></label>
+      <label class="inline"><input type="checkbox" id="autoChartLive" checked /> Live refresh (10s)</label>
+      <button class="secondary small-btn" onclick="loadAutoChart()">Refresh</button>
+      <span class="loading" id="autoChartStatus"></span>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <span class="legend" style="display:inline-flex; align-items:center; gap:6px;">
+        <span style="width:10px; height:10px; border-radius:2px; background:#34c77b; display:inline-block;"></span> Up candle
+        <span style="width:10px; height:10px; border-radius:2px; background:#e5484d; display:inline-block; margin-left:10px;"></span> Down candle
+        — bars are shown back-to-back by trading session (no gaps for closed-market hours).
+      </span>
+    </div>
+    <div class="chart-wrap"><canvas id="autoChartCanvas"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <h2>Breakout scanner — signals</h2>
+    <div class="row">
+      <button class="secondary small-btn" onclick="scanAutoTradeNow()">Scan now</button>
+      <span class="loading" id="autoScanStatus"></span>
+    </div>
+    <table id="autoScanTable" style="margin-top:12px; display:none;">
+      <thead><tr><th>Symbol</th><th>Direction</th><th>Score</th><th>Trend</th><th>RSI</th><th>Volume</th><th>Reasoning</th><th></th></tr></thead>
+      <tbody id="autoScanBody"></tbody>
+    </table>
+    <div class="legend" id="autoScanEmpty">No breakout candidates yet — click "Scan now" or arm the loop above.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Live position monitor</h2>
+    <div id="autoOpenPositionBox">
+      <div class="legend">No auto-trade position currently open.</div>
+    </div>
+    <div class="chart-wrap" id="autoPositionChartWrap" style="display:none; height:220px; margin-top:10px;">
+      <canvas id="autoPositionChartCanvas"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Trade log</h2>
+    <table id="autoLogTable" style="display:none;">
+      <thead><tr><th>Opened</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr></thead>
+      <tbody id="autoLogBody"></tbody>
+    </table>
+    <div class="legend" id="autoLogEmpty">No trades yet today.</div>
+  </div>
+
+</div>
+</div><!-- /tabPageAuto -->
 
 <!-- Execute confirmation modal -->
 <div class="modal-overlay" id="execModal">
@@ -1333,6 +1631,43 @@ function exitSingleLivePosition(idx) { exitLivePositions([livePositions[idx]]); 
 document.getElementById("refreshPositionsBtn").onclick = loadBrokerPositions;
 document.getElementById("exitSelectedBtn").onclick = () => exitLivePositions(livePositions.filter(p => p._selected));
 
+// ---------- Shared candlestick helpers ----------
+// Candles are plotted back-to-back by INDEX rather than by real timestamp. A time-scale axis
+// leaves big empty gaps for every night/weekend the market is closed, which is what made the
+// chart look broken/confusing. Indexing removes the gaps; the axis ticks below still show real
+// dates/times, just evenly spaced.
+function formatCandleTick(tMillis, interval) {
+  const d = new Date(tMillis);
+  const datePart = d.toLocaleDateString([], { day: "2-digit", month: "short" });
+  if (interval === "day") return datePart;
+  const timePart = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${datePart} ${timePart}`;
+}
+
+function buildIndexedCandles(candles, interval) {
+  const labels = candles.map(c => formatCandleTick(new Date(c.t).getTime(), interval));
+  const data = candles.map((c, i) => ({ x: i, o: c.o, h: c.h, l: c.l, c: c.c }));
+  return { labels, data };
+}
+
+function indexedXScale(labels) {
+  return {
+    type: "linear",
+    min: 0, max: Math.max(labels.length - 1, 1),
+    ticks: {
+      color: "#8b93a3", maxTicksLimit: 8, autoSkip: true,
+      callback: (val) => labels[Math.round(val)] ?? ""
+    },
+    grid: { color: "#262b36" }
+  };
+}
+
+function indexedTooltip(labels) {
+  // Default candlestick tooltip title is just the raw x-index (e.g. "5"), which is meaningless
+  // now that the axis is index-based -- this maps it back to the real date/time for that candle.
+  return { callbacks: { title: (items) => (items.length ? (labels[Math.round(items[0].parsed.x)] ?? "") : "") } };
+}
+
 // ---------- Price chart (candlestick) ----------
 document.getElementById("chartBtn").onclick = async () => {
   const sym = document.getElementById("chartSymbolInput").value.trim().toUpperCase();
@@ -1360,7 +1695,7 @@ document.getElementById("chartBtn").onclick = async () => {
       }
     } catch (e) {}
 
-    const candleData = d.candles.map(c => ({ x: new Date(c.t).getTime(), o: c.o, h: c.h, l: c.l, c: c.c }));
+    const { labels, data: candleData } = buildIndexedCandles(d.candles, interval);
     const datasets = [{
       label: sym, data: candleData, type: "candlestick",
       color: { up: "#34c77b", down: "#e5484d", unchanged: "#8b93a3" }
@@ -1382,11 +1717,10 @@ document.getElementById("chartBtn").onclick = async () => {
       options: {
         responsive: true, maintainAspectRatio: false,
         scales: {
-          x: { type: "time", time: { unit: interval === "day" ? "day" : "hour" },
-               ticks: { color: "#8b93a3", maxTicksLimit: 8 }, grid: { color: "#262b36" } },
+          x: indexedXScale(labels),
           y: { ticks: { color: "#8b93a3" }, grid: { color: "#262b36" } }
         },
-        plugins: { legend: { labels: { color: "#e6e8ec" } } }
+        plugins: { legend: { labels: { color: "#e6e8ec" } }, tooltip: indexedTooltip(labels) }
       }
     });
     status.textContent = d.clamped_to_days ? `Lookback clamped to ${d.clamped_to_days} days for this interval.` : "";
@@ -1472,7 +1806,763 @@ async function deleteEvent(index) {
 }
 
 document.getElementById("refreshEventsBtn").onclick = loadEvents;
+</script>
 
+<script>
+// ============================================================================
+// Double Calendar Spread tab
+// ============================================================================
+function switchTopTab(which) {
+  const isCondor = which === "condor";
+  const isCalendar = which === "calendar";
+  const isAuto = which === "auto";
+  document.getElementById("tabPageCondor").classList.toggle("active", isCondor);
+  document.getElementById("tabPageCalendar").classList.toggle("active", isCalendar);
+  document.getElementById("tabPageAuto").classList.toggle("active", isAuto);
+  document.getElementById("tabBtnCondor").classList.toggle("active", isCondor);
+  document.getElementById("tabBtnCalendar").classList.toggle("active", isCalendar);
+  document.getElementById("tabBtnAuto").classList.toggle("active", isAuto);
+  if (isCalendar && !window.__calWatchlistLoadedOnce) {
+    window.__calWatchlistLoadedOnce = true;
+    loadCalWatchlist();
+  }
+  if (isAuto && !window.__autoTradeInitedOnce) {
+    window.__autoTradeInitedOnce = true;
+    initAutoTradeTab();
+  }
+}
+
+function calQuickSymbol(sym) { document.getElementById("calSymbolInput").value = sym; }
+
+let currentCalStrikeMode = "otm_pct";
+function setCalStrikeMode(mode) {
+  currentCalStrikeMode = mode;
+  ["calModeOtm", "calModeDelta", "calModeAtm"].forEach(id => document.getElementById(id).classList.remove("active"));
+  const map = {otm_pct: "calModeOtm", delta: "calModeDelta", atm: "calModeAtm"};
+  document.getElementById(map[mode]).classList.add("active");
+  document.getElementById("calOtmLabel").style.display = mode === "otm_pct" ? "flex" : "none";
+  document.getElementById("calDeltaLabel").style.display = mode === "delta" ? "flex" : "none";
+}
+
+document.getElementById("calLoadExpiriesBtn").onclick = async () => {
+  const sym = document.getElementById("calSymbolInput").value.trim().toUpperCase();
+  if (!sym) { alert("Enter a symbol first."); return; }
+  const loggedIn = await checkSession();
+  if (!loggedIn) { alert("Connect your Kite account first."); return; }
+  try {
+    const r = await apiFetch(`/api/expiries/${sym}`);
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    const nearSel = document.getElementById("calNearExpirySelect");
+    const farSel = document.getElementById("calFarExpirySelect");
+    nearSel.innerHTML = `<option value="">Auto (nearest valid)</option>`;
+    farSel.innerHTML = `<option value="">Auto (~30 days after near)</option>`;
+    d.expiries.forEach(e => {
+      nearSel.innerHTML += `<option value="${e}">${e}</option>`;
+      farSel.innerHTML += `<option value="${e}">${e}</option>`;
+    });
+  } catch (e) { alert("Request failed: " + e); }
+};
+
+let calCurveChartInstance = null;
+window.__lastCalMaxLoss = null;
+
+document.getElementById("calBuildBtn").onclick = async () => {
+  const sym = document.getElementById("calSymbolInput").value.trim().toUpperCase();
+  const status = document.getElementById("calStrategyStatus");
+  const box = document.getElementById("calStrategyBox");
+  if (!sym) { status.textContent = "Enter a symbol."; return; }
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
+  status.textContent = "Building double calendar spread...";
+  box.style.display = "none";
+
+  const otmPct = (document.getElementById("calOtmPct").value || 3) / 100;
+  const targetDelta = document.getElementById("calTargetDelta").value || 0.25;
+  const lots = document.getElementById("calLotsInput").value || 1;
+  const nearExpiry = document.getElementById("calNearExpirySelect").value || "";
+  const farExpiry = document.getElementById("calFarExpirySelect").value || "";
+
+  try {
+    const params = new URLSearchParams({
+      strike_mode: currentCalStrikeMode, otm_pct: otmPct, target_delta: targetDelta, lots
+    });
+    if (nearExpiry) params.append("near_expiry", nearExpiry);
+    if (farExpiry) params.append("far_expiry", farExpiry);
+    const r = await apiFetch(`/api/calendar-strategy/${sym}?${params}`);
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    status.textContent = "";
+    box.style.display = "block";
+    window.__lastCalStrategy = d;
+
+    document.getElementById("cal_rank").textContent = d.rank_info
+      ? `${sym} · IV Rank ${d.rank_info.iv_rank_pct ?? "n/a"}% · Composite score ${d.rank_info.composite_score ?? "n/a"}`
+      : sym;
+    document.getElementById("cal_spot").textContent = "₹" + d.spot;
+    document.getElementById("cal_near_expiry").textContent = d.near_expiry;
+    document.getElementById("cal_dte_near").textContent = d.days_to_near_expiry;
+    document.getElementById("cal_far_expiry").textContent = d.far_expiry;
+    document.getElementById("cal_gap_days").textContent = d.days_between_expiries;
+    document.getElementById("cal_lot").textContent = d.lot_size;
+    document.getElementById("cal_lots").textContent = d.lots;
+    document.getElementById("cal_qty").textContent = d.quantity;
+
+    const legLabels = {sell_call_near: "SELL Call (near)", sell_put_near: "SELL Put (near)",
+                        buy_call_far: "BUY Call (far)", buy_put_far: "BUY Put (far)"};
+    const legGrid = document.getElementById("calLegGrid");
+    legGrid.innerHTML = "";
+    Object.keys(legLabels).forEach(k => {
+      const lg = d.legs[k];
+      if (!lg) return;
+      legGrid.innerHTML += `<div class="leg-card">
+        <div class="k">${legLabels[k]}</div>
+        <div class="v">${lg.strike} @ ₹${lg.ltp}</div>
+        <div style="color:var(--muted); font-size:11px; margin-top:2px;">IV ${lg.iv_pct}% · Δ ${lg.delta} · ${lg.tradingsymbol}</div>
+      </div>`;
+    });
+
+    document.getElementById("cal_m_loss").textContent = "₹" + d.max_loss;
+    document.getElementById("cal_m_profit").textContent = "₹" + d.max_profit_estimated;
+    document.getElementById("cal_m_debit").textContent = "₹" + d.net_debit_per_share + " / share";
+    document.getElementById("cal_m_margin").textContent = (d.margin_required !== null && d.margin_required !== undefined)
+      ? "₹" + d.margin_required : (d.margin_error ? "Unavailable" : "—");
+    document.getElementById("cal_m_be").textContent = d.breakevens && d.breakevens.length
+      ? d.breakevens.join(" , ") : "—";
+    document.getElementById("cal_sweetspot").textContent =
+      `Sweet spot (max-profit zone at near expiry): ${d.sweet_spot_range[0]} — ${d.sweet_spot_range[1]}`;
+
+    // ---- Payoff curve chart ----
+    if (calCurveChartInstance) calCurveChartInstance.destroy();
+    const ctx = document.getElementById("calCurveChart").getContext("2d");
+    const labels = d.curve.map(p => p.spot);
+    const dataPoints = d.curve.map(p => p.pnl);
+    const zeroLine = d.curve.map(() => 0);
+    calCurveChartInstance = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          {label: "Est. P&L", data: dataPoints, borderColor: "#5b8def", backgroundColor: "rgba(91,141,239,.15)",
+           fill: true, pointRadius: 0, borderWidth: 2, tension: 0.25},
+          {label: "Breakeven", data: zeroLine, borderColor: "#8b93a3", borderDash: [4,4], pointRadius: 0, borderWidth: 1}
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { ticks: { color: "#8b93a3", maxTicksLimit: 10 }, grid: { color: "#262b36" }, title: {display:true, text:"Spot at near expiry", color:"#8b93a3"} },
+          y: { ticks: { color: "#8b93a3" }, grid: { color: "#262b36" }, title: {display:true, text:"P&L (₹)", color:"#8b93a3"} }
+        },
+        plugins: { legend: { labels: { color: "#e6e8ec" } } }
+      }
+    });
+
+    // ---- Insights ----
+    document.getElementById("cal_ins_ivhv").innerHTML = d.iv_hv
+      ? `${d.iv_hv.ratio} (IV ${d.iv_hv.iv_pct}% / HV ${d.iv_hv.hv_pct}%) <span class="badge ${d.iv_hv.label.toLowerCase()}">${d.iv_hv.label}</span>`
+      : `— <span style="opacity:.6">${d.iv_hv_note || ""}</span>`;
+    document.getElementById("cal_ins_em").textContent = d.expected_move
+      ? `±₹${d.expected_move.expected_move} (${d.expected_move.expected_move_pct}%) → ${d.expected_move.lower}–${d.expected_move.upper}`
+      : "—";
+    document.getElementById("cal_ins_trend").innerHTML = d.trend
+      ? `${d.trend.regime} <span class="badge ${d.trend.regime.toLowerCase().replace(/\s*\/\s*|\s+/g,'-')}">${d.trend.adx14 != null ? "ADX " + d.trend.adx14 : ""}</span>`
+      : `— <span style="opacity:.6">${d.trend_note || ""}</span>`;
+    document.getElementById("cal_ins_volregime").innerHTML = d.volatility_regime
+      ? `${d.volatility_regime.label}${d.volatility_regime.india_vix != null ? " (VIX " + d.volatility_regime.india_vix + ")" : ""}`
+      : "—";
+    document.getElementById("cal_ins_score").innerHTML = d.trade_quality_score != null
+      ? `${d.trade_quality_score}/100 <span class="badge ${(d.trade_quality_label||"").toLowerCase()}">${d.trade_quality_label || ""}</span>`
+      : "—";
+    document.getElementById("cal_ins_vega").textContent = d.vega_note || "";
+    document.getElementById("cal_ins_note").textContent = d.trade_quality_note || "";
+
+    const warnBox = document.getElementById("cal_warnings");
+    warnBox.innerHTML = "";
+    if (d.expected_move_vs_sweet_spot) warnBox.innerHTML += `<div class="warn-box">ℹ ${d.expected_move_vs_sweet_spot}</div>`;
+    if (d.trend_warning) warnBox.innerHTML += `<div class="warn-box">⚠ ${d.trend_warning}</div>`;
+    if (d.entry_event_warning) warnBox.innerHTML += `<div class="warn-box">⚠ ${d.entry_event_warning}</div>`;
+    if (d.event_before_expiry) warnBox.innerHTML += `<div class="warn-box">⚠ ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before near expiry.</div>`;
+
+    let noteText = d.note;
+    if (d.margin_error) noteText += ` | Margin lookup failed: ${d.margin_error}`;
+    if (d.estimated_entry_charges) noteText += ` | Est. entry charges: ₹${d.estimated_entry_charges.total}.`;
+    document.getElementById("cal_note").textContent = noteText;
+
+    window.__lastCalMaxLoss = d.max_loss;
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+document.getElementById("calSizeCalcBtn").onclick = async () => {
+  const capital = document.getElementById("calSizeCapital").value;
+  const riskPct = document.getElementById("calSizeRiskPct").value;
+  const resultEl = document.getElementById("calSizeResult");
+  const maxLoss = window.__lastCalMaxLoss;
+  if (!capital || !riskPct) { resultEl.textContent = "Enter capital and risk % first."; return; }
+  if (!maxLoss) { resultEl.textContent = "Calculate a strategy above first."; return; }
+  const loggedIn = await checkSession();
+  if (!loggedIn) return;
+  try {
+    const params = new URLSearchParams({capital, risk_pct: riskPct, max_loss_per_lot: maxLoss});
+    const r = await apiFetch(`/api/position-sizing?${params}`);
+    const d = await r.json();
+    if (d.error) { resultEl.textContent = "Error: " + d.error; return; }
+    resultEl.textContent = `Max risk budget ₹${d.max_risk_amount} → recommended ${d.recommended_lots} lot(s).`;
+  } catch (e) { resultEl.textContent = "Request failed: " + e; }
+};
+
+document.getElementById("calTrackBtn").onclick = async () => {
+  const sym = document.getElementById("calSymbolInput").value.trim().toUpperCase();
+  const status = document.getElementById("calTrackStatus");
+  if (!sym) { status.textContent = "Calculate a strategy first."; return; }
+  status.textContent = "Saving...";
+  const otmPct = (document.getElementById("calOtmPct").value || 3) / 100;
+  const targetDelta = document.getElementById("calTargetDelta").value || 0.25;
+  const lots = document.getElementById("calLotsInput").value || 1;
+  const nearExpiry = document.getElementById("calNearExpirySelect").value || null;
+  const farExpiry = document.getElementById("calFarExpirySelect").value || null;
+  try {
+    const r = await apiFetch("/api/calendar-watchlist/add", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({symbol: sym, strike_mode: currentCalStrikeMode, otm_pct: otmPct,
+                             target_delta: targetDelta, lots, near_expiry: nearExpiry, far_expiry: farExpiry})
+    });
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    status.textContent = "Tracked. See Track Positions below.";
+    loadCalWatchlist();
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+function calZonePill(zone) {
+  if (zone === "safe") return `<span class="pill ok">In sweet spot</span>`;
+  if (zone === "outside_sweet_spot") return `<span class="pill bad">Outside sweet spot</span>`;
+  if (zone === "near_expiry") return `<span class="pill warn">Near expiry</span>`;
+  return `<span class="pill warn">Unknown</span>`;
+}
+
+async function loadCalWatchlist() {
+  const status = document.getElementById("calWatchlistStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
+  status.textContent = "Refreshing against today's market data...";
+  try {
+    const r = await apiFetch("/api/watchlist");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    const positions = (d.positions || []).filter(p => p.strategy_type === "double_calendar");
+    const tbody = document.querySelector("#calWatchlistTable tbody");
+    tbody.innerHTML = "";
+    if (!positions.length) {
+      document.getElementById("calWatchlistTable").style.display = "none";
+      document.getElementById("calWatchlistEmpty").style.display = "block";
+      status.textContent = "";
+      return;
+    }
+    document.getElementById("calWatchlistEmpty").style.display = "none";
+    positions.forEach(p => {
+      const tr = document.createElement("tr");
+      const qty = p.quantity || p.lot_size;
+      const maxLossDisplay = "₹" + p.entry_max_loss;
+      const maxProfitDisplay = p.entry_max_profit_estimated != null ? "₹" + p.entry_max_profit_estimated : "—";
+      if (p.mtm_error) {
+        tr.innerHTML = `<td>${p.symbol}</td><td>${qty}</td><td>${p.expiry} / ${p.far_expiry}</td>
+                        <td colspan="7" style="color:var(--red);">${p.mtm_error}</td>
+                        <td>${maxLossDisplay}</td><td>${maxProfitDisplay}</td><td><span class="pill warn">Error</span></td>
+                        <td><button class="secondary small-btn" onclick="removeCalPosition('${p.id}')">Remove</button></td>`;
+        tbody.appendChild(tr);
+        return;
+      }
+      const pnlClass = p.current.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+      const netPnlClass = p.current.net_pnl_after_charges >= 0 ? "pnl-pos" : "pnl-neg";
+      const detailId = `calLegDetail_${p.id}`;
+      let zoneCell = calZonePill(p.current.zone);
+      if (p.current.exit_suggested) {
+        const reasonsAttr = (p.current.exit_reasons || []).join(" ").replace(/"/g, "&quot;");
+        zoneCell += ` <span class="pill bad" title="${reasonsAttr}">Exit suggested</span>`;
+      }
+      if (p.current.event_before_expiry) {
+        const ev = p.current.event_before_expiry;
+        zoneCell += ` <span class="pill warn" title="${ev.label} on ${ev.date}">Event in ${ev.days_away}d</span>`;
+      }
+      tr.innerHTML = `<td>${p.symbol}</td><td>${qty}</td><td>${p.expiry} / ${p.far_expiry}</td>
+                      <td>${p.current.days_left}</td>
+                      <td>${p.entry_spot}</td><td>${p.current.spot}</td>
+                      <td>₹${p.current.current_position_value}</td>
+                      <td class="${pnlClass}">₹${p.current.pnl}</td>
+                      <td class="${netPnlClass}" title="Round-trip est. charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
+                      <td>${p.current.probability_in_sweet_spot_pct ?? "-"}%</td>
+                      <td>${maxLossDisplay}</td>
+                      <td>${maxProfitDisplay}</td>
+                      <td>${zoneCell}</td>
+                      <td>
+                        <div class="action-cell">
+                          <button class="secondary small-btn" onclick="toggleLegDetail('${detailId}')">Prices</button>
+                          <button class="secondary small-btn" onclick="refreshCalCurve('${p.id}')">Live Curve</button>
+                          <button class="small-btn" onclick="openExecuteModal('${p.id}')">Execute</button>
+                          <button class="danger small-btn" onclick="openCloseModal('${p.id}')">Close</button>
+                          <button class="secondary small-btn" onclick="removeCalPosition('${p.id}')">Remove</button>
+                        </div>
+                      </td>`;
+      tbody.appendChild(tr);
+
+      const detailTr = document.createElement("tr");
+      detailTr.id = detailId;
+      detailTr.style.display = "none";
+      const legLabels = {sell_call_near: "Sell Call (near)", sell_put_near: "Sell Put (near)",
+                          buy_call_far: "Buy Call (far)", buy_put_far: "Buy Put (far)"};
+      let legHtml = `<td colspan="14"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
+      Object.keys(legLabels).forEach(k => {
+        const lg = p.current.legs_current && p.current.legs_current[k];
+        if (!lg) return;
+        const legPnlClass = lg.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+        const deltaLine = lg.current_delta !== undefined
+          ? `<div style="color:var(--muted); font-size:11px;">Current delta: ${lg.current_delta}</div>` : "";
+        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px;">
+                      <div style="color:var(--muted); font-size:11px;">${legLabels[k]} (strike ${lg.strike})</div>
+                      <div style="font-size:13px;">Entry ₹${lg.entry_price} → Now ₹${lg.current_price}</div>
+                      <div class="${legPnlClass}" style="font-size:13px;">P&amp;L ₹${lg.pnl}</div>
+                      ${deltaLine}
+                    </div>`;
+      });
+      legHtml += `<div id="calCurveMini_${p.id}" style="width:100%; margin-top:8px; color:var(--muted); font-size:12px;"></div>`;
+      legHtml += `</div></td>`;
+      detailTr.innerHTML = legHtml;
+      tbody.appendChild(detailTr);
+    });
+    document.getElementById("calWatchlistTable").style.display = "table";
+    status.textContent = "Updated just now.";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+
+async function refreshCalCurve(posId) {
+  const loggedIn = await checkSession();
+  if (!loggedIn) return;
+  try {
+    const r = await apiFetch(`/api/calendar-watchlist/${posId}/curve`);
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    const maxPt = d.curve.reduce((a, b) => (b.pnl > a.pnl ? b : a), d.curve[0]);
+    const minPt = d.curve.reduce((a, b) => (b.pnl < a.pnl ? b : a), d.curve[0]);
+    alert(`Live curve for spot ₹${d.spot} (${d.days_to_near_expiry}d to near expiry):\n` +
+          `Sweet spot: ${d.sweet_spot_range[0]} — ${d.sweet_spot_range[1]}\n` +
+          `Best case in range: ₹${maxPt.pnl} (spot ${maxPt.spot})\n` +
+          `Worst case in range: ₹${minPt.pnl} (spot ${minPt.spot})\n\n${d.note}`);
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+async function removeCalPosition(id) {
+  await apiFetch(`/api/watchlist/${id}`, {method: "DELETE"});
+  loadCalWatchlist();
+}
+
+document.getElementById("calRefreshWatchlistBtn").onclick = loadCalWatchlist;
+setCalStrikeMode("otm_pct");
+</script>
+
+<script>
+// ============================================================================
+// Auto Trade Mode tab
+// ============================================================================
+let autoChartInstance = null;
+let autoPendingMode = "manual";
+let autoStatePollTimer = null;
+let autoChartTimer = null;
+let autoLastCandidates = [];
+
+let autoUniverseSymbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"];
+let foUniverseAll = [];
+
+async function loadFoUniverseOptions() {
+  try {
+    const r = await apiFetch("/api/fo-universe");
+    const d = await r.json();
+    if (d.error) return;
+    foUniverseAll = [...(d.indices || []), ...(d.stocks || [])];
+    document.getElementById("foUniverseList").innerHTML =
+      foUniverseAll.map(s => `<option value="${s}"></option>`).join("");
+  } catch (e) { /* datalist just stays empty; free typing still works */ }
+}
+
+function renderAutoUniverseTags() {
+  const box = document.getElementById("autoUniverseTags");
+  box.innerHTML = autoUniverseSymbols.map(sym => `
+    <span class="pill ok" style="display:inline-flex; align-items:center; gap:6px;">
+      ${sym} <span style="cursor:pointer; font-weight:700;" onclick="removeAutoUniverseSymbol('${sym}')">&times;</span>
+    </span>`).join("") || `<span class="legend">No symbols added yet.</span>`;
+  const sel = document.getElementById("autoChartSymbol");
+  const current = sel.value;
+  sel.innerHTML = "";
+  autoUniverseSymbols.forEach(sym => {
+    const opt = document.createElement("option"); opt.value = sym; opt.textContent = sym; sel.appendChild(opt);
+  });
+  if (autoUniverseSymbols.includes(current)) sel.value = current;
+}
+
+function addAutoUniverseSymbol() {
+  const input = document.getElementById("autoUniverseInput");
+  const sym = input.value.trim().toUpperCase();
+  if (!sym) return;
+  if (foUniverseAll.length && !foUniverseAll.includes(sym)) {
+    if (!confirm(`"${sym}" isn't in your fetched F&O instrument list (or that list hasn't loaded yet — ` +
+                 `connect your Kite account first). Add it anyway?`)) return;
+  }
+  if (!autoUniverseSymbols.includes(sym)) autoUniverseSymbols.push(sym);
+  input.value = "";
+  renderAutoUniverseTags();
+}
+
+function removeAutoUniverseSymbol(sym) {
+  autoUniverseSymbols = autoUniverseSymbols.filter(s => s !== sym);
+  renderAutoUniverseTags();
+}
+
+function initAutoTradeTab() {
+  loadFoUniverseOptions();
+  renderAutoUniverseTags();
+  onScanAllFoToggle();
+  document.getElementById("autoChartSymbol").onchange = loadAutoChart;
+  document.getElementById("autoChartInterval").onchange = loadAutoChart;
+  document.getElementById("autoChartDays").onchange = loadAutoChart;
+  document.getElementById("autoUniverseInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); addAutoUniverseSymbol(); }
+  });
+  setAutoModeChoice("manual");
+  pollAutoTradeState();
+  loadAutoChart();
+  autoStatePollTimer = setInterval(pollAutoTradeState, 5000);
+  autoChartTimer = setInterval(() => {
+    if (document.getElementById("autoChartLive").checked) loadAutoChart();
+  }, 10000);
+}
+
+function setAutoModeChoice(mode) {
+  autoPendingMode = mode;
+  document.getElementById("autoModeManualBtn").classList.toggle("active", mode === "manual");
+  document.getElementById("autoModeAutoBtn").classList.toggle("active", mode === "auto");
+}
+
+async function armAutoTrade() {
+  const loggedIn = await checkSession();
+  if (!loggedIn) { alert("Connect your Kite account first."); return; }
+  const body = { mode: autoPendingMode };
+  if (autoPendingMode === "auto") {
+    const understood = confirm(
+      "AUTO mode places REAL option-buy orders on your live Zerodha account with no per-trade " +
+      "click, the instant a breakout signal qualifies.\n\nClick OK to arm it, or Cancel to stay in Manual mode."
+    );
+    if (!understood) return;
+    body.ack = true;
+  }
+  try {
+    const r = await apiFetch("/api/autotrade/arm", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    pollAutoTradeState();
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+async function disarmAutoTrade() {
+  await apiFetch("/api/autotrade/disarm", {method: "POST"});
+  pollAutoTradeState();
+}
+
+async function closeAllAutoTrades() {
+  if (!confirm("Force-exit any currently open auto-trade position at market, right now?")) return;
+  try {
+    const r = await apiFetch("/api/autotrade/close-all", {method: "POST"});
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    pollAutoTradeState();
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+function onScanAllFoToggle() {
+  const on = document.getElementById("autoScanAllFo").checked;
+  document.getElementById("autoManualUniverseBox").style.opacity = on ? "0.45" : "1";
+  document.getElementById("autoManualUniverseBox").style.pointerEvents = on ? "none" : "auto";
+}
+
+async function saveAutoConfig() {
+  const body = {
+    universe: autoUniverseSymbols,
+    scan_all_fo: document.getElementById("autoScanAllFo").checked,
+    candle_interval: document.getElementById("autoInterval").value,
+    breakout_lookback: Number(document.getElementById("autoLookback").value),
+    poll_seconds: Number(document.getElementById("autoPoll").value),
+    capital_per_trade: Number(document.getElementById("autoCapital").value),
+    max_trades_per_day: Number(document.getElementById("autoMaxTrades").value),
+    max_daily_loss: Number(document.getElementById("autoMaxLoss").value),
+    sl_pct_of_premium: Number(document.getElementById("autoSlPct").value),
+    target_pct_of_premium: Number(document.getElementById("autoTargetPct").value),
+    trail_after_pct: Number(document.getElementById("autoTrailAfter").value),
+    trail_giveback_pct: Number(document.getElementById("autoTrailGiveback").value),
+    min_breakout_score: Number(document.getElementById("autoMinScore").value),
+    square_off_time: document.getElementById("autoSquareOff").value.trim(),
+  };
+  try {
+    const r = await apiFetch("/api/autotrade/config", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    const sel = document.getElementById("autoChartSymbol");
+    sel.innerHTML = "";
+    body.universe.forEach(sym => {
+      const opt = document.createElement("option"); opt.value = sym; opt.textContent = sym; sel.appendChild(opt);
+    });
+    loadAutoChart();
+    alert("Settings saved.");
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+async function pollAutoTradeState() {
+  const loggedIn = await checkSession();
+  if (!loggedIn) return;
+  try {
+    const r = await apiFetch("/api/autotrade/state");
+    const d = await r.json();
+    if (d.error) return;
+    const s = d.state;
+
+    const pill = document.getElementById("autoStatusPill");
+    if (!s.enabled) { pill.className = "pill warn"; pill.textContent = "Not armed"; }
+    else if (s.mode === "auto") { pill.className = "pill bad"; pill.textContent = "ARMED — Auto-executing"; }
+    else { pill.className = "pill ok"; pill.textContent = "Scanning — Manual (review & click)"; }
+
+    document.getElementById("autoTradesToday").textContent = `${s.trades_today} / ${s.max_trades_per_day}`;
+    const pnlEl = document.getElementById("autoPnlToday");
+    pnlEl.textContent = `₹${s.realized_pnl_today}`;
+    pnlEl.className = s.realized_pnl_today > 0 ? "v pnl-pos" : s.realized_pnl_today < 0 ? "v pnl-neg" : "v";
+    document.getElementById("autoLastScan").textContent = s.last_scan_at ? new Date(s.last_scan_at).toLocaleTimeString() : "—";
+
+    const drBox = document.getElementById("autoDisarmReasonBox");
+    if (s.disarm_reason) { drBox.style.display = "block"; drBox.textContent = s.disarm_reason; }
+    else { drBox.style.display = "none"; }
+
+    const errBox = document.getElementById("autoErrorBox");
+    if (s.last_error) { errBox.style.display = "block"; errBox.textContent = "Last error: " + s.last_error; }
+    else { errBox.style.display = "none"; }
+
+    autoLastCandidates = s.last_scan_candidates || [];
+    if (!window.__autoUniverseSyncedOnce && s.universe && s.universe.length) {
+      window.__autoUniverseSyncedOnce = true;
+      autoUniverseSymbols = s.universe.slice();
+      renderAutoUniverseTags();
+    }
+    if (!window.__scanAllFoSyncedOnce) {
+      window.__scanAllFoSyncedOnce = true;
+      document.getElementById("autoScanAllFo").checked = !!s.scan_all_fo;
+      onScanAllFoToggle();
+    }
+    if (s.scan_all_fo && s.last_scan_universe_size) {
+      document.getElementById("autoLastScan").textContent =
+        (s.last_scan_at ? new Date(s.last_scan_at).toLocaleTimeString() : "—") +
+        ` (${s.last_scan_universe_size} scanned this cycle)`;
+    }
+    renderAutoScanTable(autoLastCandidates, s.mode);
+    renderAutoOpenPosition(d.open_trades && d.open_trades[0]);
+    updateAutoPositionChart(d.open_trades && d.open_trades[0]);
+    renderAutoLog(d.recent_trades || []);
+  } catch (e) { /* silent — next poll will retry */ }
+}
+
+function renderAutoScanTable(candidates, mode) {
+  const table = document.getElementById("autoScanTable");
+  const empty = document.getElementById("autoScanEmpty");
+  const tbody = document.getElementById("autoScanBody");
+  if (!candidates.length) { table.style.display = "none"; empty.style.display = "block"; return; }
+  empty.style.display = "none"; table.style.display = "table";
+  tbody.innerHTML = "";
+  candidates.forEach((c, idx) => {
+    const dirClass = c.direction === "CE" ? "buy" : "sell";
+    const trendPill = c.trend_aligned === true ? '<span class="pill ok">aligned</span>'
+      : c.trend_aligned === false ? '<span class="pill warn">counter</span>'
+      : '<span class="legend">n/a</span>';
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${c.symbol}</td>
+      <td class="${dirClass}">${c.direction === "CE" ? "Bullish breakout (buy CE)" : "Bearish breakdown (buy PE)"}</td>
+      <td>${c.score}</td>
+      <td>${trendPill}</td>
+      <td>${c.rsi != null ? c.rsi : "—"}</td>
+      <td>${c.volume_confirmed ? '<span class="pill ok">confirmed</span>' : '<span class="pill warn">weak</span>'}</td>
+      <td style="font-size:12px; color:var(--muted); max-width:340px;">${c.reasoning}</td>
+      <td>${mode === "manual" ? `<button class="small-btn" onclick="executeAutoSignal(${idx})">Execute</button>` : "<span class=\"legend\">auto-executes</span>"}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function executeAutoSignal(idx) {
+  const candidate = autoLastCandidates[idx];
+  if (!candidate) return;
+  if (!confirm(`Buy ATM ${candidate.direction} on ${candidate.symbol} right now at market, with your ` +
+               `configured stop-loss/target? This is a REAL order.`)) return;
+  try {
+    const r = await apiFetch("/api/autotrade/execute-signal", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirmed: true, candidate})
+    });
+    const d = await r.json();
+    if (d.error) { alert("Error: " + d.error); return; }
+    alert(`Placed: BUY ${d.trade.tradingsymbol} x${d.trade.quantity} @ ~₹${d.trade.entry_price}`);
+    pollAutoTradeState();
+  } catch (e) { alert("Request failed: " + e); }
+}
+
+async function scanAutoTradeNow() {
+  const status = document.getElementById("autoScanStatus");
+  status.textContent = "Scanning...";
+  try {
+    const r = await apiFetch("/api/autotrade/scan");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    autoLastCandidates = d.candidates || [];
+    const modeBtn = document.getElementById("autoModeAutoBtn").classList.contains("active") ? "auto" : "manual";
+    renderAutoScanTable(autoLastCandidates, modeBtn);
+    status.textContent = d.errors && d.errors.length ? `Done, with notes: ${d.errors.join(" | ")}` : "Done.";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+
+let autoPositionChartInstance = null;
+let positionChartTradeKey = null;
+let positionChartPoints = [];
+
+function updateAutoPositionChart(trade) {
+  const wrap = document.getElementById("autoPositionChartWrap");
+  if (!trade) {
+    wrap.style.display = "none";
+    positionChartTradeKey = null;
+    positionChartPoints = [];
+    if (autoPositionChartInstance) { autoPositionChartInstance.destroy(); autoPositionChartInstance = null; }
+    return;
+  }
+  const key = `${trade.tradingsymbol}@${trade.opened_at}`;
+  if (key !== positionChartTradeKey) {
+    // New position (or first time we've seen one) -- start a fresh in-memory series. This is
+    // built live from quote polls, not historical data, since it's tracking the CURRENT trade.
+    positionChartTradeKey = key;
+    positionChartPoints = [{ t: Date.now(), ltp: trade.entry_price }];
+  }
+  const last = positionChartPoints[positionChartPoints.length - 1];
+  if (!last || trade.last_ltp !== last.ltp) {
+    positionChartPoints.push({ t: Date.now(), ltp: trade.last_ltp });
+  }
+  wrap.style.display = "block";
+
+  const labels = positionChartPoints.map(p => new Date(p.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+  const ltpSeries = positionChartPoints.map(p => p.ltp);
+  const flat = (val) => positionChartPoints.map(() => val);
+
+  const datasets = [
+    { label: "Live LTP", data: ltpSeries, borderColor: "#5b8def", backgroundColor: "rgba(91,141,239,.12)",
+      fill: true, pointRadius: 0, tension: .15, borderWidth: 2 },
+    { label: "Entry", data: flat(trade.entry_price), borderColor: "#8b93a3", borderDash: [4,4], pointRadius: 0, borderWidth: 1 },
+    { label: "Target", data: flat(trade.target_price), borderColor: "#34c77b", borderDash: [6,3], pointRadius: 0, borderWidth: 1.5 },
+    { label: trade.trail_active ? "Trailing stop" : "Stop-loss", data: flat(trade.sl_price),
+      borderColor: "#e5484d", borderDash: [6,3], pointRadius: 0, borderWidth: 1.5 },
+  ];
+
+  if (autoPositionChartInstance) autoPositionChartInstance.destroy();
+  const ctx = document.getElementById("autoPositionChartCanvas").getContext("2d");
+  autoPositionChartInstance = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      scales: {
+        x: { ticks: { color: "#8b93a3", maxTicksLimit: 8 }, grid: { color: "#262b36" } },
+        y: { ticks: { color: "#8b93a3" }, grid: { color: "#262b36" } }
+      },
+      plugins: { legend: { labels: { color: "#e6e8ec" } } }
+    }
+  });
+}
+
+function renderAutoOpenPosition(trade) {
+  const box = document.getElementById("autoOpenPositionBox");
+  if (!trade) { box.innerHTML = `<div class="legend">No auto-trade position currently open.</div>`; return; }
+  const pnl = (trade.last_ltp - trade.entry_price) * trade.quantity;
+  const pnlClass = pnl >= 0 ? "pnl-pos" : "pnl-neg";
+  box.innerHTML = `
+    <div class="leg-grid">
+      <div class="leg-card"><div class="k">Contract</div><div class="v" style="font-size:14px;">${trade.tradingsymbol}</div></div>
+      <div class="leg-card"><div class="k">Qty</div><div class="v">${trade.quantity}</div></div>
+      <div class="leg-card"><div class="k">Entry premium</div><div class="v">₹${trade.entry_price}</div></div>
+      <div class="leg-card"><div class="k">Live LTP</div><div class="v">₹${trade.last_ltp}</div></div>
+    </div>
+    <div class="metric-row">
+      <div class="metric ${pnl >= 0 ? 'profit' : 'loss'}"><div class="k">Live P&amp;L</div><div class="v ${pnlClass}">₹${pnl.toFixed(2)}</div></div>
+      <div class="metric"><div class="k">Stop-loss</div><div class="v">₹${trade.sl_price}${trade.trail_active ? ' (trailing)' : ''}</div></div>
+      <div class="metric"><div class="k">Target</div><div class="v">₹${trade.target_price}</div></div>
+    </div>
+    <div class="legend">${trade.reasoning}</div>`;
+}
+
+function renderAutoLog(trades) {
+  const table = document.getElementById("autoLogTable");
+  const empty = document.getElementById("autoLogEmpty");
+  const tbody = document.getElementById("autoLogBody");
+  if (!trades.length) { table.style.display = "none"; empty.style.display = "block"; return; }
+  empty.style.display = "none"; table.style.display = "table";
+  tbody.innerHTML = "";
+  trades.forEach(t => {
+    const pnlClass = t.realized_pnl > 0 ? "pnl-pos" : t.realized_pnl < 0 ? "pnl-neg" : "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${new Date(t.opened_at).toLocaleString()}</td>
+      <td>${t.symbol}</td>
+      <td>${t.direction}</td>
+      <td>₹${t.entry_price}</td>
+      <td>${t.exit_price != null ? "₹" + t.exit_price : "—"}</td>
+      <td class="${pnlClass}">${t.realized_pnl != null ? "₹" + t.realized_pnl : "—"}</td>
+      <td style="font-size:12px; color:var(--muted);">${t.exit_reason || (t.status === "open" ? "still open" : "—")}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadAutoChart() {
+  const sym = document.getElementById("autoChartSymbol").value;
+  if (!sym) return;
+  const status = document.getElementById("autoChartStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
+  const interval = document.getElementById("autoChartInterval").value;
+  const days = document.getElementById("autoChartDays").value || 3;
+  status.textContent = "Loading...";
+  try {
+    const r = await apiFetch(`/api/chart/${sym}?interval=${interval}&days=${days}`);
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    if (!d.candles.length) { status.textContent = "No candle data returned."; return; }
+    const { labels, data: candleData } = buildIndexedCandles(d.candles, interval);
+    const datasets = [{
+      label: sym, data: candleData, type: "candlestick",
+      color: { up: "#34c77b", down: "#e5484d", unchanged: "#8b93a3" }
+    }];
+    if (autoChartInstance) autoChartInstance.destroy();
+    const ctx = document.getElementById("autoChartCanvas").getContext("2d");
+    autoChartInstance = new Chart(ctx, {
+      type: "candlestick",
+      data: { datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: indexedXScale(labels),
+          y: { ticks: { color: "#8b93a3" }, grid: { color: "#262b36" } }
+        },
+        plugins: { legend: { labels: { color: "#e6e8ec" } }, tooltip: indexedTooltip(labels) }
+      }
+    });
+    status.textContent = `Updated ${new Date().toLocaleTimeString()}` +
+      (d.clamped_to_days ? ` (lookback clamped to ${d.clamped_to_days}d for this interval)` : "");
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+</script>
+
+<script>
 checkSession();
 loadWatchlist();
 loadOrders();
