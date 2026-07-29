@@ -3214,22 +3214,62 @@ AUTOTRADE_MARKET_OPEN = "09:20"   # a few minutes after the 9:15 open, letting t
 AUTOTRADE_DEFAULTS = {
     "enabled": False,                 # is the scan/execute loop armed at all
     "mode": "manual",                 # "manual" (show signal, wait for click) or "auto" (self-execute)
-    "universe": ["NIFTY", "BANKNIFTY", "FINNIFTY"],   # symbols to scan when scan_all_fo is OFF
-    "scan_all_fo": False,             # when True, scans the ENTIRE live F&O stock universe (every
-                                       # NFO-OPT name) instead of just `universe` above -- see
-                                       # _effective_scan_universe() for how this is rate-limited
+    # --- Order execution: Track (paper) vs Live (real orders) ---
+    # Orthogonal to `mode` above -- applies to BOTH Manual and Auto scanning.
+    #   "track" (DEFAULT): NO real orders are ever sent to your broker. Entries and exits are
+    #             simulated fills at the same real, live LTP a live trade would have used, so P&L,
+    #             SL/target/trailing, and the auto-detected exit logic all run exactly as they would
+    #             live -- just with paper money. Safe to leave scanning/armed indefinitely.
+    #   "live"  : real orders are placed on your live Zerodha account, same as before this setting
+    #             existed. Can only be turned on via /api/autotrade/set-execution-mode with an
+    #             explicit ack -- NOT changeable through the bulk /api/autotrade/config save, so a
+    #             stray "Save settings" click can never silently flip you into real-money trading.
+    # Each trade snapshots which mode it was opened under (trade["execution_mode"]), so switching
+    # this setting never changes how an already-open position behaves.
+    "execution_mode": "track",
+    "universe": ["NIFTY", "BANKNIFTY", "FINNIFTY"],   # fallback list used only if scan_all_fo is OFF
+    "scan_all_fo": True,              # DEFAULT: scan the ENTIRE live F&O stock universe (every
+                                       # NFO-OPT name, indices included) instead of a hand-picked list
+                                       # -- see _effective_scan_universe() for how this is rate-limited.
+                                       # Untick in Settings to fall back to the manual `universe` list.
     "_fo_scan_cursor": 0,             # internal: rotation position through the full F&O list
     "candle_interval": "5minute",
     "breakout_lookback": 20,          # candles in the Donchian channel
     "poll_seconds": 20,
     "max_trades_per_day": 3,
+    "max_concurrent_positions": 1,    # how many auto-trade positions can be open AT ONCE
     "capital_per_trade": 15000,       # approx premium budget (Rs) used to size lots
     "max_daily_loss": 5000,           # Rs; auto-disarms Auto mode the instant realized loss hits this
-    "sl_pct_of_premium": 30,          # stop-loss = premium paid minus this %
-    "target_pct_of_premium": 60,      # target = premium paid plus this %
+    # --- Exit logic: choose how open auto-trades get closed ---
+    # "auto"      (DEFAULT): system auto-detected exit -- the position is closed the moment the
+    #             underlying's own trend/momentum invalidates the breakout thesis that opened it
+    #             (EMA9/21 flips + RSI disagrees), OR a trailing-stop gives back too much of the
+    #             peak profit reached, OR the hard safety-stop floor is hit, OR EOD square-off.
+    #             There is no fixed profit cap in this mode -- winners are allowed to run as long as
+    #             the trend holds. A hard percentage safety floor (hard_stop_pct) is ALWAYS active
+    #             underneath this, regardless of what the reversal/trailing logic is doing.
+    # "target_sl" : fixed, user-defined Target % / Stop-loss % (+ trailing) exactly as configured
+    #             below -- the position exits purely on those numbers, no trend re-evaluation.
+    "exit_mode": "auto",
+    "hard_stop_pct": 50,               # Auto exit mode ONLY: catastrophic-loss floor, % of premium
+                                        # paid -- exits immediately no matter what the reversal/
+                                        # trailing logic says. This is a safety net, not the primary
+                                        # exit trigger in Auto mode.
+    "sl_mode": "pct",                 # "pct" (of entry premium) or "points" (flat rupees off premium)
+    "sl_pct_of_premium": 30,          # stop-loss = premium paid minus this %   } used when
+    "sl_points": 5.0,                 # stop-loss = premium paid minus this many rupees (sl_mode=points)  } exit_mode
+    "target_mode": "pct",             # "pct" (of entry premium) or "points" (flat rupees over premium)  } ==
+    "target_pct_of_premium": 60,      # target = premium paid plus this %      } "target_sl"
+    "target_points": 10.0,            # target = premium paid plus this many rupees (if target_mode=points)
     "trail_after_pct": 30,            # once profit reaches this %, switch to trailing-stop mode
+                                       # (used by BOTH exit modes -- peak-profit tracking is shared)
     "trail_giveback_pct": 15,         # trailing stop = peak-profit% minus this many percentage points
     "min_breakout_score": 0.5,        # minimum breakout size, in ATR multiples, to qualify as a signal
+    "strict_breakout_filters": True,  # DEFAULT ON: extra false-breakout confirmation layers -- see
+                                       # _detect_breakout() (strong-close filter, consolidation/
+                                       # tightness check, minimum ATR floor, whipsaw/failed-breakout
+                                       # penalty, higher volume bar). Untick to fall back to the
+                                       # looser original breakout+3-confirmation model.
     "square_off_time": "15:15",       # force-exit any open auto-trade by this time regardless of SL/target
     "trades_today": 0,
     "realized_pnl_today": 0.0,
@@ -3242,8 +3282,10 @@ AUTOTRADE_DEFAULTS = {
 
 CONFIGURABLE_AUTOTRADE_KEYS = (
     "universe", "scan_all_fo", "candle_interval", "breakout_lookback", "poll_seconds",
-    "max_trades_per_day", "capital_per_trade", "max_daily_loss", "sl_pct_of_premium",
-    "target_pct_of_premium", "trail_after_pct", "trail_giveback_pct", "min_breakout_score",
+    "max_trades_per_day", "max_concurrent_positions", "capital_per_trade", "max_daily_loss",
+    "exit_mode", "hard_stop_pct",
+    "sl_mode", "sl_pct_of_premium", "sl_points", "target_mode", "target_pct_of_premium", "target_points",
+    "trail_after_pct", "trail_giveback_pct", "min_breakout_score", "strict_breakout_filters",
     "square_off_time",
 )
 
@@ -3366,21 +3408,54 @@ def _rsi(closes, period=14):
     return 100.0 - (100.0 / (1 + rs))
 
 
-def _detect_breakout(candles, lookback):
-    """Donchian-channel breakout PLUS three confirmation layers, combined into one transparent
-    composite score (still fully rules-based -- every input is echoed in `reasoning`, no black box):
+# --- False-breakout guards (active whenever strict=True, i.e. state["strict_breakout_filters"]) ---
+# Intraday breakouts fail (whipsaw back into the range) very often; these thresholds exist
+# specifically to filter out the weakest, least-reliable-looking ones before they ever become a
+# candidate -- on top of the existing trend/momentum/volume confirmation layers.
+MIN_BREAKOUT_ATR_FLOOR = 0.15        # raw move beyond the level, in ATR, below which it's just noise
+CHANNEL_TIGHTNESS_MAX_RATIO = 6.0    # if the pre-breakout range is already wider than this many ATRs,
+                                      # there's no real consolidation to break OUT of -- more likely
+                                      # an already-choppy/trending stock than a clean range break
+STRONG_CLOSE_MIN_RATIO = 0.6         # the breakout candle must close in the outer 40% of its own
+                                      # high-low range, in the breakout direction -- a close near the
+                                      # middle (or worse, back toward the opposite end) is the classic
+                                      # tell of a wick-and-reject false breakout
+VOLUME_CONFIRM_MULTIPLE = 1.5        # raised from a looser 1.2x -- demands real participation behind
+                                      # the move, not just "any" above-average print
+WHIPSAW_LOOKBACK_EXTRA_BARS = 10     # how many extra bars (beyond the channel itself) to scan for
+                                      # recent failed pokes at this same level
+WHIPSAW_PENALTY_PER_FAILURE = 0.25   # composite score is knocked down this fraction per recent
+                                      # failed breakout found at the same level (capped, see below)
 
-      1. Breakout size   -- how far the close is outside the prior `lookback`-candle range, in ATR.
-      2. Trend alignment -- EMA9 vs EMA21: does the breakout agree with the prevailing short-term
+
+def _detect_breakout(candles, lookback, strict=True):
+    """Donchian-channel breakout PLUS confirmation layers, combined into one transparent composite
+    score (still fully rules-based -- every input is echoed in `reasoning`, no black box):
+
+      1. Breakout size    -- how far the close is outside the prior `lookback`-candle range, in ATR.
+      2. Trend alignment  -- EMA9 vs EMA21: does the breakout agree with the prevailing short-term
                              trend, or is it a counter-trend poke that's more likely to fail?
-      3. Momentum        -- RSI(14): is momentum actually pushing the same direction as the break?
-      4. Relative volume -- today's bar's volume vs the recent average, scaled continuously instead
+      3. Momentum         -- RSI(14): is momentum actually pushing the same direction as the break?
+      4. Relative volume  -- today's bar's volume vs the recent average, scaled continuously instead
                              of a blunt above/below-average flag.
 
-    Returns None if there's no breakout at all."""
+    When `strict` is True (the default -- state["strict_breakout_filters"]), four extra false-
+    breakout guards are applied BEFORE anything is even scored:
+      5. Minimum breakout size floor (MIN_BREAKOUT_ATR_FLOOR) -- rejects marginal, noise-level pokes.
+      6. Consolidation/tightness check (CHANNEL_TIGHTNESS_MAX_RATIO) -- rejects "breakouts" out of a
+         range that was never actually tight to begin with (already trending/choppy).
+      7. Strong-close filter (STRONG_CLOSE_MIN_RATIO) -- rejects a breakout candle that closed back
+         near the middle of its own range (weak, indecisive, wick-heavy -- a classic failed-breakout
+         candle shape).
+      8. Whipsaw/failed-breakout penalty -- discounts the score if this same level has already been
+         poked through and rejected recently today.
+    Volume confirmation is also raised to a stricter multiple (VOLUME_CONFIRM_MULTIPLE) under strict
+    mode. Returns None if there's no qualifying breakout at all.
+    """
     highs = np.array([c["high"] for c in candles], dtype=float)
     lows = np.array([c["low"] for c in candles], dtype=float)
     closes = np.array([c["close"] for c in candles], dtype=float)
+    opens = np.array([c.get("open", c["close"]) for c in candles], dtype=float)
     volumes = np.array([c.get("volume", 0) or 0 for c in candles], dtype=float)
 
     window_highs = highs[-(lookback + 1):-1]
@@ -3388,6 +3463,8 @@ def _detect_breakout(candles, lookback):
     channel_high = float(np.max(window_highs))
     channel_low = float(np.min(window_lows))
     last_close = float(closes[-1])
+    last_high = float(highs[-1])
+    last_low = float(lows[-1])
 
     tr = np.maximum(highs[1:] - lows[1:],
                      np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
@@ -3395,11 +3472,18 @@ def _detect_breakout(candles, lookback):
     if atr <= 0:
         return None
 
+    # Consolidation/tightness guard -- skip breakouts out of a range that was already too wide to be
+    # a real base (this is checked before we even know direction, since it's a property of the range).
+    channel_width = channel_high - channel_low
+    if strict and channel_width / atr > CHANNEL_TIGHTNESS_MAX_RATIO:
+        return None
+
     prior_vol = volumes[-(lookback + 1):-1]
     avg_vol = float(np.mean(prior_vol)) if prior_vol.size else 0.0
     last_vol = float(volumes[-1])
     rel_volume = round(last_vol / avg_vol, 2) if avg_vol > 0 else None
-    vol_confirmed = (avg_vol == 0) or (last_vol >= avg_vol * 1.2)
+    vol_multiple = VOLUME_CONFIRM_MULTIPLE if strict else 1.2
+    vol_confirmed = (avg_vol == 0) or (last_vol >= avg_vol * vol_multiple)
 
     direction, breakout_level = None, None
     if last_close > channel_high:
@@ -3410,6 +3494,32 @@ def _detect_breakout(candles, lookback):
         return None
 
     breakout_size_score = abs(last_close - breakout_level) / atr
+    if strict and breakout_size_score < MIN_BREAKOUT_ATR_FLOOR:
+        return None  # the move beyond the level is still within noise -- not a real breakout yet
+
+    # Strong-close filter: reject a breakout candle that closed back toward the middle/wrong end of
+    # its own high-low range -- a common false-breakout / stop-hunt wick signature.
+    candle_range = max(last_high - last_low, 1e-9)
+    if direction == "CE":
+        close_position = (last_close - last_low) / candle_range
+    else:
+        close_position = (last_high - last_close) / candle_range
+    strong_close = close_position >= STRONG_CLOSE_MIN_RATIO
+    if strict and not strong_close:
+        return None
+
+    # Whipsaw guard: count recent bars (just before this one) that already poked through this same
+    # level and then closed back inside it -- a level that's failed repeatedly today is less trustworthy.
+    scan_from = -(lookback + 1 + WHIPSAW_LOOKBACK_EXTRA_BARS)
+    recent_highs = highs[scan_from:-1]
+    recent_lows = lows[scan_from:-1]
+    recent_closes = closes[scan_from:-1]
+    failed_breakouts = 0
+    for h, l, c in zip(recent_highs, recent_lows, recent_closes):
+        if direction == "CE" and h > channel_high and c <= channel_high:
+            failed_breakouts += 1
+        elif direction == "PE" and l < channel_low and c >= channel_low:
+            failed_breakouts += 1
 
     ema_fast = _ema(closes[-min(len(closes), 60):], 9)
     ema_slow = _ema(closes[-min(len(closes), 60):], 21)
@@ -3423,8 +3533,9 @@ def _detect_breakout(candles, lookback):
         momentum_aligned = (rsi > 55) if direction == "CE" else (rsi < 45)
 
     # Composite: breakout size is the base signal; trend agreement and momentum each scale it up,
-    # a counter-trend breakout gets heavily discounted (those fail far more often intraday), and
-    # relative volume scales it continuously rather than as a flat bonus.
+    # a counter-trend breakout gets heavily discounted (those fail far more often intraday), relative
+    # volume scales it continuously, a strong close gets a small bonus, and any recent failed
+    # breakouts at this same level knock the score down (capped so it never goes negative).
     composite = breakout_size_score
     if trend_aligned is True:
         composite *= 1.25
@@ -3434,6 +3545,10 @@ def _detect_breakout(candles, lookback):
         composite *= 1.15
     if rel_volume is not None:
         composite *= min(max(rel_volume, 0.5), 2.5) / 1.2
+    if strict and strong_close:
+        composite *= 1.1
+    if strict and failed_breakouts:
+        composite *= max(0.25, 1 - WHIPSAW_PENALTY_PER_FAILURE * failed_breakouts)
 
     score = round(composite, 2)
 
@@ -3444,14 +3559,48 @@ def _detect_breakout(candles, lookback):
         "trend_aligned": trend_aligned, "momentum_aligned": momentum_aligned,
         "rsi": round(rsi, 1) if rsi is not None else None,
         "channel_high": round(channel_high, 2), "channel_low": round(channel_low, 2),
+        "strong_close": bool(strong_close), "close_position": round(close_position, 2),
+        "failed_breakouts_recent": failed_breakouts,
     }
 
 
-def scan_breakouts(universe, interval, lookback):
+def _annotate_candidate(result, symbol, lookback):
+    """Fills in symbol, timestamp, confidence bucket, and the plain-English reasoning string for a
+    raw _detect_breakout() result. Shared by scan_breakouts (full scan) and the single-symbol
+    rescan-one route (checking one candidate's CURRENT score on demand)."""
+    result["symbol"] = symbol
+    result["detected_at"] = now_ist().isoformat()
+    # Plain-English confidence bucket from the composite score -- NOT a probability-of-profit
+    # guarantee, just a rough ranking of "how many confirmations lined up" (used to decide what
+    # Auto mode is allowed to touch -- see the auto-mode qualification in the loop below).
+    result["confidence"] = "High" if result["score"] >= 3 else "Medium" if result["score"] >= 1.5 else "Low"
+    direction_word = "broke above" if result["direction"] == "CE" else "broke below"
+    trend_note = ("EMA9/21 trend agrees" if result["trend_aligned"] is True else
+                   "EMA9/21 trend disagrees (counter-trend, discounted)" if result["trend_aligned"] is False
+                   else "trend unavailable")
+    momentum_note = (f"RSI {result['rsi']} agrees" if result["momentum_aligned"] is True else
+                      f"RSI {result['rsi']} disagrees" if result["momentum_aligned"] is False
+                      else "RSI unavailable")
+    vol_note = (f"relative volume {result['rel_volume']}x average" if result["rel_volume"] is not None
+                else "no average-volume baseline yet")
+    close_note = (f"strong close ({int(result['close_position']*100)}% of candle range)"
+                  if result.get("strong_close") else "weak/indecisive close")
+    whipsaw = result.get("failed_breakouts_recent", 0)
+    whipsaw_note = f"; {whipsaw} failed breakout(s) at this level recently (discounted)" if whipsaw else ""
+    result["reasoning"] = (
+        f"{symbol}: price {direction_word} its {lookback}-candle range ({result['breakout_level']}), "
+        f"now at {result['last_close']} -- {result['breakout_size_atr']}x ATR raw move, {close_note}; "
+        f"{trend_note}; {momentum_note}; {vol_note}{whipsaw_note}. Composite score {result['score']}."
+    )
+    return result
+
+
+def scan_breakouts(universe, interval, lookback, strict=True):
     """Ranked, fully-transparent list of breakout candidates across the given universe. Every
     candidate carries a plain-English `reasoning` string -- this IS the "why" shown in the UI, there
     is no hidden model behind it. Calls are staggered to stay under Kite's historical-data rate
-    limit when scanning long lists (e.g. the full F&O universe)."""
+    limit when scanning long lists (e.g. the full F&O universe). `strict` toggles the extra false-
+    breakout guards in _detect_breakout() -- see state["strict_breakout_filters"]."""
     candidates, errors = [], []
     for idx, symbol in enumerate(universe):
         if idx > 0:
@@ -3460,27 +3609,20 @@ def scan_breakouts(universe, interval, lookback):
         if err:
             errors.append(f"{symbol}: {err}")
             continue
-        result = _detect_breakout(candles, lookback)
+        result = _detect_breakout(candles, lookback, strict=strict)
         if not result:
             continue
-        result["symbol"] = symbol
-        direction_word = "broke above" if result["direction"] == "CE" else "broke below"
-        trend_note = ("EMA9/21 trend agrees" if result["trend_aligned"] is True else
-                       "EMA9/21 trend disagrees (counter-trend, discounted)" if result["trend_aligned"] is False
-                       else "trend unavailable")
-        momentum_note = (f"RSI {result['rsi']} agrees" if result["momentum_aligned"] is True else
-                          f"RSI {result['rsi']} disagrees" if result["momentum_aligned"] is False
-                          else "RSI unavailable")
-        vol_note = (f"relative volume {result['rel_volume']}x average" if result["rel_volume"] is not None
-                    else "no average-volume baseline yet")
-        result["reasoning"] = (
-            f"{symbol}: price {direction_word} its {lookback}-candle range ({result['breakout_level']}), "
-            f"now at {result['last_close']} -- {result['breakout_size_atr']}x ATR raw move; "
-            f"{trend_note}; {momentum_note}; {vol_note}. Composite score {result['score']}."
-        )
-        candidates.append(result)
+        candidates.append(_annotate_candidate(result, symbol, lookback))
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates, errors
+
+
+def _breakout_still_valid(direction, breakout_level, current_spot):
+    """Has price stayed beyond the breakout level since it was detected, or has it already
+    reverted back inside the range? Returns None if either input is missing (can't tell)."""
+    if breakout_level is None or current_spot is None:
+        return None
+    return (current_spot > breakout_level) if direction == "CE" else (current_spot < breakout_level)
 
 
 def _build_autotrade_order(candidate_symbol, direction, capital_per_trade):
@@ -3511,25 +3653,49 @@ def _execute_autotrade_entry(candidate, state):
     order_info, err = _build_autotrade_order(candidate["symbol"], candidate["direction"], state["capital_per_trade"])
     if err:
         return None, err
-    leg = {"leg": "auto_entry", "tradingsymbol": order_info["tradingsymbol"],
-           "transaction_type": "BUY", "quantity": order_info["quantity"]}
-    # MIS (intraday) product on purpose for auto-trades: it carries the broker's OWN automatic
-    # end-of-day square-off as a second, independent safety net on top of ours.
-    results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
-    result = results[0] if results else {"status": "failed", "error": "No result returned"}
-    if result["status"] != "placed":
-        return None, result.get("error", "Order failed")
+
+    execution_mode = state.get("execution_mode", "track")
+    if execution_mode == "live":
+        leg = {"leg": "auto_entry", "tradingsymbol": order_info["tradingsymbol"],
+               "transaction_type": "BUY", "quantity": order_info["quantity"]}
+        # MIS (intraday) product on purpose for auto-trades: it carries the broker's OWN automatic
+        # end-of-day square-off as a second, independent safety net on top of ours.
+        results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+        result = results[0] if results else {"status": "failed", "error": "No result returned"}
+        if result["status"] != "placed":
+            return None, result.get("error", "Order failed")
+        order_id = result.get("order_id")
+    else:
+        # TRACK MODE: nothing is sent to the broker. order_info["premium"] already came from a real,
+        # live quote (the same one a live entry would have used to size and price itself), so the
+        # simulated fill below tracks real market movement exactly -- only the order placement itself
+        # is skipped.
+        order_id = f"TRACK-{int(time.time() * 1000)}"
 
     premium = order_info["premium"]
-    sl_price = round(premium * (1 - state["sl_pct_of_premium"] / 100.0), 2)
-    target_price = round(premium * (1 + state["target_pct_of_premium"] / 100.0), 2)
+    if state.get("sl_mode") == "points":
+        sl_price = round(max(premium - state.get("sl_points", 5.0), 0.05), 2)
+    else:
+        sl_price = round(premium * (1 - state["sl_pct_of_premium"] / 100.0), 2)
+    if state.get("target_mode") == "points":
+        target_price = round(premium + state.get("target_points", 10.0), 2)
+    else:
+        target_price = round(premium * (1 + state["target_pct_of_premium"] / 100.0), 2)
+    hard_stop_price = round(premium * (1 - abs(state.get("hard_stop_pct", 50)) / 100.0), 2)
     trade = {
         "id": f"AT{int(time.time() * 1000)}", "symbol": order_info["symbol"], "direction": order_info["direction"],
         "tradingsymbol": order_info["tradingsymbol"], "strike": order_info["strike"], "expiry": order_info["expiry"],
         "quantity": order_info["quantity"], "lot_size": order_info["lot_size"], "entry_price": premium,
         "sl_price": sl_price, "target_price": target_price, "trail_active": False,
+        # Exit-mode settings are snapshotted at ENTRY time -- if you change Settings while this trade
+        # is open, this specific position keeps behaving the way it was opened under, rather than
+        # switching exit logic underneath you mid-trade.
+        "exit_mode": state.get("exit_mode", "auto"), "hard_stop_price": hard_stop_price,
+        "peak_pnl_pct": 0.0, "_last_reversal_check_ts": 0,
+        "execution_mode": execution_mode,
         "breakout_level": candidate["breakout_level"], "reasoning": candidate["reasoning"],
-        "order_id": result.get("order_id"), "status": "open", "opened_at": now_ist().isoformat(),
+        "confidence": candidate.get("confidence"), "detected_at": candidate.get("detected_at"),
+        "order_id": order_id, "status": "open", "opened_at": now_ist().isoformat(),
         "closed_at": None, "exit_reason": None, "exit_price": None, "realized_pnl": None,
         "last_ltp": premium, "mode": state["mode"],
     }
@@ -3537,17 +3703,29 @@ def _execute_autotrade_entry(candidate, state):
 
 
 def _execute_autotrade_exit(trade, reason):
-    leg = {"leg": "auto_exit", "tradingsymbol": trade["tradingsymbol"],
-           "transaction_type": "SELL", "quantity": trade["quantity"]}
-    results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
-    result = results[0] if results else {"status": "failed", "error": "No result returned"}
-    trade["status"] = "closed"
-    trade["closed_at"] = now_ist().isoformat()
-    trade["exit_order_status"] = result["status"]
-    if result["status"] != "placed":
-        trade["exit_reason"] = reason + " -- EXIT ORDER FAILED, check your Zerodha app IMMEDIATELY"
-        trade["exit_price"], trade["realized_pnl"] = None, None
-        return trade
+    # Legacy trades opened before execution_mode existed have no "execution_mode" key -- treat those
+    # as "live" (that was the only behavior that existed then), never silently as "track".
+    execution_mode = trade.get("execution_mode", "live")
+    if execution_mode == "live":
+        leg = {"leg": "auto_exit", "tradingsymbol": trade["tradingsymbol"],
+               "transaction_type": "SELL", "quantity": trade["quantity"]}
+        results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+        result = results[0] if results else {"status": "failed", "error": "No result returned"}
+        exit_status = result["status"]
+        trade["status"] = "closed"
+        trade["closed_at"] = now_ist().isoformat()
+        trade["exit_order_status"] = exit_status
+        if exit_status != "placed":
+            trade["exit_reason"] = reason + " -- EXIT ORDER FAILED, check your Zerodha app IMMEDIATELY"
+            trade["exit_price"], trade["realized_pnl"] = None, None
+            return trade
+    else:
+        # TRACK MODE: no order sent -- simulate an immediate fill at the last known live LTP, same
+        # price a real market exit order would have been chasing.
+        trade["status"] = "closed"
+        trade["closed_at"] = now_ist().isoformat()
+        trade["exit_order_status"] = "placed"
+
     exit_price = trade.get("last_ltp", trade["entry_price"])
     trade["exit_reason"] = reason
     trade["exit_price"] = exit_price
@@ -3555,10 +3733,85 @@ def _execute_autotrade_exit(trade, reason):
     return trade
 
 
-def _monitor_autotrade_positions(state, trades):
-    """Checks every open auto-trade against SL / target / trailing-stop / EOD square-off, and
-    exits it immediately (real market order) the instant any condition trips."""
+def _reconcile_broker_positions(trades):
+    """If a position was closed manually in Kite (or anywhere outside this tool), the local trade
+    record would otherwise sit "open" forever and this tool would try to square it off again at
+    EOD. Cross-checks every locally-open LIVE trade against the broker's ACTUAL net position for
+    that tradingsymbol and marks it closed here (no order placed, nothing re-sent) if the broker
+    already shows it flat. TRACK-mode trades are skipped entirely -- they never had a real broker
+    position to reconcile against."""
+    open_trades = [t for t in trades if t["status"] == "open" and t.get("execution_mode", "live") == "live"]
+    if not open_trades:
+        return False
+    try:
+        positions = kite.positions().get("net", [])
+    except Exception as e:
+        logger.warning(f"Could not fetch broker positions for reconciliation: {e}")
+        return False
+    net_qty = {}
+    for p in positions:
+        if p.get("exchange") == "NFO":
+            net_qty[p["tradingsymbol"]] = net_qty.get(p["tradingsymbol"], 0) + p.get("quantity", 0)
     changed = False
+    for trade in open_trades:
+        if net_qty.get(trade["tradingsymbol"], 0) == 0:
+            trade["status"] = "closed"
+            trade["closed_at"] = now_ist().isoformat()
+            trade["exit_reason"] = "Closed outside this tool (e.g. manually in Kite) -- detected by checking your broker positions"
+            trade["exit_price"] = trade.get("last_ltp")
+            trade["realized_pnl"] = None  # actual fill price wasn't ours to see -- can't compute this reliably
+            changed = True
+    return changed
+
+
+AUTO_EXIT_REVERSAL_MIN_INTERVAL_SECONDS = 60  # don't re-fetch underlying candles more than once a
+                                               # minute per open trade -- keeps this well under Kite's
+                                               # historical-data rate limit alongside the scanner
+
+
+def _check_auto_exit_signal(trade, state):
+    """System auto-detected exit signal, used when exit_mode == 'auto'. Re-checks the UNDERLYING's
+    own trend/momentum (not the option premium) using the SAME EMA9/21 + RSI(14) confirmations that
+    were used to take the trade -- the moment they flip against the position, the original breakout
+    thesis is considered invalidated and the position is closed. This is what lets Auto exit mode let
+    a winner run while the trend holds, instead of capping every trade at a fixed target. Rate-
+    limited per trade via AUTO_EXIT_REVERSAL_MIN_INTERVAL_SECONDS. Returns a reason string, or None."""
+    last_check = trade.get("_last_reversal_check_ts", 0)
+    now_ts = time.time()
+    if now_ts - last_check < AUTO_EXIT_REVERSAL_MIN_INTERVAL_SECONDS:
+        return None
+    trade["_last_reversal_check_ts"] = now_ts
+    candles, err = _fetch_recent_intraday(trade["symbol"], state.get("candle_interval", "5minute"),
+                                           state.get("breakout_lookback", 20))
+    if err or not candles:
+        return None
+    closes = np.array([c["close"] for c in candles], dtype=float)
+    ema_fast = _ema(closes[-min(len(closes), 60):], 9)
+    ema_slow = _ema(closes[-min(len(closes), 60):], 21)
+    rsi = _rsi(closes, 14)
+    if ema_fast is None or ema_slow is None or rsi is None:
+        return None
+    if trade["direction"] == "CE":
+        trend_flipped, momentum_flipped = ema_fast < ema_slow, rsi < 45
+    else:
+        trend_flipped, momentum_flipped = ema_fast > ema_slow, rsi > 55
+    if trend_flipped and momentum_flipped:
+        return f"Auto-exit: underlying trend reversed (EMA9/21 flipped, RSI {round(rsi, 1)}) -- breakout thesis invalidated"
+    return None
+
+
+def _monitor_autotrade_positions(state, trades):
+    """Checks every open auto-trade and exits it immediately (real market order) the instant its
+    exit condition trips. Two exit modes, chosen per-trade at entry (trade["exit_mode"]):
+
+      "auto"      -- system auto-detected exit: trend-reversal check (_check_auto_exit_signal),
+                     trailing-stop off the peak profit reached, and a hard safety-loss floor, in
+                     that priority. No fixed target cap -- winners run as long as the trend holds.
+      "target_sl" -- fixed Target % / Stop-loss % (+ optional trailing once trail_after_pct is
+                     reached), exactly as configured in Settings.
+
+    EOD square-off and the hard safety floor apply either way."""
+    changed = _reconcile_broker_positions(trades)
     for trade in trades:
         if trade["status"] != "open":
             continue
@@ -3572,21 +3825,36 @@ def _monitor_autotrade_positions(state, trades):
             continue
         trade["last_ltp"] = ltp
         pnl_pct = (ltp / trade["entry_price"] - 1) * 100.0
-
-        if pnl_pct >= state["trail_after_pct"]:
-            new_sl = trade["entry_price"] * (1 + (pnl_pct - state["trail_giveback_pct"]) / 100.0)
-            if new_sl > trade["sl_price"]:
-                trade["sl_price"] = round(new_sl, 2)
-                trade["trail_active"] = True
-
+        trade["peak_pnl_pct"] = max(trade.get("peak_pnl_pct", 0.0), pnl_pct)
         now_str = now_ist().strftime("%H:%M")
+        exit_mode = trade.get("exit_mode", "auto")
         reason = None
-        if ltp <= trade["sl_price"]:
-            reason = "Trailing stop hit" if trade["trail_active"] else "Stop loss hit"
-        elif ltp >= trade["target_price"] and not trade["trail_active"]:
-            reason = "Target hit"
-        elif now_str >= state.get("square_off_time", "15:15"):
-            reason = "End-of-day square-off"
+
+        if exit_mode == "auto":
+            hard_stop_price = trade.get("hard_stop_price") or round(
+                trade["entry_price"] * (1 - abs(state.get("hard_stop_pct", 50)) / 100.0), 2)
+            peak = trade["peak_pnl_pct"]
+            if ltp <= hard_stop_price:
+                reason = "Hard safety stop hit"
+            elif peak >= state.get("trail_after_pct", 30) and pnl_pct <= peak - state.get("trail_giveback_pct", 15):
+                reason = "Auto-exit: trailing stop from peak profit"
+                trade["trail_active"] = True
+            if not reason:
+                reason = _check_auto_exit_signal(trade, state)
+            if not reason and now_str >= state.get("square_off_time", "15:15"):
+                reason = "End-of-day square-off"
+        else:  # "target_sl" -- fixed target/stop-loss (+ trailing), as configured
+            if pnl_pct >= state["trail_after_pct"]:
+                new_sl = trade["entry_price"] * (1 + (pnl_pct - state["trail_giveback_pct"]) / 100.0)
+                if new_sl > trade["sl_price"]:
+                    trade["sl_price"] = round(new_sl, 2)
+                    trade["trail_active"] = True
+            if ltp <= trade["sl_price"]:
+                reason = "Trailing stop hit" if trade["trail_active"] else "Stop loss hit"
+            elif ltp >= trade["target_price"] and not trade["trail_active"]:
+                reason = "Target hit"
+            elif now_str >= state.get("square_off_time", "15:15"):
+                reason = "End-of-day square-off"
 
         if reason:
             _execute_autotrade_exit(trade, reason)
@@ -3596,8 +3864,13 @@ def _monitor_autotrade_positions(state, trades):
 
 
 def _autotrade_loop():
-    """Background daemon thread -- always running, but only acts once logged in AND armed
-    (state['enabled']). Sleeps state['poll_seconds'] between iterations."""
+    """Background daemon thread -- always running as long as you're logged in. Stop-loss/target/
+    trailing-stop monitoring and auto-close (_monitor_autotrade_positions below) apply to EVERY open
+    position regardless of how it was opened -- a manual "Execute" click from the breakout list gets
+    exactly the same automatic SL/target management as an Auto-mode entry, and it keeps running even
+    if you click "Stop scanning" (that only stops NEW entries; it does not touch a position already
+    open). Only scanning for new signals and self-executing new entries require state['enabled'].
+    Sleeps state['poll_seconds'] between iterations."""
     while True:
         sleep_for = AUTOTRADE_DEFAULTS["poll_seconds"]
         try:
@@ -3613,33 +3886,53 @@ def _autotrade_loop():
                                                f"(realized P&L today: Rs {state['realized_pnl_today']}). Auto mode disarmed.")
                     changed = True
 
-                has_open = any(t["status"] == "open" for t in trades)
+                open_count = sum(1 for t in trades if t["status"] == "open")
+                max_positions = max(1, int(state.get("max_concurrent_positions", 1)))
                 now_str = now_ist().strftime("%H:%M")
                 within_hours = AUTOTRADE_MARKET_OPEN <= now_str <= state.get("square_off_time", "15:15")
 
-                if (state["enabled"] and not has_open and within_hours
+                if (state["enabled"] and open_count < max_positions and within_hours
                         and state.get("trades_today", 0) < state.get("max_trades_per_day", 3)):
                     scan_universe = _effective_scan_universe(state)
                     candidates, errors = scan_breakouts(scan_universe, state["candle_interval"],
-                                                         state["breakout_lookback"])
+                                                         state["breakout_lookback"],
+                                                         strict=state.get("strict_breakout_filters", True))
                     state["last_scan_at"] = now_ist().isoformat()
                     state["last_scan_candidates"] = candidates[:10]
                     state["last_scan_universe_size"] = len(scan_universe)
                     state["last_error"] = "; ".join(errors[:3]) if errors else None
                     changed = True
 
-                    # Advanced qualification: strong enough composite score, NOT counter-trend
-                    # (trend_aligned is False), and at least one of volume/momentum confirming.
-                    best = next((c for c in candidates if c["score"] >= state.get("min_breakout_score", 0.5)
-                                 and c.get("trend_aligned") is not False
-                                 and (c["volume_confirmed"] or c.get("momentum_aligned"))), None)
-                    if best and state["mode"] == "auto":
-                        trade, err = _execute_autotrade_entry(best, state)
-                        if trade:
-                            trades.append(trade)
-                            state["trades_today"] = state.get("trades_today", 0) + 1
-                        else:
-                            state["last_error"] = f"Auto-entry failed for {best['symbol']}: {err}"
+                    if state["mode"] == "auto":
+                        # Auto mode gets a materially higher bar than Manual: only "High" confidence
+                        # (composite score >= 3), with trend AND momentum both agreeing AND volume
+                        # confirmed -- not just whichever candidate first clears min_breakout_score.
+                        # Manual mode still shows every candidate that clears min_breakout_score and
+                        # lets the person decide, including lower-confidence ones.
+                        auto_qualified = [c for c in candidates
+                                           if c.get("confidence") == "High"
+                                           and c["score"] >= max(state.get("min_breakout_score", 0.5), 3)
+                                           and c.get("trend_aligned") is True
+                                           and c.get("momentum_aligned") is True
+                                           and c["volume_confirmed"]]
+                        best = None
+                        for c in auto_qualified:
+                            # Re-verify right now, not just at scan time -- price can revert in the
+                            # gap between a scan and actually committing capital.
+                            fresh_order, ferr = _build_autotrade_order(c["symbol"], c["direction"], state["capital_per_trade"])
+                            if ferr:
+                                continue
+                            if _breakout_still_valid(c["direction"], c["breakout_level"], fresh_order["spot"]) is False:
+                                continue
+                            best = c
+                            break
+                        if best:
+                            trade, err = _execute_autotrade_entry(best, state)
+                            if trade:
+                                trades.append(trade)
+                                state["trades_today"] = state.get("trades_today", 0) + 1
+                            else:
+                                state["last_error"] = f"Auto-entry failed for {best['symbol']}: {err}"
 
                 if changed:
                     save_autotrade_state(state)
@@ -3683,6 +3976,30 @@ def autotrade_config():
     return jsonify({"ok": True, "state": state})
 
 
+@app.route("/api/autotrade/set-execution-mode", methods=["POST"])
+def autotrade_set_execution_mode():
+    """Switches between Track (paper, default) and Live (real orders) execution. Deliberately kept
+    OUT of CONFIGURABLE_AUTOTRADE_KEYS / the bulk /api/autotrade/config route -- a stray "Save
+    settings" click should never be able to silently flip a paper setup into placing real orders.
+    Switching to Live requires the same explicit ack pattern as arming Auto mode. This only affects
+    FUTURE entries -- any already-open trade keeps behaving under the execution_mode it was opened
+    with (see trade["execution_mode"])."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    mode = body.get("mode")
+    if mode not in ("live", "track"):
+        return jsonify({"error": "mode must be 'live' or 'track'"}), 400
+    if mode == "live" and body.get("ack") is not True:
+        return jsonify({"error": "Switching to Live mode requires explicit confirmation (ack: true) "
+                                  "that future auto-trade entries and exits will place REAL orders on "
+                                  "your live Zerodha account."}), 400
+    state = load_autotrade_state()
+    state["execution_mode"] = mode
+    save_autotrade_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
 @app.route("/api/autotrade/arm", methods=["POST"])
 def autotrade_arm():
     if not require_session():
@@ -3691,10 +4008,12 @@ def autotrade_arm():
     mode = body.get("mode", "manual")
     if mode not in ("manual", "auto"):
         return jsonify({"error": "mode must be 'manual' or 'auto'"}), 400
-    if mode == "auto" and body.get("ack") is not True:
-        return jsonify({"error": "Auto-execute mode requires explicit confirmation (ack: true) that "
-                                  "this places real orders automatically."}), 400
-    state = _autotrade_roll_day_if_needed(load_autotrade_state())
+    state = load_autotrade_state()
+    if mode == "auto" and state.get("execution_mode", "track") == "live" and body.get("ack") is not True:
+        return jsonify({"error": "Auto-execute mode in LIVE execution requires explicit confirmation "
+                                  "(ack: true) that this places real orders automatically. (Track mode "
+                                  "does not require this -- it never places real orders.)"}), 400
+    state = _autotrade_roll_day_if_needed(state)
     state["mode"], state["enabled"], state["disarm_reason"] = mode, True, None
     save_autotrade_state(state)
     return jsonify({"ok": True, "state": state})
@@ -3735,6 +4054,29 @@ def autotrade_close_all():
     return jsonify({"ok": True, "closed_any": closed_any, "trades": trades})
 
 
+@app.route("/api/autotrade/rescan-one", methods=["POST"])
+def autotrade_rescan_one():
+    """Re-checks ONE symbol right now and returns its CURRENT breakout score -- for when a
+    candidate has been sitting in the list since an earlier scan and you want to know whether it's
+    still breaking out (and how strongly) before deciding to trade it, without waiting for or
+    triggering a full universe rescan."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    symbol = body.get("symbol")
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    state = load_autotrade_state()
+    candles, err = _fetch_recent_intraday(symbol, state["candle_interval"], state["breakout_lookback"])
+    if err:
+        return jsonify({"error": err}), 400
+    result = _detect_breakout(candles, state["breakout_lookback"], strict=state.get("strict_breakout_filters", True))
+    if not result:
+        return jsonify({"candidate": None,
+                         "message": f"{symbol} is no longer breaking out -- price has moved back inside its range."})
+    return jsonify({"candidate": _annotate_candidate(result, symbol, state["breakout_lookback"])})
+
+
 @app.route("/api/autotrade/scan")
 def autotrade_scan():
     if not require_session():
@@ -3751,7 +4093,8 @@ def autotrade_scan():
             return jsonify({"error": f"Could not load full F&O universe: {e}"}), 500
     else:
         universe = state["universe"]
-    candidates, errors = scan_breakouts(universe, state["candle_interval"], state["breakout_lookback"])
+    candidates, errors = scan_breakouts(universe, state["candle_interval"], state["breakout_lookback"],
+                                         strict=state.get("strict_breakout_filters", True))
     return jsonify({"candidates": candidates, "errors": errors, "universe_size": len(universe)})
 
 
@@ -3771,6 +4114,7 @@ def autotrade_preview_signal():
     order_info, err = _build_autotrade_order(symbol, direction, body.get("capital_per_trade", state["capital_per_trade"]))
     if err:
         return jsonify({"error": err}), 400
+    order_info["still_valid"] = _breakout_still_valid(direction, body.get("breakout_level"), order_info["spot"])
     return jsonify({"order_info": order_info})
 
 
@@ -3788,8 +4132,11 @@ def autotrade_execute_signal():
         return jsonify({"error": "candidate with symbol/direction required"}), 400
     state = _autotrade_roll_day_if_needed(load_autotrade_state())
     trades = load_autotrade_trades()
-    if any(t["status"] == "open" for t in trades):
-        return jsonify({"error": "An auto-trade position is already open. Close it before opening another."}), 400
+    open_count = sum(1 for t in trades if t["status"] == "open")
+    max_positions = max(1, int(state.get("max_concurrent_positions", 1)))
+    if open_count >= max_positions:
+        return jsonify({"error": f"Max concurrent positions ({max_positions}) already open. Raise "
+                                  f"'Max concurrent positions' in Settings, or close one first."}), 400
     trade, err = _execute_autotrade_entry(candidate, state)
     if err:
         return jsonify({"error": err}), 400
