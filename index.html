@@ -149,7 +149,41 @@
   </div>
 
   <div class="panel">
-    <h2>2. Build &amp; Adjust Strategy</h2>
+    <div class="panel" id="icScreenerPanel">
+  <h2>2. Iron Condor Screener — actual Zerodha-tradable four-leg structures</h2>
+  <div class="row" style="margin-bottom:12px;">
+    <label class="inline">Short delta
+      <input type="number" id="icTargetDelta" value="0.18" step="0.01" min="0.10" max="0.30" style="width:75px;" /></label>
+    <label class="inline">Min DTE
+      <input type="number" id="icMinDte" value="14" min="1" max="90" style="width:65px;" /></label>
+    <label class="inline">Max DTE
+      <input type="number" id="icMaxDte" value="50" min="2" max="180" style="width:65px;" /></label>
+    <label class="inline">Show
+      <input type="number" id="icLimit" value="25" min="5" max="50" style="width:65px;" /></label>
+    <button id="runIcScreenerBtn">Run IC Screener</button>
+    <button class="secondary small-btn" id="refreshIcScreenerBtn">Force refresh</button>
+    <span id="icScreenerStatus" class="loading"></span>
+  </div>
+  <table id="icScreenerTable" style="display:none;">
+    <thead><tr>
+      <th>Rank</th><th>Symbol</th><th>IC Score</th><th>Expiry / DTE</th><th>IV Rank</th><th>IV/HV</th>
+      <th>Regime / ADX</th><th>CE Δ</th><th>PE Δ</th><th>CE Cushion</th><th>PE Cushion</th><th>Credit/Max Loss</th><th>POP</th>
+      <th>4-Leg Liquidity</th><th>Legs</th><th>Event</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="icScreenerExcluded" class="legend" style="display:none;margin-top:10px;"></div>
+  <div class="legend">
+    Screen 1 ranks the full usable F&amp;O stock universe. Screen 2 then takes the top ranked stocks from Screen 1
+    and evaluates actual four-leg IC structures across up to two best expiries per stock, prioritising the 21–35 DTE window.
+    It batches the required option quotes to stay within Zerodha REST limits while still testing multiple available strikes and hedge widths. Short premium legs have a stronger
+    execution threshold than far-OTM hedge legs. Expected-move cushion and credit/max-loss are scored rather than
+    treated as arbitrary pass/fail cliffs. Score weights: IV richness 20%, range quality 15%, expected-move cushion 25%,
+    four-leg liquidity 10%, economics 15%, delta quality 10%, event risk 5%. Normal mode keeps each short leg within +/-0.03 of the target delta, rejects CE/PE delta asymmetry above 0.04, and risk-adjusts extra premium using expected-move cushion.
+  </div>
+</div>
+
+<h2>2. Build &amp; Adjust Strategy</h2>
     <div class="row">
       <input type="text" id="symbolInput" placeholder="e.g. ITC, NIFTY, BANKNIFTY" />
       <button class="secondary index-btn" onclick="quickSymbol('NIFTY')">NIFTY</button>
@@ -188,11 +222,15 @@
       <div class="leg-grid" id="legGrid"></div>
 
       <div class="metric-row">
-        <div class="metric profit"><div class="k">Max Profit</div><div class="v" id="m_profit"></div></div>
-        <div class="metric loss"><div class="k">Max Loss</div><div class="v" id="m_loss"></div></div>
+        <div class="metric profit"><div class="k">Max Profit (LTP)</div><div class="v" id="m_profit"></div></div>
+        <div class="metric profit"><div class="k">Max Profit (Executable Entry)</div><div class="v" id="m_exec_profit"></div></div>
+        <div class="metric loss"><div class="k">Max Loss (LTP)</div><div class="v" id="m_loss"></div></div>
+        <div class="metric loss"><div class="k">Max Loss (Executable Entry)</div><div class="v" id="m_exec_loss"></div></div>
         <div class="metric"><div class="k">Margin / Investment Required</div><div class="v" id="m_margin"></div></div>
-        <div class="metric profit"><div class="k">Net Profit After Est. Entry Charges</div><div class="v" id="m_net_profit"></div></div>
-        <div class="metric"><div class="k">Breakeven Range</div><div class="v" id="m_be"></div></div>
+        <div class="metric profit"><div class="k">Net Profit After Entry Charges (Executable)</div><div class="v" id="m_net_profit"></div></div>
+        <div class="metric"><div class="k">Net Credit: LTP / Executable</div><div class="v" id="m_credit_compare"></div></div>
+        <div class="metric"><div class="k">Entry Spread Impact</div><div class="v" id="m_spread_impact"></div></div>
+        <div class="metric"><div class="k">Breakeven: LTP / Executable</div><div class="v" id="m_be"></div></div>
       </div>
 
       <div id="s_warnings"></div>
@@ -290,10 +328,11 @@
     <table id="watchlistTable" style="display:none;">
       <thead>
         <tr><th>Symbol</th><th>Type</th><th>Qty</th><th>Entry Spot</th><th>Current Spot</th><th>Days Left</th>
-            <th>Position Value</th><th>P&amp;L</th><th>Net P&amp;L (after charges)</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
+            <th>Position Value (LTP)</th><th>P&amp;L (LTP)</th><th>Exit P&amp;L (Bid/Ask)</th><th>Net Exit P&amp;L</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
       </thead>
       <tbody></tbody>
     </table>
+    <div class="legend">LTP P&amp;L = theoretical mark using current LTP. Exit P&amp;L = approximate immediately realizable P&amp;L using Ask to buy back short legs and Bid to sell long legs. Net Exit P&amp;L subtracts estimated entry + exit charges.</div>
     <div class="legend" id="watchlistEmpty">No trades entered yet — use section 2 or 4 above.</div>
   </div>
 
@@ -318,18 +357,43 @@
     <table id="positionsTable" style="display:none;">
       <thead><tr>
         <th><input type="checkbox" id="selectAllPositions" /></th>
-        <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>LTP</th><th>P&amp;L</th>
-        <th>Exit Price (blank = MARKET)</th><th></th>
+        <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th>
+        <th>LTP</th><th>LTP P&amp;L / Share</th><th>LTP P&amp;L Total</th>
+        <th>Bid</th><th>Ask</th><th>Market Exit Price</th>
+        <th>Exit P&amp;L / Share</th><th>Exit P&amp;L Total</th>
+        <th>Custom Exit Price</th><th></th>
       </tr></thead>
       <tbody></tbody>
     </table>
+    <div id="positionsTotals" style="display:none; margin-top:14px; padding:14px; border:1px solid var(--border); border-radius:10px; background:#11151d;">
+      <div class="row" style="gap:24px; flex-wrap:wrap;">
+        <div><span class="legend">Total LTP P&amp;L — All Open Legs</span><br><strong id="totalLtpPnl">₹0.00</strong></div>
+        <div><span class="legend">Total Market-Exit P&amp;L — All Open Legs</span><br><strong id="totalExitPnl">₹0.00</strong></div>
+        <div><span class="legend">LTP vs Exit Difference</span><br><strong id="totalExitGap">₹0.00</strong></div>
+      </div>
+      <div class="legend" style="margin-top:8px;">
+        <b>LTP P&amp;L</b> is the theoretical mark-to-market: LONG = (LTP − Entry) × Qty; SHORT = (Entry − LTP) × Qty.
+        <b>Market-Exit P&amp;L</b> is the approximate amount realizable immediately: LONG exits at Bid; SHORT exits at Ask.
+        Totals are before brokerage/taxes/charges.
+      </div>
+      <div style="margin-top:16px; overflow-x:auto;">
+        <div style="font-weight:700; margin-bottom:8px;">Underlying-wise total P&amp;L — all open legs of the same stock</div>
+        <table id="positionGroupsTable" style="display:none; width:100%;">
+          <thead><tr>
+            <th>Underlying</th><th>Open Legs</th><th>Total Qty</th>
+            <th>LTP P&amp;L Total</th><th>Market-Exit P&amp;L Total</th><th>LTP vs Exit</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
     <div class="legend" id="positionsEmpty">No open F&amp;O positions, or click Refresh.</div>
     <div class="legend">
-      Entry price, LTP and P&amp;L here come straight from Zerodha's live position book — this is
-      every open F&amp;O leg in your account, not just the ones this tool placed. Type a price in a
-      row and Exit (or select several with the checkboxes and click "Exit Selected") to send that
-      as a LIMIT order; leave it blank to exit at MARKET. Selecting several legs and exiting them
-      together sends one order per leg, back to back — it does not net legs against each other.
+      <b>Per-share view:</b> LTP P&amp;L/Share shows the theoretical gain/loss from Entry → LTP.
+      Market Exit Price shows the actual executable side of the market (Bid for LONG, Ask for SHORT),
+      and Exit P&amp;L/Share shows what that immediate exit would approximately realise.
+      Type a Custom Exit Price in a row and click Exit to send a LIMIT order; leave it blank to exit at MARKET.
+      Selecting several legs and exiting them together sends one order per leg.
     </div>
   </div>
 
@@ -1191,6 +1255,67 @@ document.getElementById("loadChainExpiriesBtn").onclick = async () => {
   } catch (e) { alert("Could not load expiries: " + e); }
 };
 
+// ---------- Iron Condor Screener ----------
+async function runIcScreener(force=false) {
+  const status=document.getElementById("icScreenerStatus");
+  const loggedIn=await checkSession();
+  if(!loggedIn){ status.textContent="Connect your Kite account first (top right)."; return; }
+  const td=document.getElementById("icTargetDelta").value || 0.18;
+  const minDte=document.getElementById("icMinDte").value || 14;
+  const maxDte=document.getElementById("icMaxDte").value || 50;
+  const limit=document.getElementById("icLimit").value || 25;
+  status.textContent="Building actual four-leg ICs from the top Screen-1 candidates and batching Zerodha option quotes...";
+  try {
+    const qs=new URLSearchParams({limit,target_delta:td,min_dte:minDte,max_dte:maxDte,force:force?"true":"false"});
+    const r=await apiFetch(`/api/ic-screener?${qs.toString()}`);
+    const d=await r.json().catch(()=>({error:`HTTP ${r.status}`}));
+    if(!r.ok || d.error){ status.textContent="Error: "+(d.message||d.error||`HTTP ${r.status}`); return; }
+    const tbody=document.querySelector("#icScreenerTable tbody"); tbody.innerHTML="";
+    (d.stocks||[]).forEach((x,i)=>{
+      const ivhv=x.iv_hv ? `${x.iv_hv.ratio} ${x.iv_hv.label||""}` : "—";
+      const regime=x.trend_regime ? `${x.trend_regime}${x.trend_adx!=null?" / "+x.trend_adx:""}` : "—";
+      const liq=`${x.ic_liquidity_score ?? "—"} <span style="opacity:.65">OI ${x.ic_min_leg_oi ?? "—"}, Vol ${x.ic_total_leg_volume ?? "—"}</span>`;
+      const legs=x.ic_legs ? `P ${x.ic_legs.buy_put}/${x.ic_legs.sell_put} · C ${x.ic_legs.sell_call}/${x.ic_legs.buy_call}` : "—";
+      const event=(x.event_flags&&x.event_flags.length)?x.event_flags.map(e=>e.label||e.type).join("; "):"OK";
+      const tr=document.createElement("tr");
+      tr.innerHTML=`<td>${x.rank||i+1}/${x.total||d.eligible_count||0}</td>
+        <td><b>${x.symbol}</b></td><td><b>${x.ic_score}</b> ${x.ic_label||""}</td>
+        <td>${x.ic_expiry||"—"} / ${x.ic_dte??"—"}</td>
+        <td>${x.iv_rank_pct!=null?x.iv_rank_pct+"%":"building"}</td><td>${ivhv}</td>
+        <td>${regime}</td><td>${x.ic_sell_call_delta??"—"}</td><td>${x.ic_sell_put_delta??"—"}</td>
+        <td>${x.ic_ce_cushion_em??"—"}x</td><td>${x.ic_pe_cushion_em??"—"}x</td>
+        <td>${x.ic_credit_max_loss_pct??"—"}%</td><td>${x.ic_pop_pct??"—"}%</td>
+        <td>${liq}<br><span style="opacity:.65">short OI ${x.ic_min_short_oi??"—"}, hedge OI ${x.ic_min_hedge_oi??"—"}</span></td>
+        <td style="font-size:11px;white-space:nowrap">${legs}</td><td style="max-width:180px">${event}</td>
+        <td><button class="secondary small-btn" onclick="useIcCandidate('${x.symbol}','${x.ic_expiry||""}')">Use</button></td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById("icScreenerTable").style.display="table";
+    status.textContent=`${d.count} Screen-1 candidates → ${d.deep_evaluated ?? 0} evaluated → ${d.eligible_count} IC candidates. Showing top ${d.stocks?.length||0}.` + (d.option_quote_instruments ? ` ${d.option_quote_instruments} option instruments batched.` : "") + (d.evaluation_error_count ? ` ${d.evaluation_error_count} data issues.` : "");
+    const ex=document.getElementById("icScreenerExcluded");
+    if(d.excluded_sample&&d.excluded_sample.length){
+      ex.innerHTML="<b>Excluded sample:</b> "+d.excluded_sample.map(x=>`${x.symbol} (${(x.hard_reasons||[]).join(", ")||"not qualified"})`).join(" · ");
+      ex.style.display="block";
+    } else ex.style.display="none";
+  } catch(e) { status.textContent="Request failed: "+e; }
+}
+document.getElementById("runIcScreenerBtn").onclick=()=>runIcScreener(false);
+document.getElementById("refreshIcScreenerBtn").onclick=()=>runIcScreener(true);
+function useIcCandidate(sym,expiry){
+  document.getElementById("symbolInput").value=sym;
+  if(expiry){
+    const sel=document.getElementById("expirySelect");
+    const found=[...sel.options].find(o=>o.value===expiry);
+    if(found) sel.value=expiry;
+    else {
+      // Load the symbol's expiries; the user can then calculate the selected structure.
+      document.getElementById("loadExpiriesBtn").click();
+    }
+  }
+  document.getElementById("targetDeltaInput").value=document.getElementById("icTargetDelta").value;
+  document.getElementById("buildBtn").click();
+}
+
 // ---------- Build / Calculate strategy ----------
 document.getElementById("buildBtn").onclick = async () => {
   const sym = document.getElementById("symbolInput").value.trim().toUpperCase();
@@ -1246,22 +1371,29 @@ document.getElementById("buildBtn").onclick = async () => {
       div.className = "leg-card";
       const potTxt = leg.probability_of_touch_pct != null
         ? `<div style="font-size:11px; color:var(--muted); margin-top:2px;">POT ${leg.probability_of_touch_pct}%</div>` : "";
-      div.innerHTML = `<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>${potTxt}`;
+      const baTxt=`<div style="font-size:11px;color:var(--muted);margin-top:2px;">Bid ₹${leg.bid!=null?leg.bid:"—"} · Ask ₹${leg.ask!=null?leg.ask:"—"}${leg.spread_pct!=null?` · Spread ${leg.spread_pct}%`:""}</div>`;
+      const execPrice=key.startsWith("sell")?leg.bid:leg.ask;
+      const execTxt=`<div style="font-size:11px;color:var(--muted);margin-top:2px;">Entry execution: ${execPrice!=null?"₹"+execPrice:"LTP fallback"} (${key.startsWith("sell")?"Bid":"Ask"})</div>`;
+      div.innerHTML=`<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>${baTxt}${execTxt}${potTxt}`;
       legGrid.appendChild(div);
     });
 
-    document.getElementById("m_profit").textContent = "₹" + d.max_profit;
-    document.getElementById("m_loss").textContent = d.max_loss === null ? "Unlimited" : "₹" + d.max_loss;
-    document.getElementById("m_margin").textContent = d.margin_required !== null && d.margin_required !== undefined
-      ? "₹" + d.margin_required : (d.margin_error ? "Unavailable" : "—");
-    document.getElementById("m_net_profit").textContent = d.net_profit_after_entry_charges !== null
-      ? "₹" + d.net_profit_after_entry_charges : "—";
-    document.getElementById("m_be").textContent = `${d.breakeven_lower} — ${d.breakeven_upper}`;
+    document.getElementById("m_profit").textContent=d.max_profit==null?"—":"₹"+d.max_profit;
+    document.getElementById("m_exec_profit").textContent=d.executable_max_profit==null?"—":"₹"+d.executable_max_profit;
+    document.getElementById("m_loss").textContent=d.max_loss===null?"Unlimited":"₹"+d.max_loss;
+    document.getElementById("m_exec_loss").textContent=d.executable_max_loss==null?"—":"₹"+d.executable_max_loss;
+    document.getElementById("m_margin").textContent=d.margin_required!==null&&d.margin_required!==undefined?"₹"+d.margin_required:(d.margin_error?"Unavailable":"—");
+    document.getElementById("m_net_profit").textContent=d.net_profit_after_entry_charges!==null?"₹"+d.net_profit_after_entry_charges:"—";
+    document.getElementById("m_credit_compare").textContent=d.net_credit_per_share!=null?`₹${d.net_credit_per_share} / ₹${d.executable_net_credit_per_share??d.net_credit_per_share}`:"—";
+    document.getElementById("m_spread_impact").textContent=d.entry_spread_impact_per_share!=null?`₹${d.entry_spread_impact_per_share} / share`:"—";
+    document.getElementById("m_be").textContent=`${d.breakeven_lower} — ${d.breakeven_upper} / ${d.executable_breakeven_lower??d.breakeven_lower} — ${d.executable_breakeven_upper??d.breakeven_upper}`;
     let noteText = d.note;
     if (d.available_call_strikes_above_short) noteText += ` | Nearby call strikes: ${d.available_call_strikes_above_short.join(", ")}`;
     if (d.available_put_strikes_below_short) noteText += ` | Nearby put strikes: ${d.available_put_strikes_below_short.join(", ")}`;
     if (d.margin_error) noteText += ` | Margin lookup failed: ${d.margin_error}`;
     if (d.estimated_entry_charges) noteText += ` | Est. entry charges: ₹${d.estimated_entry_charges.total} (brokerage ₹${d.estimated_entry_charges.brokerage}, STT ₹${d.estimated_entry_charges.stt}, exchange+SEBI+GST ₹${(d.estimated_entry_charges.exchange_txn_charges + d.estimated_entry_charges.sebi_fee + d.estimated_entry_charges.gst).toFixed(2)}, stamp duty ₹${d.estimated_entry_charges.stamp_duty}) — entry side only, exit charges apply too if closed before expiry.`;
+    if (d.estimated_entry_charges_ltp) noteText += ` LTP-entry charges would be ~₹${d.estimated_entry_charges_ltp.total}.`;
+    if (d.entry_spread_impact_per_share != null && Math.abs(d.entry_spread_impact_per_share) > 0) noteText += ` ⚠ Bid/Ask execution reduces theoretical credit by ₹${d.entry_spread_impact_per_share}/share versus LTP.`;
     if (d.entry_event_warning) noteText += ` ⚠ ${d.entry_event_warning}`;
     if (d.event_before_expiry) noteText += ` | Note: ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before this expiry.`;
     document.getElementById("s_note").textContent = noteText;
@@ -1462,12 +1594,12 @@ document.getElementById("chainBtn").onclick = async () => {
     callsBody.innerHTML = ""; putsBody.innerHTML = "";
     d.calls.forEach(o => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
+      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.bid ?? "—"}</td><td>${o.ask ?? "—"}</td><td>${o.spread_pct != null ? o.spread_pct + "%" : "—"}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
       callsBody.appendChild(tr);
     });
     d.puts.forEach(o => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
+      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.bid ?? "—"}</td><td>${o.ask ?? "—"}</td><td>${o.spread_pct != null ? o.spread_pct + "%" : "—"}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
       putsBody.appendChild(tr);
     });
     document.getElementById("chainBox").style.display = "block";
@@ -1510,7 +1642,7 @@ async function loadWatchlist() {
       const qty = p.quantity || p.lot_size;
       if (p.mtm_error) {
         tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot ?? "-"}</td>
-                        <td colspan="6" style="color:var(--red);">${p.mtm_error}</td>
+                        <td colspan="7" style="color:var(--red);">${p.mtm_error}</td>
                         <td>${maxLossDisplay}</td><td>${marginDisplay}</td><td><span class="pill warn">Error</span></td>
                         <td><button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button></td>`;
         tbody.appendChild(tr);
@@ -1532,7 +1664,8 @@ async function loadWatchlist() {
                       <td>${p.current.days_left}</td>
                       <td>₹${p.current.current_position_value}</td>
                       <td class="${pnlClass}">₹${p.current.pnl}</td>
-                      <td class="${netPnlClass}" title="Round-trip est. charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
+                      <td class="${p.current.executable_pnl >= 0 ? "pnl-pos" : "pnl-neg"}" title="Immediate exit: short legs at Ask, long legs at Bid">₹${p.current.executable_pnl}</td>
+                      <td class="${netPnlClass}" title="Executable exit after estimated round-trip charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
                       <td>${p.current.probability_of_success_pct ?? "-"}%</td>
                       <td>${maxLossDisplay}</td>
                       <td>${marginDisplay}</td>
@@ -1551,17 +1684,20 @@ async function loadWatchlist() {
       detailTr.id = detailId;
       detailTr.style.display = "none";
       const legLabels = {sell_call: "Sell Call", buy_call: "Buy Call", sell_put: "Sell Put", buy_put: "Buy Put"};
-      let legHtml = `<td colspan="14"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
+      let legHtml = `<td colspan="15"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
       Object.keys(legLabels).forEach(k => {
         const lg = p.current.legs_current && p.current.legs_current[k];
         if (!lg) return;
         const legPnlClass = lg.pnl >= 0 ? "pnl-pos" : "pnl-neg";
         const deltaLine = lg.current_delta !== undefined
           ? `<div style="color:var(--muted); font-size:11px;">Current delta: ${lg.current_delta}</div>` : "";
-        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px;">
+        const execLegClass=lg.executable_pnl>=0?"pnl-pos":"pnl-neg";
+        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px; min-width:190px;">
                       <div style="color:var(--muted); font-size:11px;">${legLabels[k]} (strike ${lg.strike})</div>
-                      <div style="font-size:13px;">Entry ₹${lg.entry_price} → Now ₹${lg.current_price}</div>
-                      <div class="${legPnlClass}" style="font-size:13px;">P&amp;L ₹${lg.pnl}</div>
+                      <div style="font-size:13px;">Entry ₹${lg.entry_price} → LTP ₹${lg.current_price}</div>
+                      <div style="color:var(--muted);font-size:11px;">Bid ₹${lg.bid ?? "—"} · Ask ₹${lg.ask ?? "—"}</div>
+                      <div class="${legPnlClass}" style="font-size:13px;">LTP P&amp;L ₹${lg.pnl}</div>
+                      <div class="${execLegClass}" style="font-size:13px;">Exit P&amp;L ₹${lg.executable_pnl} (exit ₹${lg.exit_price_executable})</div>
                       ${deltaLine}
                     </div>`;
       });
@@ -1780,27 +1916,129 @@ function renderPositionsTable() {
   tbody.innerHTML = "";
   if (!livePositions.length) {
     document.getElementById("positionsTable").style.display = "none";
+    document.getElementById("positionsTotals").style.display = "none";
     document.getElementById("positionsEmpty").style.display = "block";
     return;
   }
   document.getElementById("positionsEmpty").style.display = "none";
+
+  // Always calculate the numbers in the browser from Entry + LTP/Bid/Ask as a
+  // fallback. This makes the display correct even if an older backend is still
+  // returning only average_price/last_price from Kite.
+  const num = v => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const qtyAbs = p => Math.abs(num(p.quantity) || 0);
+  const side = p => String(p.side || ((num(p.quantity) || 0) < 0 ? "SHORT" : "LONG")).toUpperCase();
+  const calc = p => {
+    const entry = num(p.average_price);
+    const ltp = num(p.last_price ?? p.ltp);
+    const bid = num(p.bid);
+    const ask = num(p.ask);
+    const q = qtyAbs(p);
+    let ltpPer = num(p.ltp_pnl_per_unit);
+    let ltpTotal = num(p.ltp_pnl_total);
+    let exitPrice = num(p.exit_price);
+    let exitPer = num(p.exit_pnl_per_unit);
+    let exitTotal = num(p.exit_pnl_total);
+
+    if (ltpPer == null && entry != null && ltp != null) {
+      ltpPer = side(p) === "LONG" ? ltp - entry : entry - ltp;
+    }
+    if (ltpTotal == null && ltpPer != null) ltpTotal = ltpPer * q;
+
+    if (exitPrice == null) exitPrice = side(p) === "LONG" ? bid : ask;
+    if (exitPer == null && entry != null && exitPrice != null) {
+      exitPer = side(p) === "LONG" ? exitPrice - entry : entry - exitPrice;
+    }
+    if (exitTotal == null && exitPer != null) exitTotal = exitPer * q;
+    return {entry, ltp, bid, ask, q, ltpPer, ltpTotal, exitPrice, exitPer, exitTotal};
+  };
+
+  const money = v => v == null || !Number.isFinite(Number(v)) ? "—" : `₹${Number(v).toFixed(2)}`;
+  const signedMoney = v => {
+    if (v == null || !Number.isFinite(Number(v))) return "—";
+    const n = Number(v);
+    return `${n >= 0 ? "+" : "−"}₹${Math.abs(n).toFixed(2)}`;
+  };
+  const pnlClass = v => (v != null && Number(v) >= 0) ? "pnl-pos" : "pnl-neg";
+
+  let totalLtp = 0, totalExit = 0;
+  const groups = new Map();
+
   livePositions.forEach((p, idx) => {
-    const pnlClass = (p.pnl != null && p.pnl >= 0) ? "pnl-pos" : "pnl-neg";
-    const sideClass = p.side === "SHORT" ? "sell" : "buy";
+    const c = calc(p);
+    // Keep the calculated values on the row so later refresh/exit actions use
+    // the same displayed values.
+    p._calc = c;
+    if (c.ltpTotal != null) totalLtp += c.ltpTotal;
+    if (c.exitTotal != null) totalExit += c.exitTotal;
+
+    // For options, Zerodha's tradingsymbol contains DDMMM after the underlying,
+    // e.g. IREDA26AUG110PE -> IREDA. Fall back to the whole symbol if it cannot
+    // be parsed. This groups all four IREDA legs together.
+    const ts = String(p.tradingsymbol || "");
+    const m = ts.match(/^(.+?)(\d{2}[A-Z]{3})/);
+    const underlying = m ? m[1] : ts;
+    p._underlying = underlying;
+    if (!groups.has(underlying)) groups.set(underlying, {legs:0, qty:0, ltp:0, exit:0, ltpKnown:true, exitKnown:true});
+    const g = groups.get(underlying);
+    g.legs += 1; g.qty += c.q;
+    if (c.ltpTotal != null) g.ltp += c.ltpTotal; else g.ltpKnown = false;
+    if (c.exitTotal != null) g.exit += c.exitTotal; else g.exitKnown = false;
+
+    const ltpClass = pnlClass(c.ltpPer);
+    const exitClass = pnlClass(c.exitPer);
+    const sideClass = side(p) === "SHORT" ? "sell" : "buy";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><input type="checkbox" ${p._selected ? "checked" : ""} onchange="livePositions[${idx}]._selected=this.checked" /></td>
       <td>${p.tradingsymbol}</td>
-      <td class="${sideClass}">${p.side}</td>
-      <td>${Math.abs(p.quantity)}</td>
-      <td>₹${p.average_price}</td>
-      <td>₹${p.last_price}</td>
-      <td class="${pnlClass}">₹${p.pnl}</td>
+      <td class="${sideClass}">${side(p)}</td>
+      <td>${c.q}</td>
+      <td>${money(c.entry)}</td>
+      <td>${money(c.ltp)}</td>
+      <td class="${ltpClass}">${signedMoney(c.ltpPer)}</td>
+      <td class="${ltpClass}"><b>${signedMoney(c.ltpTotal)}</b></td>
+      <td>${money(c.bid)}</td>
+      <td>${money(c.ask)}</td>
+      <td><b>${money(c.exitPrice)}</b><br><span class="legend">${side(p) === "LONG" ? "Bid" : "Ask"}</span></td>
+      <td class="${exitClass}">${signedMoney(c.exitPer)}</td>
+      <td class="${exitClass}"><b>${signedMoney(c.exitTotal)}</b></td>
       <td><input type="number" step="0.05" placeholder="MARKET" style="width:90px;" value="${p._exitPrice}" onchange="livePositions[${idx}]._exitPrice=this.value" /></td>
       <td><button class="danger small-btn" onclick="exitSingleLivePosition(${idx})">Exit</button></td>`;
     tbody.appendChild(tr);
   });
+
   document.getElementById("positionsTable").style.display = "table";
+  const totals = document.getElementById("positionsTotals");
+  totals.style.display = "block";
+  const totalGap = totalExit - totalLtp;
+  const fmtTotal = v => `${v >= 0 ? "+" : "−"}₹${Math.abs(Number(v)).toFixed(2)}`;
+  document.getElementById("totalLtpPnl").textContent = fmtTotal(totalLtp);
+  document.getElementById("totalExitPnl").textContent = fmtTotal(totalExit);
+  document.getElementById("totalExitGap").textContent = fmtTotal(totalGap);
+  document.getElementById("totalLtpPnl").className = totalLtp >= 0 ? "pnl-pos" : "pnl-neg";
+  document.getElementById("totalExitPnl").className = totalExit >= 0 ? "pnl-pos" : "pnl-neg";
+  document.getElementById("totalExitGap").className = totalGap >= 0 ? "pnl-pos" : "pnl-neg";
+
+  // Underlying-wise summary: e.g. all four IREDA legs are added together.
+  const gt = document.querySelector("#positionGroupsTable tbody");
+  gt.innerHTML = "";
+  for (const [underlying, g] of groups) {
+    const gap = g.exit - g.ltp;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${underlying}</b></td>
+      <td>${g.legs}</td>
+      <td>${g.qty}</td>
+      <td class="${pnlClass(g.ltp)}"><b>${g.ltpKnown ? fmtTotal(g.ltp) : "—"}</b></td>
+      <td class="${pnlClass(g.exit)}"><b>${g.exitKnown ? fmtTotal(g.exit) : "—"}</b></td>
+      <td class="${pnlClass(gap)}"><b>${g.ltpKnown && g.exitKnown ? fmtTotal(gap) : "—"}</b></td>`;
+    gt.appendChild(tr);
+  }
+  document.getElementById("positionGroupsTable").style.display = "table";
 }
 
 document.getElementById("selectAllPositions").onchange = function() {
