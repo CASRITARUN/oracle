@@ -93,6 +93,7 @@
   .top-tab-btn:hover { color:var(--text); opacity:1; }
   .top-tab-btn.active { color:var(--text); border-bottom-color:var(--accent); }
   .tab-page { display:none; }
+#tabPageCalendar,#tabPageDelta { display:none !important; }
   .tab-page.active { display:block; }
   .curve-legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
   .strike-mode-btn.active { background:var(--accent); color:white; border-color:var(--accent); }
@@ -109,17 +110,13 @@
   </div>
   <div class="row">
     <button class="secondary small-btn" id="forceRefreshBtn">Fetch New Data</button>
-    <div id="kotakArea"></div>
     <div id="loginArea"></div>
   </div>
 </header>
 
 <div class="top-tabs">
   <button class="top-tab-btn active" id="tabBtnCondor" onclick="switchTopTab('condor')">Option Selling — Condor / Strangle</button>
-  <button class="top-tab-btn" id="tabBtnCalendar" onclick="switchTopTab('calendar')">Double Calendar Spread</button>
   <button class="top-tab-btn" id="tabBtnAuto" onclick="switchTopTab('auto')">⚡ Auto Trade Mode</button>
-  <button class="top-tab-btn" id="tabBtnDelta" onclick="switchTopTab('delta')">Δ Delta Neutral Engine</button>
-  <button class="top-tab-btn" id="tabBtnSkew" onclick="switchTopTab('skew')">Premium Skew Scanner</button>
 </div>
 
 <div class="tab-page active" id="tabPageCondor">
@@ -151,7 +148,41 @@
   </div>
 
   <div class="panel">
-    <h2>2. Build &amp; Adjust Strategy</h2>
+    <div class="panel" id="icScreenerPanel">
+  <h2>2. Iron Condor Screener — actual Zerodha-tradable four-leg structures</h2>
+  <div class="row" style="margin-bottom:12px;">
+    <label class="inline">Short delta
+      <input type="number" id="icTargetDelta" value="0.18" step="0.01" min="0.10" max="0.30" style="width:75px;" /></label>
+    <label class="inline">Min DTE
+      <input type="number" id="icMinDte" value="14" min="1" max="90" style="width:65px;" /></label>
+    <label class="inline">Max DTE
+      <input type="number" id="icMaxDte" value="50" min="2" max="180" style="width:65px;" /></label>
+    <label class="inline">Show
+      <input type="number" id="icLimit" value="25" min="5" max="50" style="width:65px;" /></label>
+    <button id="runIcScreenerBtn">Run IC Screener</button>
+    <button class="secondary small-btn" id="refreshIcScreenerBtn">Force refresh</button>
+    <span id="icScreenerStatus" class="loading"></span>
+  </div>
+  <table id="icScreenerTable" style="display:none;">
+    <thead><tr>
+      <th>Rank</th><th>Symbol</th><th>IC Score</th><th>Expiry / DTE</th><th>IV Rank</th><th>IV/HV</th>
+      <th>Regime / ADX</th><th>CE Δ</th><th>PE Δ</th><th>CE Cushion</th><th>PE Cushion</th><th>Credit/Max Loss</th><th>POP</th>
+      <th>4-Leg Liquidity</th><th>Legs</th><th>Event</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="icScreenerExcluded" class="legend" style="display:none;margin-top:10px;"></div>
+  <div class="legend">
+    Screen 1 ranks the full usable F&amp;O stock universe. Screen 2 then takes the top ranked stocks from Screen 1
+    and evaluates actual four-leg IC structures across up to two best expiries per stock, prioritising the 21–35 DTE window.
+    It batches the required option quotes to stay within Zerodha REST limits while still testing multiple available strikes and hedge widths. Short premium legs have a stronger
+    execution threshold than far-OTM hedge legs. Expected-move cushion and credit/max-loss are scored rather than
+    treated as arbitrary pass/fail cliffs. Score weights: IV richness 20%, range quality 15%, expected-move cushion 25%,
+    four-leg liquidity 10%, economics 15%, delta quality 10%, event risk 5%. Normal mode keeps each short leg within +/-0.03 of the target delta, rejects CE/PE delta asymmetry above 0.04, and risk-adjusts extra premium using expected-move cushion.
+  </div>
+</div>
+
+<h2>2. Build &amp; Adjust Strategy</h2>
     <div class="row">
       <input type="text" id="symbolInput" placeholder="e.g. ITC, NIFTY, BANKNIFTY" />
       <button class="secondary index-btn" onclick="quickSymbol('NIFTY')">NIFTY</button>
@@ -190,11 +221,15 @@
       <div class="leg-grid" id="legGrid"></div>
 
       <div class="metric-row">
-        <div class="metric profit"><div class="k">Max Profit</div><div class="v" id="m_profit"></div></div>
-        <div class="metric loss"><div class="k">Max Loss</div><div class="v" id="m_loss"></div></div>
+        <div class="metric profit"><div class="k">Max Profit (LTP)</div><div class="v" id="m_profit"></div></div>
+        <div class="metric profit"><div class="k">Max Profit (Executable Entry)</div><div class="v" id="m_exec_profit"></div></div>
+        <div class="metric loss"><div class="k">Max Loss (LTP)</div><div class="v" id="m_loss"></div></div>
+        <div class="metric loss"><div class="k">Max Loss (Executable Entry)</div><div class="v" id="m_exec_loss"></div></div>
         <div class="metric"><div class="k">Margin / Investment Required</div><div class="v" id="m_margin"></div></div>
-        <div class="metric profit"><div class="k">Net Profit After Est. Entry Charges</div><div class="v" id="m_net_profit"></div></div>
-        <div class="metric"><div class="k">Breakeven Range</div><div class="v" id="m_be"></div></div>
+        <div class="metric profit"><div class="k">Net Profit After Entry Charges (Executable)</div><div class="v" id="m_net_profit"></div></div>
+        <div class="metric"><div class="k">Net Credit: LTP / Executable</div><div class="v" id="m_credit_compare"></div></div>
+        <div class="metric"><div class="k">Entry Spread Impact</div><div class="v" id="m_spread_impact"></div></div>
+        <div class="metric"><div class="k">Breakeven: LTP / Executable</div><div class="v" id="m_be"></div></div>
       </div>
 
       <div id="s_warnings"></div>
@@ -292,10 +327,11 @@
     <table id="watchlistTable" style="display:none;">
       <thead>
         <tr><th>Symbol</th><th>Type</th><th>Qty</th><th>Entry Spot</th><th>Current Spot</th><th>Days Left</th>
-            <th>Position Value</th><th>P&amp;L</th><th>Net P&amp;L (after charges)</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
+            <th>Position Value (LTP)</th><th>P&amp;L (LTP)</th><th>Exit P&amp;L (Bid/Ask)</th><th>Net Exit P&amp;L</th><th>Prob. Success</th><th>Max Loss</th><th>Margin</th><th>Zone</th><th></th></tr>
       </thead>
       <tbody></tbody>
     </table>
+    <div class="legend">LTP P&amp;L = theoretical mark using current LTP. Exit P&amp;L = approximate immediately realizable P&amp;L using Ask to buy back short legs and Bid to sell long legs. Net Exit P&amp;L subtracts estimated entry + exit charges.</div>
     <div class="legend" id="watchlistEmpty">No trades entered yet — use section 2 or 4 above.</div>
   </div>
 
@@ -320,49 +356,45 @@
     <table id="positionsTable" style="display:none;">
       <thead><tr>
         <th><input type="checkbox" id="selectAllPositions" /></th>
-        <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>LTP</th><th>P&amp;L</th>
-        <th>Exit Price (blank = MARKET)</th><th></th>
+        <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th>
+        <th>LTP</th><th>LTP P&amp;L / Share</th><th>LTP P&amp;L Total</th>
+        <th>Bid</th><th>Ask</th><th>Market Exit Price</th>
+        <th>Exit P&amp;L / Share</th><th>Exit P&amp;L Total</th>
+        <th>Custom Exit Price</th><th></th>
       </tr></thead>
       <tbody></tbody>
     </table>
-    <div id="positionsTotalsBox" class="leg-grid" style="margin-top:10px;"></div>
+    <div id="positionsTotals" style="display:none; margin-top:14px; padding:14px; border:1px solid var(--border); border-radius:10px; background:#11151d;">
+      <div class="row" style="gap:24px; flex-wrap:wrap;">
+        <div><span class="legend">Total LTP P&amp;L — All Open Legs</span><br><strong id="totalLtpPnl">₹0.00</strong></div>
+        <div><span class="legend">Total Market-Exit P&amp;L — All Open Legs</span><br><strong id="totalExitPnl">₹0.00</strong></div>
+        <div><span class="legend">LTP vs Exit Difference</span><br><strong id="totalExitGap">₹0.00</strong></div>
+      </div>
+      <div class="legend" style="margin-top:8px;">
+        <b>LTP P&amp;L</b> is the theoretical mark-to-market: LONG = (LTP − Entry) × Qty; SHORT = (Entry − LTP) × Qty.
+        <b>Market-Exit P&amp;L</b> is the approximate amount realizable immediately: LONG exits at Bid; SHORT exits at Ask.
+        Totals are before brokerage/taxes/charges.
+      </div>
+      <div style="margin-top:16px; overflow-x:auto;">
+        <div style="font-weight:700; margin-bottom:8px;">Underlying-wise total P&amp;L — all open legs of the same stock</div>
+        <table id="positionGroupsTable" style="display:none; width:100%;">
+          <thead><tr>
+            <th>Underlying</th><th>Open Legs</th><th>Total Qty</th>
+            <th>LTP P&amp;L Total</th><th>Market-Exit P&amp;L Total</th><th>LTP vs Exit</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
     <div class="legend" id="positionsEmpty">No open F&amp;O positions, or click Refresh.</div>
     <div class="legend">
-      Entry price, LTP and P&amp;L here come straight from Zerodha's live position book — this is
-      every open F&amp;O leg in your account, not just the ones this tool placed. Type a price in a
-      row and Exit (or select several with the checkboxes and click "Exit Selected") to send that
-      as a LIMIT order; leave it blank to exit at MARKET. Selecting several legs and exiting them
-      together sends one order per leg, back to back — it does not net legs against each other.
-      The totals above group every leg by its underlying stock/index, since a single leg's P&amp;L
-      alone isn't the number that matters for a multi-leg position.
+      <b>Per-share view:</b> LTP P&amp;L/Share shows the theoretical gain/loss from Entry → LTP.
+      Market Exit Price shows the actual executable side of the market (Bid for LONG, Ask for SHORT),
+      and Exit P&amp;L/Share shows what that immediate exit would approximately realise.
+      Type a Custom Exit Price in a row and click Exit to send a LIMIT order; leave it blank to exit at MARKET.
+      Selecting several legs and exiting them together sends one order per leg.
     </div>
   </div>
-
-  <div class="panel">
-    <h2>Scenario Simulator — "what if the price moves?"</h2>
-    <div class="legend" style="max-width:820px;">
-      Estimates P&amp;L on your CURRENT live position for one underlying, across a range of price
-      moves and days forward — including time decay. Each leg's implied volatility is pulled
-      automatically from its live Zerodha price — you don't need to enter anything for that.
-    </div>
-    <div class="row" style="margin-top:10px; align-items:flex-end;">
-      <label class="inline">Underlying <select id="simSymbolSelect" style="width:140px;"></select></label>
-      <label class="inline">Price moves (%, comma-separated) <input type="text" id="simPriceMoves" value="-10,-7,-5,-3,-1,0,1,3,5,7,10" style="width:220px;" /></label>
-      <label class="inline">Days forward (comma-separated) <input type="text" id="simDayOffsets" value="0,1,3,7" style="width:110px;" /></label>
-      <button onclick="runPositionSimulator()">Simulate</button>
-      <span id="simStatus" class="loading"></span>
-    </div>
-    <div class="row" style="margin-top:8px; align-items:flex-end;">
-      <label class="inline">Optional: also stress IV by (%) <input type="number" id="simIvShift" value="0" style="width:70px;" /></label>
-      <span class="legend">Leave at 0 to just use today's live IV as-is. Only change this if you want to additionally test a volatility jump/crush on top of the price move — e.g. -20 to simulate IV collapsing during a rally, or +30 to simulate IV spiking during a selloff.</span>
-    </div>
-    <div id="simChartWrap" style="margin-top:14px; display:none;">
-      <canvas id="simChart" height="90"></canvas>
-    </div>
-    <div id="simLegsBox" style="margin-top:10px;"></div>
-    <div id="simCaveat" class="legend" style="margin-top:8px;"></div>
-  </div>
-
 
   <div class="panel">
     <h2>7. Price Movement Chart (candlestick)</h2>
@@ -559,7 +591,7 @@
   <div class="panel">
     <h2>⚡ Auto Trade Mode — status</h2>
     <div class="warn-box" style="margin-top:0;">
-      This is a rule-based intraday <b>breakout scanner + option buyer</b> — not a guaranteed-profit
+      This is a rule-based intraday <b>market-mood breakout scanner + option buyer with risk-based sizing</b> — not a guaranteed-profit
       system. It watches your configured symbols for a price breakout above/below their recent
       trading range, buys the ATM option in that direction, and manages stop-loss/target/trailing-stop
       itself. In <b>Manual</b> mode nothing is ever sent to your broker until you click "Execute".
@@ -570,6 +602,25 @@
       <span id="autoStatusPill" class="pill warn">Not armed</span>
       <span id="autoExecModePill" class="pill ok">TRACK — paper, no real orders</span>
     </div>
+    <div class="panel" style="margin-top:14px; background:rgba(91,141,239,.05);">
+      <h3 style="margin-top:0;">🧭 Market mood + candle behaviour engine</h3>
+      <div class="row">
+        <span id="autoMoodPill" class="pill warn">Mood: —</span>
+        <span id="autoMoodScore" class="legend">Score: —</span>
+        <span id="autoMoodReason" class="legend" style="max-width:760px;">Waiting for market data…</span>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label class="inline"><input type="checkbox" id="autoUseMood" checked /> Require market-mood alignment</label>
+        <label class="inline"><input type="checkbox" id="autoRequireCandle" checked /> Require 2/3-candle alignment</label>
+        <label class="inline">Min candle score <input type="number" id="autoMinCandleScore" value="1" min="0" max="6" step="1" style="width:60px;" /></label>
+      </div>
+      <div class="legend" style="margin-top:6px;">
+        The engine does not treat a Hammer/Doji alone as a trade. It combines 2–3 candle sequence,
+        rejection/engulfing behaviour, trend, RSI, volume, breakout strength and broad market mood.
+        After entry it re-checks these conditions and can exit when the original thesis is contradicted.
+      </div>
+    </div>
+
     <div class="row" style="margin-top:10px; align-items:center; gap:10px;">
       <span class="legend">Order execution:</span>
       <button class="toggle" id="autoTrackModeBtn" onclick="setExecutionMode('track')">Track mode — paper</button>
@@ -654,6 +705,17 @@
       <label class="inline">Max concurrent positions <input type="number" id="autoMaxConcurrent" value="1" min="1" max="10" /></label>
       <label class="inline">Max daily loss (₹) <input type="number" id="autoMaxLoss" value="5000" min="500" step="500" /></label>
     </div>
+    <div class="row" style="margin-top:10px; align-items:flex-end;">
+      <label class="inline"><input type="checkbox" id="autoRiskSizing" checked /> Fixed-fractional risk sizing</label>
+      <label class="inline">Account equity (₹) <input type="number" id="autoAccountEquity" value="200000" min="10000" step="10000" /></label>
+      <label class="inline">Risk / trade (%) <input type="number" id="autoRiskPct" value="0.75" min="0.1" max="3" step="0.05" /></label>
+      <label class="inline">Max drawdown (%) <input type="number" id="autoMaxDDPct" value="3" min="0.5" max="10" step="0.25" /></label>
+    </div>
+    <div class="legend" style="margin-top:6px; max-width:820px;">
+      Position size is calculated from the initial premium stop and account risk, then capped by the budget per trade.
+      If the permitted risk is less than one lot, the system refuses the trade. The daily circuit breaker includes
+      realized P&amp;L plus tracked open P&amp;L.
+    </div>
     <div class="row" style="margin-top:14px; align-items:flex-start;">
       <div>
         <label class="inline">Exit logic
@@ -723,60 +785,31 @@
     </div>
   </div>
 
-
   <div class="panel">
-    <h2>🛡️ Professional Risk & Validation</h2>
-    <div class="legend" style="max-width:820px;">
-      Position size is determined by <b>maximum planned loss</b>, not simply by how many lots fit
-      inside the premium budget. Regime, volatility and current drawdown reduce risk automatically.
-      The walk-forward test optimizes a small parameter set only on prior candles and evaluates the
-      next unseen candles, helping expose overfitting. Results are underlying points, not fabricated
-      historical option-premium P&amp;L.
+    <h2>🧪 Strategy Backtest — same entry logic</h2>
+    <div class="row" style="align-items:flex-end;">
+      <label class="inline">Symbol <input type="text" id="autoBtSymbol" value="NIFTY" style="width:120px;" /></label>
+      <label class="inline">Interval <select id="autoBtInterval"><option value="5minute">5 min</option><option value="15minute">15 min</option><option value="60minute">60 min</option></select></label>
+      <label class="inline">Days <input type="number" id="autoBtDays" value="20" min="2" max="60" style="width:60px;" /></label>
+      <label class="inline">Lookback <input type="number" id="autoBtLookback" value="20" min="5" max="100" style="width:65px;" /></label>
+      <button class="secondary small-btn" onclick="runAutoBacktest()">Run backtest</button>
+      <span class="loading" id="autoBtStatus"></span>
     </div>
-    <div class="row" style="margin-top:12px; align-items:flex-end;">
-      <label class="inline">Risk capital ₹ <input type="number" id="autoRiskCapital" value="500000" min="10000" step="10000" /></label>
-      <label class="inline">Risk / trade % <input type="number" id="autoRiskPct" value="1" min="0.1" max="3" step="0.1" /></label>
-      <label class="inline">Max capital deployed % <input type="number" id="autoRiskMaxCapPct" value="5" min="1" max="20" step="0.5" /></label>
-      <label class="inline">Reduce risk at DD % <input type="number" id="autoRiskReduceDD" value="3" min="1" max="20" step="0.5" /></label>
-      <label class="inline">Stop new entries at DD % <input type="number" id="autoRiskStopDD" value="5" min="1" max="25" step="0.5" /></label>
+    <div id="autoBtSummary" class="row" style="margin-top:12px; gap:12px;"></div>
+    <div id="autoBtNote" class="legend" style="margin-top:8px;">Uses the same breakout + candle + mood filters. Results are underlying points, not fabricated option-premium P&amp;L.</div>
+    <table id="autoBtTable" style="display:none; margin-top:12px;"><thead><tr><th>Entry</th><th>Side</th><th>Entry</th><th>Exit</th><th>Points</th><th>Exit reason</th><th>Candles</th><th>Mood</th></tr></thead><tbody id="autoBtBody"></tbody></table>
+    <div class="panel" style="margin-top:14px; background:rgba(91,141,239,.04);">
+      <h3 style="margin-top:0;">🔬 Walk-forward validation</h3>
+      <div class="legend">Parameters are selected on earlier data and tested only on the next unseen period. This is the preferred validation before Live mode.</div>
+      <div class="row" style="margin-top:10px;">
+        <label class="inline">Days <input type="number" id="autoWfDays" value="120" min="20" max="365" style="width:70px;"></label>
+        <label class="inline">Folds <input type="number" id="autoWfFolds" value="4" min="2" max="8" style="width:60px;"></label>
+        <button class="secondary small-btn" onclick="runAutoWalkForward()">Run walk-forward</button>
+        <span class="loading" id="autoWfStatus"></span>
+      </div>
+      <div id="autoWfSummary" class="row" style="margin-top:10px;gap:10px;"></div>
+      <table id="autoWfTable" style="display:none;margin-top:10px;"><thead><tr><th>Fold</th><th>Train</th><th>Test</th><th>Lookback</th><th>SL ATR</th><th>Target ATR</th><th>Trades</th><th>Win %</th><th>Net pts</th><th>Max DD</th></tr></thead><tbody id="autoWfBody"></tbody></table>
     </div>
-    <div class="row" style="margin-top:10px;">
-      <label class="inline">Strong regime size × <input type="number" id="autoRiskStrong" value="1" min="0" max="1.5" step="0.1" /></label>
-      <label class="inline">Normal regime × <input type="number" id="autoRiskNormal" value="0.8" min="0" max="1.5" step="0.1" /></label>
-      <label class="inline">Sideways breakout × <input type="number" id="autoRiskSideways" value="0.5" min="0" max="1" step="0.1" /></label>
-      <label class="inline">High-vol × <input type="number" id="autoRiskHighVol" value="0.5" min="0" max="1" step="0.1" /></label>
-      <label class="inline">High-vol threshold ATR <input type="number" id="autoRiskHighVolAtr" value="3" min="1" max="10" step="0.5" /></label>
-      <button class="secondary small-btn" onclick="saveAutoRiskConfig()">Save risk</button>
-    </div>
-    <div id="autoRiskStatus" class="legend" style="margin-top:8px;"></div>
-  </div>
-
-  <div class="panel">
-    <h2>🧪 Walk-forward validation</h2>
-    <div class="legend" style="max-width:820px;">
-      The system selects a small set of lookback/score parameters using only the earlier training
-      window, then tests those parameters on unseen candles. This is a validation tool, not a
-      promise of future returns.
-    </div>
-    <div class="row" style="margin-top:12px; align-items:flex-end;">
-      <label class="inline">Symbol <input type="text" id="autoWfSymbol" value="NIFTY" style="width:120px;" /></label>
-      <label class="inline">Interval
-        <select id="autoWfInterval">
-          <option value="5minute">5 min</option>
-          <option value="15minute">15 min</option>
-          <option value="60minute">60 min</option>
-        </select>
-      </label>
-      <label class="inline">History days <input type="number" id="autoWfDays" value="60" min="5" max="180" style="width:70px;" /></label>
-      <button onclick="runAutoWalkForward()">Run walk-forward test</button>
-      <span id="autoWfStatus" class="loading"></span>
-    </div>
-    <div id="autoWfSummary" style="margin-top:12px;"></div>
-    <table id="autoWfTable" style="display:none; margin-top:10px;">
-      <thead><tr><th>Fold</th><th>Train bars</th><th>Test bars</th><th>Chosen lookback</th><th>Chosen score</th><th>Train points</th><th>OOS trades</th><th>OOS win %</th><th>OOS points</th></tr></thead>
-      <tbody id="autoWfBody"></tbody>
-    </table>
-    <div id="autoWfNote" class="legend" style="margin-top:8px;"></div>
   </div>
 
   <div class="panel">
@@ -814,7 +847,7 @@
       <span class="legend">Scores update every scan cycle — use "Recheck" on a row for its score right now, or "Dismiss" to hide a stale row until the next scan.</span>
     </div>
     <table id="autoScanTable" style="margin-top:12px; display:none;">
-      <thead><tr><th>Symbol</th><th>Direction</th><th>Detected</th><th>Confidence</th><th>Score</th><th>Trend</th><th>RSI</th><th>Volume</th><th>Reasoning</th><th colspan="2"></th></tr></thead>
+      <thead><tr><th>Symbol</th><th>Direction</th><th>Detected</th><th>Confidence</th><th>Score</th><th>Mood</th><th>Candles</th><th>Trend</th><th>RSI</th><th>Volume</th><th>Reasoning</th><th colspan="2"></th></tr></thead>
       <tbody id="autoScanBody"></tbody>
     </table>
     <div class="legend" id="autoScanEmpty">No breakout candidates yet — click "Scan now" or arm the loop above.</div>
@@ -959,50 +992,6 @@
 
 </div>
 </div><!-- /tabPageDelta -->
-
-<div class="tab-page" id="tabPageSkew">
-<div class="wrap">
-
-  <div class="panel">
-    <h2>Premium Skew Scanner</h2>
-    <div class="legend" style="max-width:820px;">
-      For a symmetric Iron Condor (equal delta on both sides), the call and put premiums are usually
-      close but rarely identical. This scans stocks/indices, finds the call and put nearest your
-      chosen delta for each, and ranks candidates by a <b>safety score</b> that blends how lopsided
-      today's premium is with two risk checks: whether that stock is actually trending (bad for a
-      condor regardless of skew) and how liquid the strikes are. Each leg also shows a
-      <b>Black-Scholes fair value</b> — what that strike "should" cost if the whole chain were priced
-      with the at-the-money option's volatility (no smile). The gap between that and the actual quoted
-      premium shows which side is carrying the smile premium, not just which is pricier of the two.
-      Click Scan once — it automatically keeps working through the whole F&amp;O list in batches until
-      done, or until you click Stop.
-    </div>
-    <div class="row" style="margin-top:14px; align-items:flex-end;">
-      <label class="inline">Delta range: low <input type="number" id="skewDeltaLow" value="0.15" step="0.01" style="width:70px;" /></label>
-      <label class="inline">high <input type="number" id="skewDeltaHigh" value="0.20" step="0.01" style="width:70px;" /></label>
-      <label class="inline">Hedge distance (%) <input type="number" id="skewHedgeDist" value="2.5" step="0.1" style="width:70px;" /></label>
-      <label class="inline">Min skew to show (%) <input type="number" id="skewMinPct" value="15" style="width:70px;" /></label>
-      <label class="inline" style="display:flex; align-items:center; gap:6px;">
-        <input type="checkbox" id="skewScanAllFo" checked /> Scan entire F&amp;O universe
-      </label>
-      <button class="secondary small-btn" onclick="saveSkewConfig()">Save settings</button>
-    </div>
-    <div class="row" style="margin-top:10px;">
-      <button id="skewScanBtn" onclick="startSkewAutoScan()">Scan</button>
-      <button id="skewStopBtn" class="secondary" onclick="stopSkewAutoScan()" style="display:none;">Stop scanning</button>
-      <button class="secondary" onclick="clearSkewResults()">Clear results</button>
-      <span id="skewScanStatus" class="loading"></span>
-    </div>
-    <div id="skewCaveat" class="legend" style="margin-top:8px;"></div>
-  </div>
-
-  <div class="panel">
-    <h2>Ranked candidates <span class="legend">(richest premium imbalance first)</span></h2>
-    <div id="skewResultsBox" style="margin-top:10px;"></div>
-  </div>
-
-</div>
-</div><!-- /tabPageSkew -->
 
 <!-- Execute confirmation modal -->
 <div class="modal-overlay" id="execModal">
@@ -1202,37 +1191,6 @@ async function apiFetch(url, options) {
 // clicking anything (e.g. token expired overnight and they just left the tab open).
 setInterval(checkSession, 2 * 60 * 1000);
 
-// --- Kotak Neo status pill ---------------------------------------------------------------
-// Purely additive: does not touch checkSession()/apiFetch()/the Kite login flow above. Kotak
-// authenticates itself entirely server-side (TOTP + MPIN from ~/kotak_algo/.env) — this just
-// polls the status the backend already establishes, no credentials ever touch the browser.
-async function checkKotakStatus() {
-  const el = document.getElementById("kotakArea");
-  if (!el) return;
-  try {
-    const r = await fetch("/api/broker/status");
-    const d = await r.json();
-    const k = d.kotak || {};
-    if (k.connected) {
-      el.innerHTML = `<span class="pill ok">🟢 Kotak Neo Connected</span>`;
-    } else if (k.message && k.message.toLowerCase().includes("missing required kotak env vars")) {
-      // Not configured yet on this server — stay quiet rather than showing a scary red pill
-      // for something that isn't a failure, just an unfinished setup step.
-      el.innerHTML = "";
-    } else {
-      el.innerHTML = `<span class="pill bad" title="${(k.message || "").replace(/"/g, "'")}">🔴 Kotak Neo Disconnected</span> <button class="secondary small-btn" id="kotakReconnectBtn">Reconnect</button>`;
-      const btn = document.getElementById("kotakReconnectBtn");
-      if (btn) btn.onclick = async () => {
-        el.innerHTML = `<span class="pill warn">🟡 Connecting...</span>`;
-        await fetch("/api/kotak/connect", {method: "POST"});
-        checkKotakStatus();
-      };
-    }
-  } catch (e) { /* network hiccup — leave the pill as it was */ }
-}
-checkKotakStatus();
-setInterval(checkKotakStatus, 2 * 60 * 1000);
-
 document.getElementById("forceRefreshBtn").onclick = async () => {
   const loggedIn = await checkSession();
   if (!loggedIn) return;
@@ -1353,6 +1311,67 @@ document.getElementById("loadChainExpiriesBtn").onclick = async () => {
   } catch (e) { alert("Could not load expiries: " + e); }
 };
 
+// ---------- Iron Condor Screener ----------
+async function runIcScreener(force=false) {
+  const status=document.getElementById("icScreenerStatus");
+  const loggedIn=await checkSession();
+  if(!loggedIn){ status.textContent="Connect your Kite account first (top right)."; return; }
+  const td=document.getElementById("icTargetDelta").value || 0.18;
+  const minDte=document.getElementById("icMinDte").value || 14;
+  const maxDte=document.getElementById("icMaxDte").value || 50;
+  const limit=document.getElementById("icLimit").value || 25;
+  status.textContent="Building actual four-leg ICs from the top Screen-1 candidates and batching Zerodha option quotes...";
+  try {
+    const qs=new URLSearchParams({limit,target_delta:td,min_dte:minDte,max_dte:maxDte,force:force?"true":"false"});
+    const r=await apiFetch(`/api/ic-screener?${qs.toString()}`);
+    const d=await r.json().catch(()=>({error:`HTTP ${r.status}`}));
+    if(!r.ok || d.error){ status.textContent="Error: "+(d.message||d.error||`HTTP ${r.status}`); return; }
+    const tbody=document.querySelector("#icScreenerTable tbody"); tbody.innerHTML="";
+    (d.stocks||[]).forEach((x,i)=>{
+      const ivhv=x.iv_hv ? `${x.iv_hv.ratio} ${x.iv_hv.label||""}` : "—";
+      const regime=x.trend_regime ? `${x.trend_regime}${x.trend_adx!=null?" / "+x.trend_adx:""}` : "—";
+      const liq=`${x.ic_liquidity_score ?? "—"} <span style="opacity:.65">OI ${x.ic_min_leg_oi ?? "—"}, Vol ${x.ic_total_leg_volume ?? "—"}</span>`;
+      const legs=x.ic_legs ? `P ${x.ic_legs.buy_put}/${x.ic_legs.sell_put} · C ${x.ic_legs.sell_call}/${x.ic_legs.buy_call}` : "—";
+      const event=(x.event_flags&&x.event_flags.length)?x.event_flags.map(e=>e.label||e.type).join("; "):"OK";
+      const tr=document.createElement("tr");
+      tr.innerHTML=`<td>${x.rank||i+1}/${x.total||d.eligible_count||0}</td>
+        <td><b>${x.symbol}</b></td><td><b>${x.ic_score}</b> ${x.ic_label||""}</td>
+        <td>${x.ic_expiry||"—"} / ${x.ic_dte??"—"}</td>
+        <td>${x.iv_rank_pct!=null?x.iv_rank_pct+"%":"building"}</td><td>${ivhv}</td>
+        <td>${regime}</td><td>${x.ic_sell_call_delta??"—"}</td><td>${x.ic_sell_put_delta??"—"}</td>
+        <td>${x.ic_ce_cushion_em??"—"}x</td><td>${x.ic_pe_cushion_em??"—"}x</td>
+        <td>${x.ic_credit_max_loss_pct??"—"}%</td><td>${x.ic_pop_pct??"—"}%</td>
+        <td>${liq}<br><span style="opacity:.65">short OI ${x.ic_min_short_oi??"—"}, hedge OI ${x.ic_min_hedge_oi??"—"}</span></td>
+        <td style="font-size:11px;white-space:nowrap">${legs}</td><td style="max-width:180px">${event}</td>
+        <td><button class="secondary small-btn" onclick="useIcCandidate('${x.symbol}','${x.ic_expiry||""}')">Use</button></td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById("icScreenerTable").style.display="table";
+    status.textContent=`${d.count} Screen-1 candidates → ${d.deep_evaluated ?? 0} evaluated → ${d.eligible_count} IC candidates. Showing top ${d.stocks?.length||0}.` + (d.option_quote_instruments ? ` ${d.option_quote_instruments} option instruments batched.` : "") + (d.evaluation_error_count ? ` ${d.evaluation_error_count} data issues.` : "");
+    const ex=document.getElementById("icScreenerExcluded");
+    if(d.excluded_sample&&d.excluded_sample.length){
+      ex.innerHTML="<b>Excluded sample:</b> "+d.excluded_sample.map(x=>`${x.symbol} (${(x.hard_reasons||[]).join(", ")||"not qualified"})`).join(" · ");
+      ex.style.display="block";
+    } else ex.style.display="none";
+  } catch(e) { status.textContent="Request failed: "+e; }
+}
+document.getElementById("runIcScreenerBtn").onclick=()=>runIcScreener(false);
+document.getElementById("refreshIcScreenerBtn").onclick=()=>runIcScreener(true);
+function useIcCandidate(sym,expiry){
+  document.getElementById("symbolInput").value=sym;
+  if(expiry){
+    const sel=document.getElementById("expirySelect");
+    const found=[...sel.options].find(o=>o.value===expiry);
+    if(found) sel.value=expiry;
+    else {
+      // Load the symbol's expiries; the user can then calculate the selected structure.
+      document.getElementById("loadExpiriesBtn").click();
+    }
+  }
+  document.getElementById("targetDeltaInput").value=document.getElementById("icTargetDelta").value;
+  document.getElementById("buildBtn").click();
+}
+
 // ---------- Build / Calculate strategy ----------
 document.getElementById("buildBtn").onclick = async () => {
   const sym = document.getElementById("symbolInput").value.trim().toUpperCase();
@@ -1408,22 +1427,29 @@ document.getElementById("buildBtn").onclick = async () => {
       div.className = "leg-card";
       const potTxt = leg.probability_of_touch_pct != null
         ? `<div style="font-size:11px; color:var(--muted); margin-top:2px;">POT ${leg.probability_of_touch_pct}%</div>` : "";
-      div.innerHTML = `<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>${potTxt}`;
+      const baTxt=`<div style="font-size:11px;color:var(--muted);margin-top:2px;">Bid ₹${leg.bid!=null?leg.bid:"—"} · Ask ₹${leg.ask!=null?leg.ask:"—"}${leg.spread_pct!=null?` · Spread ${leg.spread_pct}%`:""}</div>`;
+      const execPrice=key.startsWith("sell")?leg.bid:leg.ask;
+      const execTxt=`<div style="font-size:11px;color:var(--muted);margin-top:2px;">Entry execution: ${execPrice!=null?"₹"+execPrice:"LTP fallback"} (${key.startsWith("sell")?"Bid":"Ask"})</div>`;
+      div.innerHTML=`<div class="k">${legLabels[key]}</div><div class="v">${leg.strike} @ ₹${leg.ltp} (Δ${leg.delta})</div>${baTxt}${execTxt}${potTxt}`;
       legGrid.appendChild(div);
     });
 
-    document.getElementById("m_profit").textContent = "₹" + d.max_profit;
-    document.getElementById("m_loss").textContent = d.max_loss === null ? "Unlimited" : "₹" + d.max_loss;
-    document.getElementById("m_margin").textContent = d.margin_required !== null && d.margin_required !== undefined
-      ? "₹" + d.margin_required : (d.margin_error ? "Unavailable" : "—");
-    document.getElementById("m_net_profit").textContent = d.net_profit_after_entry_charges !== null
-      ? "₹" + d.net_profit_after_entry_charges : "—";
-    document.getElementById("m_be").textContent = `${d.breakeven_lower} — ${d.breakeven_upper}`;
+    document.getElementById("m_profit").textContent=d.max_profit==null?"—":"₹"+d.max_profit;
+    document.getElementById("m_exec_profit").textContent=d.executable_max_profit==null?"—":"₹"+d.executable_max_profit;
+    document.getElementById("m_loss").textContent=d.max_loss===null?"Unlimited":"₹"+d.max_loss;
+    document.getElementById("m_exec_loss").textContent=d.executable_max_loss==null?"—":"₹"+d.executable_max_loss;
+    document.getElementById("m_margin").textContent=d.margin_required!==null&&d.margin_required!==undefined?"₹"+d.margin_required:(d.margin_error?"Unavailable":"—");
+    document.getElementById("m_net_profit").textContent=d.net_profit_after_entry_charges!==null?"₹"+d.net_profit_after_entry_charges:"—";
+    document.getElementById("m_credit_compare").textContent=d.net_credit_per_share!=null?`₹${d.net_credit_per_share} / ₹${d.executable_net_credit_per_share??d.net_credit_per_share}`:"—";
+    document.getElementById("m_spread_impact").textContent=d.entry_spread_impact_per_share!=null?`₹${d.entry_spread_impact_per_share} / share`:"—";
+    document.getElementById("m_be").textContent=`${d.breakeven_lower} — ${d.breakeven_upper} / ${d.executable_breakeven_lower??d.breakeven_lower} — ${d.executable_breakeven_upper??d.breakeven_upper}`;
     let noteText = d.note;
     if (d.available_call_strikes_above_short) noteText += ` | Nearby call strikes: ${d.available_call_strikes_above_short.join(", ")}`;
     if (d.available_put_strikes_below_short) noteText += ` | Nearby put strikes: ${d.available_put_strikes_below_short.join(", ")}`;
     if (d.margin_error) noteText += ` | Margin lookup failed: ${d.margin_error}`;
     if (d.estimated_entry_charges) noteText += ` | Est. entry charges: ₹${d.estimated_entry_charges.total} (brokerage ₹${d.estimated_entry_charges.brokerage}, STT ₹${d.estimated_entry_charges.stt}, exchange+SEBI+GST ₹${(d.estimated_entry_charges.exchange_txn_charges + d.estimated_entry_charges.sebi_fee + d.estimated_entry_charges.gst).toFixed(2)}, stamp duty ₹${d.estimated_entry_charges.stamp_duty}) — entry side only, exit charges apply too if closed before expiry.`;
+    if (d.estimated_entry_charges_ltp) noteText += ` LTP-entry charges would be ~₹${d.estimated_entry_charges_ltp.total}.`;
+    if (d.entry_spread_impact_per_share != null && Math.abs(d.entry_spread_impact_per_share) > 0) noteText += ` ⚠ Bid/Ask execution reduces theoretical credit by ₹${d.entry_spread_impact_per_share}/share versus LTP.`;
     if (d.entry_event_warning) noteText += ` ⚠ ${d.entry_event_warning}`;
     if (d.event_before_expiry) noteText += ` | Note: ${d.event_before_expiry.label} on ${d.event_before_expiry.date} falls before this expiry.`;
     document.getElementById("s_note").textContent = noteText;
@@ -1624,12 +1650,12 @@ document.getElementById("chainBtn").onclick = async () => {
     callsBody.innerHTML = ""; putsBody.innerHTML = "";
     d.calls.forEach(o => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
+      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.bid ?? "—"}</td><td>${o.ask ?? "—"}</td><td>${o.spread_pct != null ? o.spread_pct + "%" : "—"}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
       callsBody.appendChild(tr);
     });
     d.puts.forEach(o => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
+      tr.innerHTML = `<td>${o.strike}</td><td>${o.ltp}</td><td>${o.bid ?? "—"}</td><td>${o.ask ?? "—"}</td><td>${o.spread_pct != null ? o.spread_pct + "%" : "—"}</td><td>${o.oi}</td><td>${o.iv_pct}</td><td>${o.delta}</td>`;
       putsBody.appendChild(tr);
     });
     document.getElementById("chainBox").style.display = "block";
@@ -1672,7 +1698,7 @@ async function loadWatchlist() {
       const qty = p.quantity || p.lot_size;
       if (p.mtm_error) {
         tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot ?? "-"}</td>
-                        <td colspan="6" style="color:var(--red);">${p.mtm_error}</td>
+                        <td colspan="7" style="color:var(--red);">${p.mtm_error}</td>
                         <td>${maxLossDisplay}</td><td>${marginDisplay}</td><td><span class="pill warn">Error</span></td>
                         <td><button class="secondary small-btn" onclick="removePosition('${p.id}')">Remove</button></td>`;
         tbody.appendChild(tr);
@@ -1694,7 +1720,8 @@ async function loadWatchlist() {
                       <td>${p.current.days_left}</td>
                       <td>₹${p.current.current_position_value}</td>
                       <td class="${pnlClass}">₹${p.current.pnl}</td>
-                      <td class="${netPnlClass}" title="Round-trip est. charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
+                      <td class="${p.current.executable_pnl >= 0 ? "pnl-pos" : "pnl-neg"}" title="Immediate exit: short legs at Ask, long legs at Bid">₹${p.current.executable_pnl}</td>
+                      <td class="${netPnlClass}" title="Executable exit after estimated round-trip charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
                       <td>${p.current.probability_of_success_pct ?? "-"}%</td>
                       <td>${maxLossDisplay}</td>
                       <td>${marginDisplay}</td>
@@ -1713,17 +1740,20 @@ async function loadWatchlist() {
       detailTr.id = detailId;
       detailTr.style.display = "none";
       const legLabels = {sell_call: "Sell Call", buy_call: "Buy Call", sell_put: "Sell Put", buy_put: "Buy Put"};
-      let legHtml = `<td colspan="14"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
+      let legHtml = `<td colspan="15"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
       Object.keys(legLabels).forEach(k => {
         const lg = p.current.legs_current && p.current.legs_current[k];
         if (!lg) return;
         const legPnlClass = lg.pnl >= 0 ? "pnl-pos" : "pnl-neg";
         const deltaLine = lg.current_delta !== undefined
           ? `<div style="color:var(--muted); font-size:11px;">Current delta: ${lg.current_delta}</div>` : "";
-        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px;">
+        const execLegClass=lg.executable_pnl>=0?"pnl-pos":"pnl-neg";
+        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px; min-width:190px;">
                       <div style="color:var(--muted); font-size:11px;">${legLabels[k]} (strike ${lg.strike})</div>
-                      <div style="font-size:13px;">Entry ₹${lg.entry_price} → Now ₹${lg.current_price}</div>
-                      <div class="${legPnlClass}" style="font-size:13px;">P&amp;L ₹${lg.pnl}</div>
+                      <div style="font-size:13px;">Entry ₹${lg.entry_price} → LTP ₹${lg.current_price}</div>
+                      <div style="color:var(--muted);font-size:11px;">Bid ₹${lg.bid ?? "—"} · Ask ₹${lg.ask ?? "—"}</div>
+                      <div class="${legPnlClass}" style="font-size:13px;">LTP P&amp;L ₹${lg.pnl}</div>
+                      <div class="${execLegClass}" style="font-size:13px;">Exit P&amp;L ₹${lg.executable_pnl} (exit ₹${lg.exit_price_executable})</div>
                       ${deltaLine}
                     </div>`;
       });
@@ -1932,32 +1962,9 @@ async function loadBrokerPositions() {
     const d = await r.json();
     if (d.error) { status.textContent = "Error: " + d.error; return; }
     livePositions = (d.positions || []).map(p => ({...p, _selected: false, _exitPrice: ""}));
-    window.__brokerTotalsBySymbol = d.totals_by_symbol || {};
     renderPositionsTable();
-    renderPositionsTotals();
-    populateSimSymbolSelect();
     status.textContent = "Updated just now.";
   } catch (e) { status.textContent = "Request failed: " + e; }
-}
-
-function renderPositionsTotals() {
-  const box = document.getElementById("positionsTotalsBox");
-  const totals = window.__brokerTotalsBySymbol || {};
-  const symbols = Object.keys(totals);
-  if (!symbols.length) { box.innerHTML = ""; return; }
-  box.innerHTML = symbols.map(sym => {
-    const pnl = totals[sym];
-    const cls = pnl >= 0 ? "pnl-pos" : "pnl-neg";
-    return `<div class="leg-card"><div class="k">${sym} total</div><div class="v ${cls}">₹${pnl}</div></div>`;
-  }).join("");
-}
-
-function populateSimSymbolSelect() {
-  const sel = document.getElementById("simSymbolSelect");
-  const symbols = Object.keys(window.__brokerTotalsBySymbol || {});
-  const current = sel.value;
-  sel.innerHTML = symbols.map(s => `<option value="${s}">${s}</option>`).join("");
-  if (symbols.includes(current)) sel.value = current;
 }
 
 function renderPositionsTable() {
@@ -1965,27 +1972,129 @@ function renderPositionsTable() {
   tbody.innerHTML = "";
   if (!livePositions.length) {
     document.getElementById("positionsTable").style.display = "none";
+    document.getElementById("positionsTotals").style.display = "none";
     document.getElementById("positionsEmpty").style.display = "block";
     return;
   }
   document.getElementById("positionsEmpty").style.display = "none";
+
+  // Always calculate the numbers in the browser from Entry + LTP/Bid/Ask as a
+  // fallback. This makes the display correct even if an older backend is still
+  // returning only average_price/last_price from Kite.
+  const num = v => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const qtyAbs = p => Math.abs(num(p.quantity) || 0);
+  const side = p => String(p.side || ((num(p.quantity) || 0) < 0 ? "SHORT" : "LONG")).toUpperCase();
+  const calc = p => {
+    const entry = num(p.average_price);
+    const ltp = num(p.last_price ?? p.ltp);
+    const bid = num(p.bid);
+    const ask = num(p.ask);
+    const q = qtyAbs(p);
+    let ltpPer = num(p.ltp_pnl_per_unit);
+    let ltpTotal = num(p.ltp_pnl_total);
+    let exitPrice = num(p.exit_price);
+    let exitPer = num(p.exit_pnl_per_unit);
+    let exitTotal = num(p.exit_pnl_total);
+
+    if (ltpPer == null && entry != null && ltp != null) {
+      ltpPer = side(p) === "LONG" ? ltp - entry : entry - ltp;
+    }
+    if (ltpTotal == null && ltpPer != null) ltpTotal = ltpPer * q;
+
+    if (exitPrice == null) exitPrice = side(p) === "LONG" ? bid : ask;
+    if (exitPer == null && entry != null && exitPrice != null) {
+      exitPer = side(p) === "LONG" ? exitPrice - entry : entry - exitPrice;
+    }
+    if (exitTotal == null && exitPer != null) exitTotal = exitPer * q;
+    return {entry, ltp, bid, ask, q, ltpPer, ltpTotal, exitPrice, exitPer, exitTotal};
+  };
+
+  const money = v => v == null || !Number.isFinite(Number(v)) ? "—" : `₹${Number(v).toFixed(2)}`;
+  const signedMoney = v => {
+    if (v == null || !Number.isFinite(Number(v))) return "—";
+    const n = Number(v);
+    return `${n >= 0 ? "+" : "−"}₹${Math.abs(n).toFixed(2)}`;
+  };
+  const pnlClass = v => (v != null && Number(v) >= 0) ? "pnl-pos" : "pnl-neg";
+
+  let totalLtp = 0, totalExit = 0;
+  const groups = new Map();
+
   livePositions.forEach((p, idx) => {
-    const pnlClass = (p.pnl != null && p.pnl >= 0) ? "pnl-pos" : "pnl-neg";
-    const sideClass = p.side === "SHORT" ? "sell" : "buy";
+    const c = calc(p);
+    // Keep the calculated values on the row so later refresh/exit actions use
+    // the same displayed values.
+    p._calc = c;
+    if (c.ltpTotal != null) totalLtp += c.ltpTotal;
+    if (c.exitTotal != null) totalExit += c.exitTotal;
+
+    // For options, Zerodha's tradingsymbol contains DDMMM after the underlying,
+    // e.g. IREDA26AUG110PE -> IREDA. Fall back to the whole symbol if it cannot
+    // be parsed. This groups all four IREDA legs together.
+    const ts = String(p.tradingsymbol || "");
+    const m = ts.match(/^(.+?)(\d{2}[A-Z]{3})/);
+    const underlying = m ? m[1] : ts;
+    p._underlying = underlying;
+    if (!groups.has(underlying)) groups.set(underlying, {legs:0, qty:0, ltp:0, exit:0, ltpKnown:true, exitKnown:true});
+    const g = groups.get(underlying);
+    g.legs += 1; g.qty += c.q;
+    if (c.ltpTotal != null) g.ltp += c.ltpTotal; else g.ltpKnown = false;
+    if (c.exitTotal != null) g.exit += c.exitTotal; else g.exitKnown = false;
+
+    const ltpClass = pnlClass(c.ltpPer);
+    const exitClass = pnlClass(c.exitPer);
+    const sideClass = side(p) === "SHORT" ? "sell" : "buy";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><input type="checkbox" ${p._selected ? "checked" : ""} onchange="livePositions[${idx}]._selected=this.checked" /></td>
       <td>${p.tradingsymbol}</td>
-      <td class="${sideClass}">${p.side}</td>
-      <td>${Math.abs(p.quantity)}</td>
-      <td>₹${p.average_price}</td>
-      <td>₹${p.last_price}</td>
-      <td class="${pnlClass}">₹${p.pnl}</td>
+      <td class="${sideClass}">${side(p)}</td>
+      <td>${c.q}</td>
+      <td>${money(c.entry)}</td>
+      <td>${money(c.ltp)}</td>
+      <td class="${ltpClass}">${signedMoney(c.ltpPer)}</td>
+      <td class="${ltpClass}"><b>${signedMoney(c.ltpTotal)}</b></td>
+      <td>${money(c.bid)}</td>
+      <td>${money(c.ask)}</td>
+      <td><b>${money(c.exitPrice)}</b><br><span class="legend">${side(p) === "LONG" ? "Bid" : "Ask"}</span></td>
+      <td class="${exitClass}">${signedMoney(c.exitPer)}</td>
+      <td class="${exitClass}"><b>${signedMoney(c.exitTotal)}</b></td>
       <td><input type="number" step="0.05" placeholder="MARKET" style="width:90px;" value="${p._exitPrice}" onchange="livePositions[${idx}]._exitPrice=this.value" /></td>
       <td><button class="danger small-btn" onclick="exitSingleLivePosition(${idx})">Exit</button></td>`;
     tbody.appendChild(tr);
   });
+
   document.getElementById("positionsTable").style.display = "table";
+  const totals = document.getElementById("positionsTotals");
+  totals.style.display = "block";
+  const totalGap = totalExit - totalLtp;
+  const fmtTotal = v => `${v >= 0 ? "+" : "−"}₹${Math.abs(Number(v)).toFixed(2)}`;
+  document.getElementById("totalLtpPnl").textContent = fmtTotal(totalLtp);
+  document.getElementById("totalExitPnl").textContent = fmtTotal(totalExit);
+  document.getElementById("totalExitGap").textContent = fmtTotal(totalGap);
+  document.getElementById("totalLtpPnl").className = totalLtp >= 0 ? "pnl-pos" : "pnl-neg";
+  document.getElementById("totalExitPnl").className = totalExit >= 0 ? "pnl-pos" : "pnl-neg";
+  document.getElementById("totalExitGap").className = totalGap >= 0 ? "pnl-pos" : "pnl-neg";
+
+  // Underlying-wise summary: e.g. all four IREDA legs are added together.
+  const gt = document.querySelector("#positionGroupsTable tbody");
+  gt.innerHTML = "";
+  for (const [underlying, g] of groups) {
+    const gap = g.exit - g.ltp;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${underlying}</b></td>
+      <td>${g.legs}</td>
+      <td>${g.qty}</td>
+      <td class="${pnlClass(g.ltp)}"><b>${g.ltpKnown ? fmtTotal(g.ltp) : "—"}</b></td>
+      <td class="${pnlClass(g.exit)}"><b>${g.exitKnown ? fmtTotal(g.exit) : "—"}</b></td>
+      <td class="${pnlClass(gap)}"><b>${g.ltpKnown && g.exitKnown ? fmtTotal(gap) : "—"}</b></td>`;
+    gt.appendChild(tr);
+  }
+  document.getElementById("positionGroupsTable").style.display = "table";
 }
 
 document.getElementById("selectAllPositions").onchange = function() {
@@ -2020,76 +2129,6 @@ function exitSingleLivePosition(idx) { exitLivePositions([livePositions[idx]]); 
 
 document.getElementById("refreshPositionsBtn").onclick = loadBrokerPositions;
 document.getElementById("exitSelectedBtn").onclick = () => exitLivePositions(livePositions.filter(p => p._selected));
-
-// ---------- Scenario Simulator ("what if the price moves?") ----------
-let simChartInstance = null;
-
-async function runPositionSimulator() {
-  const status = document.getElementById("simStatus");
-  const symbol = document.getElementById("simSymbolSelect").value;
-  if (!symbol) { alert("No underlying with an open position to simulate — refresh positions first."); return; }
-  const priceMoves = document.getElementById("simPriceMoves").value.split(",")
-    .map(s => Number(s.trim())).filter(n => !isNaN(n));
-  const dayOffsets = document.getElementById("simDayOffsets").value.split(",")
-    .map(s => Number(s.trim())).filter(n => !isNaN(n));
-  const ivShift = Number(document.getElementById("simIvShift").value || 0);
-  status.textContent = "Simulating...";
-  try {
-    const r = await apiFetch("/api/broker-positions/simulate", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({symbol, price_moves_pct: priceMoves, day_offsets: dayOffsets, iv_shift_pct: ivShift})
-    });
-    const d = await r.json();
-    status.textContent = "";
-    if (d.error) { alert("Error: " + d.error); return; }
-    renderSimChart(d);
-    document.getElementById("simLegsBox").innerHTML = `
-      <div class="legend">Spot now: ₹${d.spot} · Legs: ${d.legs.map(l =>
-        `${l.tradingsymbol} (${l.quantity > 0 ? "LONG" : "SHORT"} ${Math.abs(l.quantity)}, ${l.days_to_expiry}d to expiry, IV ${l.iv_pct}%)`
-      ).join(" | ")}</div>`;
-    document.getElementById("simCaveat").textContent = d.caveat || "";
-  } catch (e) { status.textContent = "Request failed: " + e; }
-}
-
-function renderSimChart(d) {
-  const wrap = document.getElementById("simChartWrap");
-  wrap.style.display = "block";
-  const ctx = document.getElementById("simChart").getContext("2d");
-  const labels = d.price_moves_pct.map(p => `${p > 0 ? "+" : ""}${p}%`);
-  const palette = ["#5b8def", "#e0a052", "#5cc98a", "#e05555", "#a56ee0", "#4fb8c4"];
-  const datasets = d.day_offsets.map((day, idx) => {
-    const row = d.grid[String(day)] || [];
-    return {
-      label: day === 0 ? "Today" : `+${day}d`,
-      data: row.map(pt => pt.pnl),
-      borderColor: palette[idx % palette.length],
-      backgroundColor: palette[idx % palette.length],
-      tension: 0.15,
-      fill: false,
-    };
-  });
-  if (simChartInstance) simChartInstance.destroy();
-  simChartInstance = new Chart(ctx, {
-    type: "line",
-    data: { labels, datasets },
-    options: {
-      responsive: true,
-      interaction: { mode: "index", intersect: false },
-      plugins: {
-        legend: { labels: { color: "#e6e8ec" } },
-        tooltip: {
-          callbacks: {
-            label: (item) => `${item.dataset.label}: ₹${item.formattedValue} (spot ₹${d.grid[String(d.day_offsets[item.datasetIndex])][item.dataIndex].spot_price})`
-          }
-        }
-      },
-      scales: {
-        x: { title: { display: true, text: "Price move", color: "#e6e8ec" }, ticks: { color: "#9aa3af" }, grid: { color: "#2a2e37" } },
-        y: { title: { display: true, text: "Estimated P&L (₹)", color: "#e6e8ec" }, ticks: { color: "#9aa3af" }, grid: { color: "#2a2e37" } },
-      },
-    },
-  });
-}
 
 // ---------- Shared candlestick helpers ----------
 // Candles are plotted back-to-back by INDEX rather than by real timestamp. A time-scale axis
@@ -2274,37 +2313,17 @@ document.getElementById("refreshEventsBtn").onclick = loadEvents;
 // ============================================================================
 function switchTopTab(which) {
   const isCondor = which === "condor";
-  const isCalendar = which === "calendar";
   const isAuto = which === "auto";
-  const isDelta = which === "delta";
-  const isSkew = which === "skew";
   document.getElementById("tabPageCondor").classList.toggle("active", isCondor);
-  document.getElementById("tabPageCalendar").classList.toggle("active", isCalendar);
   document.getElementById("tabPageAuto").classList.toggle("active", isAuto);
-  document.getElementById("tabPageDelta").classList.toggle("active", isDelta);
-  document.getElementById("tabPageSkew").classList.toggle("active", isSkew);
   document.getElementById("tabBtnCondor").classList.toggle("active", isCondor);
-  document.getElementById("tabBtnCalendar").classList.toggle("active", isCalendar);
   document.getElementById("tabBtnAuto").classList.toggle("active", isAuto);
-  document.getElementById("tabBtnDelta").classList.toggle("active", isDelta);
-  document.getElementById("tabBtnSkew").classList.toggle("active", isSkew);
-  if (isCalendar && !window.__calWatchlistLoadedOnce) {
-    window.__calWatchlistLoadedOnce = true;
-    loadCalWatchlist();
-  }
   if (isAuto && !window.__autoTradeInitedOnce) {
     window.__autoTradeInitedOnce = true;
     initAutoTradeTab();
   }
-  if (isDelta && !window.__deltaEngineInitedOnce) {
-    window.__deltaEngineInitedOnce = true;
-    initDeltaEngineTab();
-  }
-  if (isSkew && !window.__skewScannerInitedOnce) {
-    window.__skewScannerInitedOnce = true;
-    initSkewScannerTab();
-  }
 }
+
 
 function calQuickSymbol(sym) { document.getElementById("calSymbolInput").value = sym; }
 
@@ -2804,6 +2823,10 @@ async function saveAutoConfig() {
     max_trades_per_day: Number(document.getElementById("autoMaxTrades").value),
     max_concurrent_positions: Number(document.getElementById("autoMaxConcurrent").value),
     max_daily_loss: Number(document.getElementById("autoMaxLoss").value),
+    risk_sizing_enabled: document.getElementById("autoRiskSizing").checked,
+    account_equity: Number(document.getElementById("autoAccountEquity").value),
+    risk_per_trade_pct: Number(document.getElementById("autoRiskPct").value),
+    max_drawdown_pct: Number(document.getElementById("autoMaxDDPct").value),
     exit_mode: document.getElementById("autoExitMode").value,
     hard_stop_pct: Number(document.getElementById("autoHardStopPct").value),
     sl_mode: document.getElementById("autoSlMode").value,
@@ -2817,16 +2840,9 @@ async function saveAutoConfig() {
     min_breakout_score: Number(document.getElementById("autoMinScore").value),
     strict_breakout_filters: document.getElementById("autoStrictBreakout").checked,
     square_off_time: document.getElementById("autoSquareOff").value.trim(),
-    risk_account_capital: Number(document.getElementById("autoRiskCapital").value),
-    risk_per_trade_pct: Number(document.getElementById("autoRiskPct").value),
-    risk_max_capital_pct: Number(document.getElementById("autoRiskMaxCapPct").value),
-    risk_drawdown_reduce_pct: Number(document.getElementById("autoRiskReduceDD").value),
-    risk_drawdown_stop_pct: Number(document.getElementById("autoRiskStopDD").value),
-    risk_strong_multiplier: Number(document.getElementById("autoRiskStrong").value),
-    risk_normal_multiplier: Number(document.getElementById("autoRiskNormal").value),
-    risk_sideways_multiplier: Number(document.getElementById("autoRiskSideways").value),
-    risk_high_vol_multiplier: Number(document.getElementById("autoRiskHighVol").value),
-    risk_high_vol_cutoff_atr: Number(document.getElementById("autoRiskHighVolAtr").value),
+    use_market_mood: document.getElementById("autoUseMood").checked,
+    require_candle_alignment: document.getElementById("autoRequireCandle").checked,
+    min_candle_score: Number(document.getElementById("autoMinCandleScore").value)||1
   };
   try {
     const r = await apiFetch("/api/autotrade/config", {
@@ -2890,6 +2906,13 @@ async function pollAutoTradeState() {
       document.getElementById("autoScanAllFo").checked = !!s.scan_all_fo;
       onScanAllFoToggle();
     }
+    if (!window.__riskSizingSyncedOnce) {
+      window.__riskSizingSyncedOnce = true;
+      document.getElementById("autoRiskSizing").checked = s.risk_sizing_enabled !== false;
+      document.getElementById("autoAccountEquity").value = s.account_equity ?? 200000;
+      document.getElementById("autoRiskPct").value = s.risk_per_trade_pct ?? 0.75;
+      document.getElementById("autoMaxDDPct").value = s.max_drawdown_pct ?? 3;
+    }
     if (!window.__slTargetModeSyncedOnce) {
       window.__slTargetModeSyncedOnce = true;
       document.getElementById("autoSlMode").value = s.sl_mode || "pct";
@@ -2898,19 +2921,6 @@ async function pollAutoTradeState() {
       document.getElementById("autoTargetPoints").value = s.target_points ?? 10;
       document.getElementById("autoMaxConcurrent").value = s.max_concurrent_positions ?? 1;
       onSlTargetModeChange();
-    }
-    if (!window.__riskSettingsSyncedOnce) {
-      window.__riskSettingsSyncedOnce = true;
-      document.getElementById("autoRiskCapital").value = s.risk_account_capital ?? 500000;
-      document.getElementById("autoRiskPct").value = s.risk_per_trade_pct ?? 1;
-      document.getElementById("autoRiskMaxCapPct").value = s.risk_max_capital_pct ?? 5;
-      document.getElementById("autoRiskReduceDD").value = s.risk_drawdown_reduce_pct ?? 3;
-      document.getElementById("autoRiskStopDD").value = s.risk_drawdown_stop_pct ?? 5;
-      document.getElementById("autoRiskStrong").value = s.risk_strong_multiplier ?? 1;
-      document.getElementById("autoRiskNormal").value = s.risk_normal_multiplier ?? 0.8;
-      document.getElementById("autoRiskSideways").value = s.risk_sideways_multiplier ?? 0.5;
-      document.getElementById("autoRiskHighVol").value = s.risk_high_vol_multiplier ?? 0.5;
-      document.getElementById("autoRiskHighVolAtr").value = s.risk_high_vol_cutoff_atr ?? 3;
     }
     if (!window.__exitModeSyncedOnce) {
       window.__exitModeSyncedOnce = true;
@@ -2924,6 +2934,14 @@ async function pollAutoTradeState() {
         (s.last_scan_at ? new Date(s.last_scan_at).toLocaleTimeString() : "—") +
         ` (${s.last_scan_universe_size} scanned this cycle)`;
     }
+    const mm = (autoLastCandidates[0] && autoLastCandidates[0].market_mood) || null;
+    const mp=document.getElementById("autoMoodPill");
+    if(mp){ mp.textContent = mm ? `Mood: ${mm.label}` : "Mood: —"; mp.className = "pill " + (mm && Math.abs(mm.score)>=2 ? "ok" : "warn"); }
+    const ms=document.getElementById("autoMoodScore"); if(ms) ms.textContent = mm ? `Score: ${mm.score}` : "Score: —";
+    const mr=document.getElementById("autoMoodReason"); if(mr) mr.textContent = mm ? mm.reason : "Waiting for a current scan.";
+    if(document.getElementById("autoUseMood")) document.getElementById("autoUseMood").checked = s.use_market_mood !== false;
+    if(document.getElementById("autoRequireCandle")) document.getElementById("autoRequireCandle").checked = s.require_candle_alignment !== false;
+    if(document.getElementById("autoMinCandleScore")) document.getElementById("autoMinCandleScore").value = s.min_candle_score ?? 1;
     renderAutoScanTable(autoLastCandidates, s.mode);
     renderAutoOpenPosition(d.open_trades);
     updateAutoPositionChart(d.open_trades);
@@ -2967,6 +2985,8 @@ function renderAutoScanTable(candidates, mode) {
       <td style="font-size:12px; color:var(--muted);">${detectedTime}</td>
       <td><span class="pill ${confClass}">${c.confidence || "—"}</span></td>
       <td>${c.score}</td>
+      <td>${c.market_mood ? `<span class="pill ${c.mood_aligned ? "ok" : "warn"}">${c.market_mood.label}</span>` : "—"}</td>
+      <td style="font-size:11px; max-width:170px;">${c.candle_sequence ? `${c.candle_sequence.label}<br><span class="legend">${(c.candle_sequence.patterns||[]).slice(0,2).join(", ")}</span>` : "—"}</td>
       <td>${trendPill}</td>
       <td>${c.rsi != null ? c.rsi : "—"}</td>
       <td>${c.volume_confirmed ? '<span class="pill ok">confirmed</span>' : '<span class="pill warn">weak</span>'}</td>
@@ -3057,65 +3077,38 @@ async function executeAutoSignal(idx) {
   } catch (e) { alert("Request failed: " + e); }
 }
 
-
-async function saveAutoRiskConfig() {
-  const body = {
-    risk_account_capital: Number(document.getElementById("autoRiskCapital").value),
-    risk_per_trade_pct: Number(document.getElementById("autoRiskPct").value),
-    risk_max_capital_pct: Number(document.getElementById("autoRiskMaxCapPct").value),
-    risk_drawdown_reduce_pct: Number(document.getElementById("autoRiskReduceDD").value),
-    risk_drawdown_stop_pct: Number(document.getElementById("autoRiskStopDD").value),
-    risk_strong_multiplier: Number(document.getElementById("autoRiskStrong").value),
-    risk_normal_multiplier: Number(document.getElementById("autoRiskNormal").value),
-    risk_sideways_multiplier: Number(document.getElementById("autoRiskSideways").value),
-    risk_high_vol_multiplier: Number(document.getElementById("autoRiskHighVol").value),
-    risk_high_vol_cutoff_atr: Number(document.getElementById("autoRiskHighVolAtr").value)
-  };
+async function runAutoBacktest() {
+  const status=document.getElementById("autoBtStatus"); status.textContent="Running…";
   try {
-    const r = await apiFetch("/api/autotrade/config", {
-      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
-    });
-    const d = await r.json();
-    if (d.error) { alert("Error: " + d.error); return; }
-    document.getElementById("autoRiskStatus").textContent =
-      "Risk settings saved. New trades will be sized by stop-risk + regime + volatility + drawdown.";
-    pollAutoTradeState();
-  } catch (e) { alert("Risk settings request failed: " + e); }
+    const r=await apiFetch("/api/autotrade/backtest",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      symbol:document.getElementById("autoBtSymbol").value.trim().toUpperCase(), interval:document.getElementById("autoBtInterval").value,
+      days:Number(document.getElementById("autoBtDays").value)||20, lookback:Number(document.getElementById("autoBtLookback").value)||20
+    })});
+    const d=await r.json(); if(d.error){status.textContent="Error";alert(d.error);return;}
+    const s=d.summary||{};
+    document.getElementById("autoBtSummary").innerHTML=`<span class="pill ok">Trades ${s.trades??0}</span><span class="pill ${s.win_rate>=50?"ok":"warn"}">Win ${s.win_rate??0}%</span><span class="pill ${s.net_points>=0?"ok":"bad"}">Net ${s.net_points??0} pts</span><span class="pill">PF ${s.profit_factor??0}</span><span class="pill">Max DD ${s.max_drawdown_points??0} pts</span>`;
+    const table=document.getElementById("autoBtTable"), body=document.getElementById("autoBtBody");
+    body.innerHTML=(d.trades||[]).map(t=>`<tr><td>${t.entry_time||"—"}</td><td>${t.direction}</td><td>${t.entry}</td><td>${t.exit}</td><td class="${t.pnl_points>=0?"buy":"sell"}">${t.pnl_points}</td><td>${t.exit_reason}</td><td>${t.candle_label||"—"}</td><td>${t.mood||"—"}</td></tr>`).join("");
+    table.style.display=d.trades&&d.trades.length?"table":"none"; status.textContent="Done";
+    document.getElementById("autoBtNote").textContent=d.note||"Backtest completed.";
+  } catch(e){status.textContent="Failed";alert("Backtest request failed: "+e);}
 }
 
 async function runAutoWalkForward() {
-  const status = document.getElementById("autoWfStatus");
-  status.textContent = "Fetching historical candles and validating…";
+  const status=document.getElementById("autoWfStatus"); status.textContent="Running rolling train/test…";
   try {
-    const r = await apiFetch("/api/autotrade/walk-forward", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        symbol:document.getElementById("autoWfSymbol").value.trim().toUpperCase(),
-        interval:document.getElementById("autoWfInterval").value,
-        days:Number(document.getElementById("autoWfDays").value)
-      })
-    });
-    const d = await r.json();
-    if (!r.ok || d.error) { status.textContent="Error"; alert(d.error || "Walk-forward failed"); return; }
-    const s = d.oos_summary || {};
-    document.getElementById("autoWfSummary").innerHTML =
-      `<span class="pill">OOS trades ${s.trades ?? 0}</span>` +
-      `<span class="pill ${Number(s.win_rate)>=50 ? "ok":"warn"}">OOS win ${s.win_rate ?? 0}%</span>` +
-      `<span class="pill ${Number(s.net_points)>=0 ? "ok":"bad"}">OOS net ${s.net_points ?? 0} pts</span>` +
-      `<span class="pill">Avg ${s.avg_points ?? 0} pts/trade</span>`;
-    const rows = d.folds || [];
-    document.getElementById("autoWfBody").innerHTML = rows.map(x =>
-      `<tr><td>${x.fold}</td><td>${x.train_bars}</td><td>${x.test_bars}</td>` +
-      `<td>${x.selected_lookback}</td><td>${x.selected_min_score}</td>` +
-      `<td>${x.train_net_points}</td><td>${x.oos_trades}</td><td>${x.oos_win_rate}%</td><td>${x.oos_net_points}</td></tr>`
-    ).join("");
-    document.getElementById("autoWfTable").style.display = rows.length ? "table" : "none";
-    document.getElementById("autoWfNote").textContent = d.note || "";
-    status.textContent = "Done";
-  } catch (e) {
-    status.textContent = "Failed";
-    alert("Walk-forward request failed: " + e);
-  }
+    const r=await apiFetch("/api/autotrade/walk-forward",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      symbol:document.getElementById("autoBtSymbol").value.trim().toUpperCase(), interval:document.getElementById("autoBtInterval").value,
+      days:Number(document.getElementById("autoWfDays").value)||120, folds:Number(document.getElementById("autoWfFolds").value)||4
+    })});
+    const d=await r.json(); if(d.error){status.textContent="Error";alert(d.error);return;}
+    const s=d.summary||{};
+    document.getElementById("autoWfSummary").innerHTML=`<span class="pill ok">Out-of-sample trades ${s.trades??0}</span><span class="pill ${s.win_rate>=50?"ok":"warn"}">OOS Win ${s.win_rate??0}%</span><span class="pill ${s.net_points>=0?"ok":"bad"}">OOS Net ${s.net_points??0} pts</span>`;
+    const body=document.getElementById("autoWfBody");
+    body.innerHTML=(d.folds||[]).map(x=>`<tr><td>${x.fold}</td><td>${x.train_bars}</td><td>${x.test_bars}</td><td>${x.lookback}</td><td>${x.stop_atr}</td><td>${x.target_atr}</td><td>${x.trades}</td><td>${x.win_rate}%</td><td class="${x.net_points>=0?"buy":"sell"}">${x.net_points}</td><td>${x.max_drawdown}</td></tr>`).join("");
+    document.getElementById("autoWfTable").style.display=(d.folds||[]).length?"table":"none";
+    status.textContent="Done";
+  } catch(e){status.textContent="Failed";alert("Walk-forward request failed: "+e);}
 }
 
 async function scanAutoTradeNow() {
@@ -3616,181 +3609,6 @@ async function loadDeltaLogs() {
       tbody.appendChild(tr);
     });
   } catch (e) { /* silent */ }
-}
-</script>
-
-<script>
-// ============================================================================
-// Premium Skew Scanner tab
-// ============================================================================
-function initSkewScannerTab() {
-  loadSkewState();
-  loadSkewResults();
-}
-
-async function loadSkewState() {
-  try {
-    const r = await apiFetch("/api/skew-scanner/state");
-    const s = await r.json();
-    if (s.error) return;
-    document.getElementById("skewDeltaLow").value = s.delta_low ?? 0.15;
-    document.getElementById("skewDeltaHigh").value = s.delta_high ?? 0.20;
-    document.getElementById("skewHedgeDist").value = s.hedge_distance_pct ?? 2.5;
-    document.getElementById("skewMinPct").value = s.min_skew_pct ?? 15;
-    document.getElementById("skewScanAllFo").checked = s.scan_all_fo !== false;
-  } catch (e) { /* silent */ }
-}
-
-async function saveSkewConfig() {
-  const body = {
-    delta_low: Number(document.getElementById("skewDeltaLow").value),
-    delta_high: Number(document.getElementById("skewDeltaHigh").value),
-    hedge_distance_pct: Number(document.getElementById("skewHedgeDist").value),
-    min_skew_pct: Number(document.getElementById("skewMinPct").value),
-    scan_all_fo: document.getElementById("skewScanAllFo").checked,
-  };
-  try {
-    await apiFetch("/api/skew-scanner/config", {
-      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
-    });
-  } catch (e) { alert("Request failed: " + e); }
-}
-
-let skewAutoScanActive = false;
-
-async function startSkewAutoScan() {
-  const loggedIn = await checkSession();
-  if (!loggedIn) { alert("Connect your Kite account first."); return; }
-  skewAutoScanActive = true;
-  document.getElementById("skewScanBtn").disabled = true;
-  document.getElementById("skewStopBtn").style.display = "";
-  await skewScanLoop();
-}
-
-function stopSkewAutoScan() {
-  skewAutoScanActive = false;
-}
-
-function stopSkewAutoScanUI() {
-  skewAutoScanActive = false;
-  document.getElementById("skewScanBtn").disabled = false;
-  document.getElementById("skewStopBtn").style.display = "none";
-}
-
-async function skewScanLoop() {
-  const status = document.getElementById("skewScanStatus");
-  while (skewAutoScanActive) {
-    try {
-      const r = await apiFetch("/api/skew-scanner/scan-batch", {method: "POST"});
-      const d = await r.json();
-      if (d.error) { status.textContent = "Error: " + d.error; break; }
-      const pct = d.universe_size ? Math.min(100, Math.round((d.cursor / d.universe_size) * 100)) : 100;
-      document.getElementById("skewCaveat").textContent = d.caveat || "";
-      renderSkewResults(d.results || []);
-      if (d.pass_complete) {
-        status.textContent = `Full scan complete — ${d.results.length} candidate(s) found. Click Scan again to refresh.`;
-        break;
-      }
-      status.textContent = `Scanning... ${pct}% through the F&O list (${d.scanned.length} symbols this batch).`;
-    } catch (e) { status.textContent = "Request failed: " + e; break; }
-    if (!skewAutoScanActive) break;
-    await new Promise(res => setTimeout(res, 300));
-  }
-  stopSkewAutoScanUI();
-}
-
-async function loadSkewResults() {
-  try {
-    const r = await apiFetch("/api/skew-scanner/results");
-    const d = await r.json();
-    renderSkewResults(d.results || []);
-  } catch (e) { /* silent */ }
-}
-
-async function clearSkewResults() {
-  await apiFetch("/api/skew-scanner/results/clear", {method: "POST"});
-  renderSkewResults([]);
-  document.getElementById("skewScanStatus").textContent = "Results cleared.";
-}
-
-function fairValueLine(leg) {
-  if (leg.theo_premium == null) return "";
-  const cls = (leg.vs_fair ?? 0) >= 0 ? "pnl-pos" : "pnl-neg";
-  const sign = (leg.vs_fair ?? 0) >= 0 ? "+" : "";
-  return `<div class="legend" style="margin-top:3px; font-size:11px;">Fair (BS) ₹${leg.theo_premium} · <span class="${cls}">${sign}₹${leg.vs_fair} (${sign}${leg.vs_fair_pct}%)</span></div>`;
-}
-
-function renderSkewResults(results) {
-  const box = document.getElementById("skewResultsBox");
-  if (!results.length) {
-    box.innerHTML = `<div class="legend">No candidates yet — click "Scan" (it will work through the whole F&amp;O list automatically).</div>`;
-    return;
-  }
-  box.innerHTML = results.map((r, i) => {
-    const trendBad = r.trend && r.trend.avoid_premium_selling;
-    const trendPillClass = trendBad ? "bad" : (r.trend && r.trend.regime === "Range Bound" ? "ok" : "warn");
-    const dteTxt = r.days_to_expiry != null ? `${r.days_to_expiry}d to expiry (${r.expiry})` : "expiry unknown";
-    const banned = !!r.fo_banned_today;
-    const hasEdge = r.combined_vs_fair_pct != null;
-    const edgeGood = hasEdge && r.combined_vs_fair_pct > 0;
-    return `
-    <div style="border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:10px; ${banned ? "opacity:.75;" : ""}">
-      <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:6px;">
-        <div>#${i + 1} <b>${r.symbol}</b> — spot ₹${r.spot} <span class="legend" style="font-size:11px;">· ${dteTxt}</span></div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap;">
-          ${banned ? `<span class="pill bad" style="font-size:11px;">F&amp;O BAN — can't open new</span>` : ""}
-          <span class="pill ${banned ? "warn" : "ok"}" style="font-size:11px;">Safety score ${r.safety_score}/100</span>
-          ${hasEdge ? `<span class="pill ${edgeGood ? "ok" : "bad"}" style="font-size:11px;">Combined edge ${r.combined_vs_fair_pct > 0 ? "+" : ""}${r.combined_vs_fair_pct}% vs fair</span>` : ""}
-          <span class="pill ${r.richer_side === "put" ? "bad" : "warn"}" style="font-size:11px;">${r.richer_side.toUpperCase()} richer by ${r.skew_pct}% <span style="opacity:.7;">(split only)</span></span>
-          <span class="pill ${trendPillClass}" style="font-size:11px;">${r.trend ? r.trend.regime : "Trend unknown"}</span>
-        </div>
-      </div>
-      <div class="legend" style="margin-top:6px;">${r.reasoning}</div>
-      ${r.event_before_expiry ? `<div class="warn-box">Event before expiry: ${r.event_before_expiry.label} (${r.event_before_expiry.date})</div>` : ""}
-      <div class="leg-grid" style="margin-top:8px;">
-        <div class="leg-card"><div class="k">Sell Call</div><div class="v" style="font-size:13px;">${r.call.strike} @ ₹${r.call.premium} (Δ${r.call.delta}, OI ${r.call.oi ?? "-"})</div>${fairValueLine(r.call)}</div>
-        <div class="leg-card"><div class="k">Sell Put</div><div class="v" style="font-size:13px;">${r.put.strike} @ ₹${r.put.premium} (Δ${r.put.delta}, OI ${r.put.oi ?? "-"})</div>${fairValueLine(r.put)}</div>
-        ${r.call_hedge ? `<div class="leg-card"><div class="k">Hedge Call</div><div class="v" style="font-size:13px;">${r.call_hedge.strike} @ ₹${r.call_hedge.premium}</div></div>` : ""}
-        ${r.put_hedge ? `<div class="leg-card"><div class="k">Hedge Put</div><div class="v" style="font-size:13px;">${r.put_hedge.strike} @ ₹${r.put_hedge.premium}</div></div>` : ""}
-        <div class="leg-card"><div class="k">Net credit/share</div><div class="v" style="font-size:13px;">${r.net_credit_per_share != null ? "₹" + r.net_credit_per_share : "-"}</div></div>
-        <div class="leg-card"><div class="k">Max loss/share</div><div class="v" style="font-size:13px;">${r.max_loss_per_share != null ? "₹" + r.max_loss_per_share : "-"}</div></div>
-        <div class="leg-card"><div class="k">Combined edge vs fair (BS)</div><div class="v ${hasEdge ? (edgeGood ? "pnl-pos" : "pnl-neg") : ""}" style="font-size:13px;">${hasEdge ? (r.combined_vs_fair > 0 ? "+" : "") + "₹" + r.combined_vs_fair + " (" + (r.combined_vs_fair_pct > 0 ? "+" : "") + r.combined_vs_fair_pct + "%)" : "-"}</div></div>
-        <div class="leg-card"><div class="k">ATM IV used for fair value</div><div class="v" style="font-size:13px;">${r.atm_iv_used_pct != null ? r.atm_iv_used_pct + "%" : "-"}</div></div>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button class="small-btn" onclick="addSkewCandidateToTrade('${r.symbol}', ${i}, ${banned})">Add to Trade</button>
-        <span class="loading" id="skewAddStatus_${i}"></span>
-      </div>
-      <div class="legend" style="margin-top:6px; font-size:11px;">Scanned ${new Date(r.scanned_at).toLocaleTimeString()}${r.fo_banned_today === null ? " · run the Screener tab once to enable F&O ban checks" : ""}</div>
-    </div>
-  `;
-  }).join("");
-}
-
-async function addSkewCandidateToTrade(symbol, idx, banned) {
-  const status = document.getElementById(`skewAddStatus_${idx}`);
-  if (banned) {
-    const proceed = confirm(`${symbol} is in the F&O ban period today. It can still be tracked here as a paper position, but a real order (via Execute in the Trade Section) will be rejected by your broker until the ban lifts. Add as paper anyway?`);
-    if (!proceed) { status.textContent = "Skipped (F&O banned today)."; return; }
-  }
-  const loggedIn = await checkSession();
-  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
-  status.textContent = "Adding at current market price...";
-  const deltaLow = Number(document.getElementById("skewDeltaLow").value) || 0.15;
-  const deltaHigh = Number(document.getElementById("skewDeltaHigh").value) || 0.20;
-  const targetDelta = (deltaLow + deltaHigh) / 2;
-  const wingWidthPct = (Number(document.getElementById("skewHedgeDist").value) || 2.5) / 100;
-  try {
-    const r = await apiFetch("/api/watchlist/add", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({symbol, target_delta: targetDelta, wing_width_pct: wingWidthPct,
-                             strategy_type: "iron_condor", lots: 1})
-    });
-    const d = await r.json();
-    if (d.error) { status.textContent = "Error: " + d.error; return; }
-    status.textContent = "Added. See Trade Section on the Condor tab.";
-    loadWatchlist();
-  } catch (e) { status.textContent = "Request failed: " + e; }
 }
 </script>
 
