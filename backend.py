@@ -2,7 +2,7 @@
 Kite Option-Selling Dashboard — local backend
 ------------------------------------------------
 Run:  python backend.py
-Then open: https://algo.wecon.in
+Then open: https://algo2.wecon.in
 
 What this does
 - Logs you into Kite Connect (daily login, token expires every day - that's Kite's design, not a bug here)
@@ -59,9 +59,9 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # this process starts) — do NOT hardcode real keys/secrets directly in this file,
 # especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("vecsucwn1tckme31", "").strip()
-API_SECRET = os.environ.get("mehksxgc3gsbj3zz7kpacrb9ezrkvzro", "").strip()
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
+API_KEY = os.environ.get("KITE_API_KEY", "b4j9bna5hdew1hh4")
+API_SECRET = os.environ.get("KITE_API_SECRET", "mbrdjydzd9ckisvrp4tsqbtkkgojpzue")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -4163,7 +4163,11 @@ AUTOTRADE_DEFAULTS = {
     "poll_seconds": 20,
     "max_trades_per_day": 3,
     "max_concurrent_positions": 1,    # how many auto-trade positions can be open AT ONCE
-    "capital_per_trade": 15000,       # approx premium budget (Rs) used to size lots
+    "capital_per_trade": 15000,       # legacy capital ceiling; risk sizing below is the primary limiter
+    "risk_sizing_enabled": True,      # use stop-based fixed-fractional sizing instead of budget-only sizing
+    "risk_per_trade_pct": 0.75,       # % of account equity allowed to be lost at the initial stop
+    "account_equity": 200000,         # reference equity for risk sizing; update to your actual trading capital
+    "max_drawdown_pct": 3.0,          # daily equity drawdown circuit breaker (realized + tracked open loss)
     "max_daily_loss": 5000,           # Rs; auto-disarms Auto mode the instant realized loss hits this
     # --- Exit logic: choose how open auto-trades get closed ---
     # "auto"      (DEFAULT): system auto-detected exit -- the position is closed the moment the
@@ -4190,7 +4194,12 @@ AUTOTRADE_DEFAULTS = {
                                        # (used by BOTH exit modes -- peak-profit tracking is shared)
     "trail_giveback_pct": 15,         # trailing stop = peak-profit% minus this many percentage points
     "min_breakout_score": 0.5,        # minimum breakout size, in ATR multiples, to qualify as a signal
-    "strict_breakout_filters": True,  # DEFAULT ON: extra false-breakout confirmation layers -- see
+    "strict_breakout_filters": True,
+    "use_market_mood": True,
+    "require_candle_alignment": True,
+    "min_candle_score": 1,
+    "market_mood_min_score": 1,
+    "reversal_exit_score": 2,  # DEFAULT ON: extra false-breakout confirmation layers -- see
                                        # _detect_breakout() (strong-close filter, consolidation/
                                        # tightness check, minimum ATR floor, whipsaw/failed-breakout
                                        # penalty, higher volume bar). Untick to fall back to the
@@ -4207,11 +4216,13 @@ AUTOTRADE_DEFAULTS = {
 
 CONFIGURABLE_AUTOTRADE_KEYS = (
     "universe", "scan_all_fo", "candle_interval", "breakout_lookback", "poll_seconds",
-    "max_trades_per_day", "max_concurrent_positions", "capital_per_trade", "max_daily_loss",
+    "max_trades_per_day", "max_concurrent_positions", "capital_per_trade", "risk_sizing_enabled",
+    "risk_per_trade_pct", "account_equity", "max_drawdown_pct", "max_daily_loss",
     "exit_mode", "hard_stop_pct",
     "sl_mode", "sl_pct_of_premium", "sl_points", "target_mode", "target_pct_of_premium", "target_points",
     "trail_after_pct", "trail_giveback_pct", "min_breakout_score", "strict_breakout_filters",
-    "square_off_time",
+    "square_off_time", "use_market_mood", "require_candle_alignment", "min_candle_score",
+    "market_mood_min_score", "reversal_exit_score",
 )
 
 # --- "Scan all F&O stocks" mode ---
@@ -4332,6 +4343,111 @@ def _rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1 + rs))
 
+
+
+# --- Market mood + multi-candle behaviour engine ---------------------------------------------
+# This layer is deliberately transparent. It does not claim to predict the market; it classifies
+# the current regime from the broad index, volatility and the selected symbol, then checks whether
+# the last 2-3 candles agree with the proposed direction.
+
+def _candle_features(c):
+    o=float(c.get("open", c.get("close", 0))); h=float(c.get("high", o)); l=float(c.get("low", o)); cl=float(c.get("close", o))
+    rng=max(h-l, 1e-9); body=abs(cl-o); upper=max(h-max(o,cl),0.0); lower=max(min(o,cl)-l,0.0)
+    return {"bull":cl>o, "bear":cl<o, "body_pct":body/rng, "upper_pct":upper/rng, "lower_pct":lower/rng,
+            "close_pos":(cl-l)/rng, "range":rng}
+
+
+def _candle_sequence(candles):
+    if len(candles) < 3:
+        return {"score":0, "label":"Insufficient candles", "patterns":[], "direction":None, "reason":"Need at least 3 candles."}
+    last3=candles[-3:]; f=[_candle_features(x) for x in last3]
+    patterns=[]; bull=0; bear=0
+    for x in f:
+        if x["body_pct"] < 0.18: patterns.append("Doji/indecision")
+        if x["lower_pct"] >= 0.45 and x["body_pct"] <= 0.45: patterns.append("Lower-wick rejection")
+        if x["upper_pct"] >= 0.45 and x["body_pct"] <= 0.45: patterns.append("Upper-wick rejection")
+    # 2/3 candle direction and strength
+    if all(x["bull"] for x in f): bull += 2
+    if all(x["bear"] for x in f): bear += 2
+    if sum(x["bull"] for x in f[-2:]) == 2: bull += 1
+    if sum(x["bear"] for x in f[-2:]) == 2: bear += 1
+    # Engulfing using the last two candles
+    a,b=last3[-2],last3[-1]; fa,fb=f[-2],f[-1]
+    if fa["bear"] and fb["bull"] and float(b["open"]) <= float(a["close"]) and float(b["close"]) >= float(a["open"]):
+        patterns.append("Bullish engulfing"); bull += 2
+    if fa["bull"] and fb["bear"] and float(b["open"]) >= float(a["close"]) and float(b["close"]) <= float(a["open"]):
+        patterns.append("Bearish engulfing"); bear += 2
+    # Hammer / shooting-star style rejection
+    if fb["lower_pct"] >= 0.5 and fb["body_pct"] >= 0.12 and fb["upper_pct"] <= 0.25:
+        patterns.append("Hammer/rejection"); bull += 2
+    if fb["upper_pct"] >= 0.5 and fb["body_pct"] >= 0.12 and fb["lower_pct"] <= 0.25:
+        patterns.append("Shooting-star/rejection"); bear += 2
+    # Close progression: higher closes/lows vs lower closes/highs
+    closes=[float(x["close"]) for x in last3]
+    highs=[float(x["high"]) for x in last3]; lows=[float(x["low"]) for x in last3]
+    if closes[0] < closes[1] < closes[2] and lows[0] <= lows[1] <= lows[2]: bull += 1
+    if closes[0] > closes[1] > closes[2] and highs[0] >= highs[1] >= highs[2]: bear += 1
+    score=bull-bear
+    direction="CE" if score>0 else "PE" if score<0 else None
+    if score>=4: label="Strong bullish sequence"
+    elif score>=2: label="Bullish sequence"
+    elif score<=-4: label="Strong bearish sequence"
+    elif score<=-2: label="Bearish sequence"
+    else: label="Neutral / mixed sequence"
+    return {"score":int(score), "label":label, "patterns":sorted(set(patterns)), "direction":direction,
+            "bull_points":bull, "bear_points":bear, "reason":"; ".join(sorted(set(patterns))) or "No dominant named pattern; sequence direction used."}
+
+
+_MOOD_CACHE = {}
+_VIX_CACHE = {"ts": 0, "value": None}
+
+def _market_mood(symbol, local_candles=None, broad_candles=None):
+    """Classify broad market mood using NIFTY trend + RSI + India VIX and local symbol alignment.
+    Returns a directional score, not a probability or prediction. Broad inputs are cached briefly so
+    scanning many F&O names does not hammer Kite with repeated NIFTY/VIX requests."""
+    try:
+        cache_key = (symbol.upper(), round(time.time()/20))
+        if cache_key in _MOOD_CACHE and local_candles is None:
+            return _MOOD_CACHE[cache_key]
+        idx="NIFTY"
+        idx_candles=local_candles if symbol.upper()==idx and local_candles else (broad_candles if broad_candles is not None else _fetch_recent_intraday(idx, "5minute", 20)[0])
+        if not idx_candles: raise ValueError("NIFTY intraday data unavailable")
+        ic=np.array([c["close"] for c in idx_candles],dtype=float)
+        ie9=_ema(ic[-min(len(ic),60):],9); ie21=_ema(ic[-min(len(ic),60):],21); irsi=_rsi(ic,14)
+        score=0; reasons=[]
+        if ie9 is not None and ie21 is not None:
+            if ie9>ie21: score+=2; reasons.append("NIFTY EMA9>EMA21")
+            elif ie9<ie21: score-=2; reasons.append("NIFTY EMA9<EMA21")
+        if irsi is not None:
+            if irsi>55: score+=1; reasons.append(f"NIFTY RSI {irsi:.1f} bullish")
+            elif irsi<45: score-=1; reasons.append(f"NIFTY RSI {irsi:.1f} bearish")
+        vix,_=_safe_vix()
+        if vix is not None:
+            if vix>=25: reasons.append(f"India VIX {vix:.1f} extreme")
+            elif vix>=18: reasons.append(f"India VIX {vix:.1f} high")
+            else: reasons.append(f"India VIX {vix:.1f} normal/low")
+        # local trend adds alignment without letting one stock override the broad mood
+        if local_candles and symbol.upper()!=idx:
+            lc=np.array([c["close"] for c in local_candles],dtype=float); le9=_ema(lc[-min(len(lc),60):],9); le21=_ema(lc[-min(len(lc),60):],21)
+            if le9 is not None and le21 is not None:
+                score += 1 if le9>le21 else -1 if le9<le21 else 0
+                reasons.append("local trend bullish" if le9>le21 else "local trend bearish" if le9<le21 else "local trend flat")
+        label="Strong Bullish" if score>=3 else "Bullish" if score>=1 else "Strong Bearish" if score<=-3 else "Bearish" if score<=-1 else "Neutral / Mixed"
+        out={"label":label,"score":int(score),"vix":round(vix,2) if vix is not None else None,"reason":"; ".join(reasons)}
+        if local_candles is None: _MOOD_CACHE[cache_key]=out
+        return out
+    except Exception as e:
+        return {"label":"Unknown","score":0,"vix":None,"reason":f"Mood unavailable: {e}"}
+
+
+def _safe_vix():
+    try:
+        if time.time()-_VIX_CACHE["ts"] < 20:
+            return _VIX_CACHE["value"], None
+        value,err=get_india_vix(); _VIX_CACHE.update({"ts":time.time(),"value":value})
+        return value,err
+    except Exception:
+        return None, "unavailable"
 
 # --- False-breakout guards (active whenever strict=True, i.e. state["strict_breakout_filters"]) ---
 # Intraday breakouts fail (whipsaw back into the range) very often; these thresholds exist
@@ -4457,6 +4573,10 @@ def _detect_breakout(candles, lookback, strict=True):
     if rsi is not None:
         momentum_aligned = (rsi > 55) if direction == "CE" else (rsi < 45)
 
+    candle_seq = _candle_sequence(candles)
+    # Broad mood is added in scan/annotation; here we only enforce local candle alignment.
+    candle_aligned = candle_seq.get("direction") == direction and candle_seq.get("score",0) >= 1
+
     # Composite: breakout size is the base signal; trend agreement and momentum each scale it up,
     # a counter-trend breakout gets heavily discounted (those fail far more often intraday), relative
     # volume scales it continuously, a strong close gets a small bonus, and any recent failed
@@ -4474,6 +4594,10 @@ def _detect_breakout(candles, lookback, strict=True):
         composite *= 1.1
     if strict and failed_breakouts:
         composite *= max(0.25, 1 - WHIPSAW_PENALTY_PER_FAILURE * failed_breakouts)
+    if candle_aligned:
+        composite *= 1.15
+    elif candle_seq.get("direction") and candle_seq.get("direction") != direction:
+        composite *= 0.55
 
     score = round(composite, 2)
 
@@ -4486,6 +4610,8 @@ def _detect_breakout(candles, lookback, strict=True):
         "channel_high": round(channel_high, 2), "channel_low": round(channel_low, 2),
         "strong_close": bool(strong_close), "close_position": round(close_position, 2),
         "failed_breakouts_recent": failed_breakouts,
+        "candle_sequence": candle_seq,
+        "candle_aligned": bool(candle_aligned),
     }
 
 
@@ -4499,6 +4625,10 @@ def _annotate_candidate(result, symbol, lookback):
     # guarantee, just a rough ranking of "how many confirmations lined up" (used to decide what
     # Auto mode is allowed to touch -- see the auto-mode qualification in the loop below).
     result["confidence"] = "High" if result["score"] >= 3 else "Medium" if result["score"] >= 1.5 else "Low"
+    mood = _market_mood(symbol)
+    result["market_mood"] = mood
+    result["mood_aligned"] = ((result["direction"] == "CE" and mood["score"] >= 1) or
+                               (result["direction"] == "PE" and mood["score"] <= -1))
     direction_word = "broke above" if result["direction"] == "CE" else "broke below"
     trend_note = ("EMA9/21 trend agrees" if result["trend_aligned"] is True else
                    "EMA9/21 trend disagrees (counter-trend, discounted)" if result["trend_aligned"] is False
@@ -4512,10 +4642,13 @@ def _annotate_candidate(result, symbol, lookback):
                   if result.get("strong_close") else "weak/indecisive close")
     whipsaw = result.get("failed_breakouts_recent", 0)
     whipsaw_note = f"; {whipsaw} failed breakout(s) at this level recently (discounted)" if whipsaw else ""
+    seq = result.get("candle_sequence", {})
+    candle_note = f"; candles: {seq.get('label','unknown')} ({', '.join(seq.get('patterns',[])[:3])})"
+    mood_note = f"; market mood: {mood.get('label','Unknown')} (score {mood.get('score',0)})"
     result["reasoning"] = (
         f"{symbol}: price {direction_word} its {lookback}-candle range ({result['breakout_level']}), "
         f"now at {result['last_close']} -- {result['breakout_size_atr']}x ATR raw move, {close_note}; "
-        f"{trend_note}; {momentum_note}; {vol_note}{whipsaw_note}. Composite score {result['score']}."
+        f"{trend_note}; {momentum_note}; {vol_note}{whipsaw_note}{candle_note}{mood_note}. Composite score {result['score']}."
     )
     return result
 
@@ -4550,11 +4683,58 @@ def _breakout_still_valid(direction, breakout_level, current_spot):
     return (current_spot > breakout_level) if direction == "CE" else (current_spot < breakout_level)
 
 
-def _build_autotrade_order(candidate_symbol, direction, capital_per_trade):
-    return _build_autotrade_order_impl(candidate_symbol, direction, capital_per_trade)
+def _risk_sizing_for_option(premium, lot_size, state):
+    """Fixed-fractional option sizing using the INITIAL premium stop as the risk unit.
+    This is deliberately conservative: it assumes the configured stop is filled at the stop
+    price and never treats the full premium budget as the amount we are willing to lose."""
+    try:
+        premium=float(premium); lot_size=int(lot_size)
+        equity=float(state.get("account_equity", 0)); risk_pct=float(state.get("risk_per_trade_pct", 0))
+        if premium <= 0 or lot_size <= 0 or equity <= 0 or risk_pct <= 0:
+            return None
+        if state.get("sl_mode") == "points":
+            stop_distance=max(float(state.get("sl_points", 5.0)), 0.05)
+        else:
+            stop_distance=premium * max(min(float(state.get("sl_pct_of_premium", 30.0))/100.0, 0.95), 0.01)
+        risk_budget=equity * risk_pct / 100.0
+        risk_per_lot=stop_distance * lot_size
+        lots=int(risk_budget // risk_per_lot)
+        # Capital ceiling remains a second guard.
+        budget_lots=int(max(float(state.get("capital_per_trade", 0)), 0) // (premium * lot_size))
+        if budget_lots > 0:
+            lots=min(lots, budget_lots)
+        return {"risk_budget":round(risk_budget,2),"stop_distance":round(stop_distance,2),
+                "risk_per_lot":round(risk_per_lot,2),"recommended_lots":max(lots,0),
+                "capital_lots":budget_lots}
+    except Exception:
+        return None
 
 
-def _build_autotrade_order_impl(symbol, direction, capital_per_trade):
+def _risk_circuit_breaker(state, trades):
+    """Stop new entries when today's realized loss or tracked drawdown breaches a hard limit."""
+    realized=float(state.get("realized_pnl_today",0) or 0)
+    equity=float(state.get("account_equity",0) or 0)
+    max_loss=float(state.get("max_daily_loss",0) or 0)
+    dd_pct=float(state.get("max_drawdown_pct",0) or 0)
+    open_loss=0.0
+    for t in trades:
+        if t.get("status") == "open":
+            entry=float(t.get("entry_price",0) or 0); last=float(t.get("last_ltp",entry) or entry)
+            qty=float(t.get("quantity",0) or 0)
+            open_loss += (last-entry)*qty
+    total_pnl=realized+open_loss
+    hard_pct_loss=equity*dd_pct/100.0 if equity>0 and dd_pct>0 else float("inf")
+    limit=min(x for x in (max_loss if max_loss>0 else float("inf"), hard_pct_loss) if x != float("inf")) if (max_loss>0 or hard_pct_loss!=float("inf")) else float("inf")
+    breached = total_pnl <= -limit if limit != float("inf") else False
+    return {"breached":breached,"realized_pnl":round(realized,2),"open_pnl":round(open_loss,2),
+            "total_pnl":round(total_pnl,2),"limit":round(limit,2) if limit!=float("inf") else None}
+
+
+def _build_autotrade_order(candidate_symbol, direction, capital_per_trade, state=None):
+    return _build_autotrade_order_impl(candidate_symbol, direction, capital_per_trade, state=state)
+
+
+def _build_autotrade_order_impl(symbol, direction, capital_per_trade, state=None):
     data, err = get_chain_for_symbol(symbol)
     if err:
         return None, err.get("error", str(err))
@@ -4565,17 +4745,26 @@ def _build_autotrade_order_impl(symbol, direction, capital_per_trade):
     atm = min(opts, key=lambda o: abs(o["strike"] - spot))
     if not atm.get("ltp") or atm["ltp"] <= 0:
         return None, "Could not get a valid live price for the ATM option"
-    premium = atm["ltp"]
-    lots = max(1, int(capital_per_trade // (premium * lot_size)))
+    premium = float(atm["ltp"])
+    state = state or load_autotrade_state()
+    if state.get("risk_sizing_enabled", True):
+        sizing=_risk_sizing_for_option(premium, lot_size, state)
+        if not sizing or sizing["recommended_lots"] < 1:
+            return None, "Risk sizing permits 0 lots at this premium/stop. Reduce risk per trade only after validation or increase account equity."
+        lots=sizing["recommended_lots"]
+    else:
+        lots=max(1, int(float(capital_per_trade) // (premium * lot_size)))
+        sizing={"risk_budget":None,"stop_distance":None,"risk_per_lot":None,"recommended_lots":lots,"capital_lots":lots}
     return {
         "symbol": symbol, "direction": direction, "tradingsymbol": atm["tradingsymbol"],
         "strike": atm["strike"], "expiry": str(data["expiry"]), "lot_size": lot_size,
         "lots": lots, "quantity": lots * lot_size, "premium": premium, "spot": spot,
+        "risk_sizing": sizing,
     }, None
 
 
 def _execute_autotrade_entry(candidate, state):
-    order_info, err = _build_autotrade_order(candidate["symbol"], candidate["direction"], state["capital_per_trade"])
+    order_info, err = _build_autotrade_order(candidate["symbol"], candidate["direction"], state["capital_per_trade"], state=state)
     if err:
         return None, err
 
@@ -4716,12 +4905,22 @@ def _check_auto_exit_signal(trade, state):
     rsi = _rsi(closes, 14)
     if ema_fast is None or ema_slow is None or rsi is None:
         return None
+    seq = _candle_sequence(candles)
+    mood = _market_mood(trade["symbol"], candles)
     if trade["direction"] == "CE":
         trend_flipped, momentum_flipped = ema_fast < ema_slow, rsi < 45
+        opposite_candles = seq.get("score",0) <= -2
+        opposite_mood = mood.get("score",0) <= -2
     else:
         trend_flipped, momentum_flipped = ema_fast > ema_slow, rsi > 55
+        opposite_candles = seq.get("score",0) >= 2
+        opposite_mood = mood.get("score",0) >= 2
+    # Exit when the original thesis is clearly contradicted by the underlying trend/momentum OR
+    # when both candle sequence and broad mood turn against the position. One weak candle alone never exits.
     if trend_flipped and momentum_flipped:
-        return f"Auto-exit: underlying trend reversed (EMA9/21 flipped, RSI {round(rsi, 1)}) -- breakout thesis invalidated"
+        return f"Auto-exit: trend/momentum reversed (EMA9/21, RSI {round(rsi,1)})"
+    if opposite_candles and opposite_mood:
+        return f"Auto-exit: candle sequence + market mood reversed ({seq.get('label')}; {mood.get('label')})"
     return None
 
 
@@ -4839,7 +5038,9 @@ def _autotrade_loop():
                                            and c["score"] >= max(state.get("min_breakout_score", 0.5), 3)
                                            and c.get("trend_aligned") is True
                                            and c.get("momentum_aligned") is True
-                                           and c["volume_confirmed"]]
+                                           and c["volume_confirmed"]
+                                           and (not state.get("require_candle_alignment", True) or c.get("candle_aligned") is True)
+                                           and (not state.get("use_market_mood", True) or c.get("mood_aligned") is True)]
                         best = None
                         for c in auto_qualified:
                             # Re-verify right now, not just at scan time -- price can revert in the
@@ -5023,6 +5224,141 @@ def autotrade_scan():
     return jsonify({"candidates": candidates, "errors": errors, "universe_size": len(universe)})
 
 
+
+@app.route("/api/autotrade/backtest", methods=["POST"])
+def autotrade_backtest():
+    """Walk-forward signal backtest on the UNDERLYING. It intentionally reports underlying points,
+    not fabricated option-premium P&L, because historical option-chain candles/IV must be available
+    for a defensible option-P&L backtest. Uses the same breakout + candle sequence + mood filters."""
+    if not require_session():
+        return jsonify({"error":"not_logged_in"}),401
+    body=request.json or {}; symbol=str(body.get("symbol") or "NIFTY").upper()
+    interval=str(body.get("interval") or "5minute"); days=max(2,min(int(body.get("days",20)),60))
+    lookback=max(5,min(int(body.get("lookback",20)),100)); strict=bool(body.get("strict",True))
+    token,err=resolve_token_for_symbol(symbol)
+    if err: return jsonify({"error":err}),400
+    try:
+        end=now_ist(); start=end-timedelta(days=days)
+        candles=kite.historical_data(token,start,end,interval)
+        broad_candles=candles if symbol=="NIFTY" else kite.historical_data(resolve_token_for_symbol("NIFTY")[0],start,end,interval)
+    except Exception as e:
+        return jsonify({"error":f"Historical data fetch failed: {e}"}),400
+    minbars=max(lookback+30,50); candles=candles or []; broad_candles=broad_candles or []
+    if len(candles)<minbars: return jsonify({"error":f"Only {len(candles)} candles available; need at least {minbars}."}),400
+    trades=[]; open_t=None; equity=0.0; wins=losses=0
+    for i in range(minbars,len(candles)):
+        window=candles[:i+1]
+        # Manage existing underlying trade first.
+        bar=window[-1]; px=float(bar["close"])
+        if open_t:
+            if open_t["direction"]=="CE":
+                pnl=px-open_t["entry"]
+                adverse=px<=open_t["entry"]-open_t["stop"]
+                target=px>=open_t["entry"]+open_t["target"]
+            else:
+                pnl=open_t["entry"]-px
+                adverse=px>=open_t["entry"]+open_t["stop"]
+                target=px<=open_t["entry"]-open_t["target"]
+            seq=_candle_sequence(window)
+            broad_prefix=[x for x in broad_candles if str(x.get("date")) <= str(bar.get("date"))][-100:]
+            mood=_market_mood(symbol,window,broad_prefix)
+            reversal=(seq["score"]<=-2 and mood["score"]<=-2) if open_t["direction"]=="CE" else (seq["score"]>=2 and mood["score"]>=2)
+            ema9=_ema(np.array([x["close"] for x in window[-60:]],float),9); ema21=_ema(np.array([x["close"] for x in window[-60:]],float),21); rsi=_rsi(np.array([x["close"] for x in window],float),14)
+            trendrev=(ema9<ema21 and rsi<45) if open_t["direction"]=="CE" else (ema9>ema21 and rsi>55)
+            if adverse or target or reversal or trendrev or i==len(candles)-1:
+                reason="stop" if adverse else "target" if target else "candle+mood reversal" if reversal else "trend reversal" if trendrev else "end"
+                equity+=pnl; rec={**open_t,"exit":px,"pnl_points":round(pnl,2),"exit_reason":reason,"exit_time":str(bar.get("date"))}; trades.append(rec)
+                if pnl>=0: wins+=1
+                else: losses+=1
+                open_t=None
+                continue
+        r=_detect_breakout(window,lookback,strict=strict)
+        if not r: continue
+        cseq=r.get("candle_sequence",{}); broad_prefix=[x for x in broad_candles if str(x.get("date")) <= str(bar.get("date"))][-100:]; mood=_market_mood(symbol,window,broad_prefix)
+        aligned=(r["direction"]=="CE" and mood["score"]>=1) or (r["direction"]=="PE" and mood["score"]<=-1)
+        if r.get("trend_aligned") is not True or r.get("momentum_aligned") is not True or not r.get("volume_confirmed"): continue
+        if cseq.get("direction")!=r["direction"] or cseq.get("score",0)<1: continue
+        if not aligned: continue
+        open_t={"symbol":symbol,"direction":r["direction"],"entry":px,"entry_time":str(bar.get("date")),"stop":max(r["atr"]*1.0,px*0.002),"target":max(r["atr"]*1.8,px*0.003),"score":r["score"],"candle_label":cseq.get("label"),"mood":mood.get("label")}
+    total=len(trades); winrate=round(wins/total*100,1) if total else 0
+    avg=round(equity/total,2) if total else 0
+    gains=sum(max(0,float(t.get("pnl_points",0))) for t in trades); losses_abs=sum(max(0,-float(t.get("pnl_points",0))) for t in trades)
+    peak=0.0; max_dd=0.0; running=0.0
+    for t in trades:
+        running += float(t.get("pnl_points",0)); peak=max(peak,running); max_dd=max(max_dd,peak-running)
+    pf=round(gains/losses_abs,2) if losses_abs else (999.0 if gains else 0.0)
+    return jsonify({"ok":True,"symbol":symbol,"interval":interval,"days":days,"lookback":lookback,"trades":trades[-100:],"summary":{"trades":total,"wins":wins,"losses":losses,"win_rate":winrate,"net_points":round(equity,2),"avg_points":avg,"profit_factor":pf,"max_drawdown_points":round(max_dd,2)},"note":"Underlying-point walk-forward backtest using the same breakout, candle-sequence and market-mood filters. It is not option-premium P&L and is not a guarantee of future performance."})
+
+
+def _simulate_signal_segment(symbol, candles, broad_candles, lookback, stop_atr, target_atr, strict=True):
+    """Deterministic underlying simulation used by walk-forward validation. No future bars are used."""
+    minbars=max(lookback+30,50); trades=[]; open_t=None; equity=0.0; peak=0.0; max_dd=0.0
+    for i in range(minbars,len(candles)):
+        window=candles[:i+1]; bar=window[-1]; px=float(bar["close"])
+        broad_prefix=[x for x in broad_candles if str(x.get("date")) <= str(bar.get("date"))][-100:]
+        if open_t:
+            pnl=(px-open_t["entry"]) if open_t["direction"]=="CE" else (open_t["entry"]-px)
+            adverse=(px<=open_t["entry"]-open_t["stop"]) if open_t["direction"]=="CE" else (px>=open_t["entry"]+open_t["stop"])
+            target=(px>=open_t["entry"]+open_t["target"]) if open_t["direction"]=="CE" else (px<=open_t["entry"]-open_t["target"])
+            seq=_candle_sequence(window); mood=_market_mood(candles=window,broad_candles=broad_prefix) if False else _market_mood(open_t["symbol"],window,broad_prefix)
+            reversal=(seq["score"]<=-2 and mood["score"]<=-2) if open_t["direction"]=="CE" else (seq["score"]>=2 and mood["score"]>=2)
+            vals=np.array([x["close"] for x in window[-60:]],float); e9=_ema(vals,9); e21=_ema(vals,21); rr=_rsi(np.array([x["close"] for x in window],float),14)
+            trendrev=(e9<e21 and rr<45) if open_t["direction"]=="CE" else (e9>e21 and rr>55)
+            if adverse or target or reversal or trendrev or i==len(candles)-1:
+                reason="stop" if adverse else "target" if target else "candle+mood reversal" if reversal else "trend reversal" if trendrev else "end"
+                equity += pnl; peak=max(peak,equity); max_dd=max(max_dd,peak-equity)
+                trades.append({**open_t,"exit":px,"pnl_points":round(pnl,2),"exit_reason":reason,"exit_time":str(bar.get("date"))})
+                open_t=None; continue
+        r=_detect_breakout(window,lookback,strict=strict)
+        if not r: continue
+        cseq=r.get("candle_sequence",{}); mood=_market_mood(symbol,window,broad_prefix)
+        aligned=(r["direction"]=="CE" and mood["score"]>=1) or (r["direction"]=="PE" and mood["score"]<=-1)
+        if r.get("trend_aligned") is not True or r.get("momentum_aligned") is not True or not r.get("volume_confirmed"): continue
+        if cseq.get("direction")!=r["direction"] or cseq.get("score",0)<1 or not aligned: continue
+        atr=max(float(r.get("atr") or 0), px*0.001)
+        open_t={"symbol":symbol,"direction":r["direction"],"entry":px,"entry_time":str(bar.get("date")),"stop":max(atr*stop_atr,px*0.001),"target":max(atr*target_atr,px*0.0015),"score":r["score"],"candle_label":cseq.get("label"),"mood":mood.get("label")}
+    return {"trades":trades,"net_points":round(equity,2),"max_drawdown":round(max_dd,2),"wins":sum(1 for t in trades if t["pnl_points"]>=0),"losses":sum(1 for t in trades if t["pnl_points"]<0)}
+
+
+@app.route("/api/autotrade/walk-forward", methods=["POST"])
+def autotrade_walk_forward():
+    """Rolling train/test validation of the SAME signal engine. A small parameter grid is selected
+    only on each training window, then frozen and applied to the next unseen test window."""
+    if not require_session(): return jsonify({"error":"not_logged_in"}),401
+    body=request.json or {}; symbol=str(body.get("symbol") or "NIFTY").upper(); interval=str(body.get("interval") or "5minute")
+    days=max(20,min(int(body.get("days",120)),365)); folds=max(2,min(int(body.get("folds",4)),8)); lookback=int(body.get("lookback",20))
+    token,err=resolve_token_for_symbol(symbol)
+    if err: return jsonify({"error":err}),400
+    try:
+        end=now_ist(); start=end-timedelta(days=days); candles=kite.historical_data(token,start,end,interval)
+        nidx,err2=resolve_token_for_symbol("NIFTY")
+        broad=candles if symbol=="NIFTY" else kite.historical_data(nidx,start,end,interval)
+    except Exception as e: return jsonify({"error":f"Historical data fetch failed: {e}"}),400
+    candles=candles or []; broad=broad or []
+    if len(candles)<200: return jsonify({"error":f"Only {len(candles)} candles available; need at least 200 for walk-forward."}),400
+    # Equal chronological folds; each fold trains on everything before it and tests on the next slice.
+    step=max(20,(len(candles)-60)//folds); results=[]; all_test=[]
+    grid=[(lb,sl,tg) for lb in (15,20,25,30) for sl in (0.8,1.0,1.2) for tg in (1.5,1.8,2.2)]
+    for f in range(folds):
+        test_start=60+f*step; test_end=min(len(candles),test_start+step)
+        if test_end-test_start<20: continue
+        train=candles[:test_start]; test=candles[:test_end]
+        best=None
+        for lb,sl,tg in grid:
+            sim=_simulate_signal_segment(symbol,train,broad[:len(train)],lb,sl,tg,True)
+            score=sim["net_points"]/(1+sim["max_drawdown"]) if sim["trades"] else -1e9
+            if best is None or score>best[0]: best=(score,lb,sl,tg,sim)
+        _,blb,bsl,btg,_=best
+        # Warm the test with training candles so indicators have their normal history, but only record test-period trades.
+        sim=_simulate_signal_segment(symbol,test,broad[:len(test)],blb,bsl,btg,True)
+        test_trades=[t for t in sim["trades"] if str(t.get("entry_time"))>=str(candles[test_start].get("date"))]
+        net=sum(t["pnl_points"] for t in test_trades); wins=sum(1 for t in test_trades if t["pnl_points"]>=0); losses=len(test_trades)-wins
+        results.append({"fold":f+1,"train_bars":len(train),"test_bars":test_end-test_start,"lookback":blb,"stop_atr":bsl,"target_atr":btg,"trades":len(test_trades),"wins":wins,"losses":losses,"win_rate":round(wins/len(test_trades)*100,1) if test_trades else 0,"net_points":round(net,2),"max_drawdown":sim["max_drawdown"]})
+        all_test.extend(test_trades)
+    total=len(all_test); wins=sum(1 for t in all_test if t["pnl_points"]>=0); net=sum(t["pnl_points"] for t in all_test)
+    return jsonify({"ok":True,"symbol":symbol,"interval":interval,"days":days,"folds":results,"summary":{"trades":total,"wins":wins,"losses":total-wins,"win_rate":round(wins/total*100,1) if total else 0,"net_points":round(net,2)},"note":"Walk-forward: parameters are selected only on earlier training data and then frozen on the next unseen test window. This is a validation tool, not a guarantee of future returns."})
+
+
 @app.route("/api/autotrade/preview-signal", methods=["POST"])
 def autotrade_preview_signal():
     """Read-only: resolves the EXACT contract (ATM strike, expiry, live premium, lot size, quantity)
@@ -5036,7 +5372,7 @@ def autotrade_preview_signal():
     if not symbol or direction not in ("CE", "PE"):
         return jsonify({"error": "symbol and direction (CE/PE) required"}), 400
     state = load_autotrade_state()
-    order_info, err = _build_autotrade_order(symbol, direction, body.get("capital_per_trade", state["capital_per_trade"]))
+    order_info, err = _build_autotrade_order(symbol, direction, body.get("capital_per_trade", state["capital_per_trade"]), state=state)
     if err:
         return jsonify({"error": err}), 400
     order_info["still_valid"] = _breakout_still_valid(direction, body.get("breakout_level"), order_info["spot"])
@@ -5057,6 +5393,12 @@ def autotrade_execute_signal():
         return jsonify({"error": "candidate with symbol/direction required"}), 400
     state = _autotrade_roll_day_if_needed(load_autotrade_state())
     trades = load_autotrade_trades()
+    circuit = _risk_circuit_breaker(state, trades)
+    if circuit["breached"]:
+        state["enabled"] = False
+        state["disarm_reason"] = f"Risk circuit breaker: total tracked P&L ₹{circuit['total_pnl']:.2f} breached limit ₹{circuit['limit']:.2f}."
+        save_autotrade_state(state)
+        return jsonify({"error": state["disarm_reason"], "risk": circuit}), 400
     open_count = sum(1 for t in trades if t["status"] == "open")
     max_positions = max(1, int(state.get("max_concurrent_positions", 1)))
     if open_count >= max_positions:
