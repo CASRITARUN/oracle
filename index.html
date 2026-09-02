@@ -116,7 +116,258 @@
   .intel-scenario { overflow-x:auto; margin-top:10px; }
   .intel-scenario table { font-size:11px; }
 
+
+/* AI Evolution shell theme: when AI tab is active, header + top navigation become light too */
+body.ai-evolution-mode { background:#f7f5f0; color:#20252b; }
+body.ai-evolution-mode header { background:#fffdfa; border-bottom-color:#e3ddd4; }
+body.ai-evolution-mode header h1 { color:#20252b; }
+body.ai-evolution-mode header .sub, body.ai-evolution-mode header .subtitle { color:#667085; }
+body.ai-evolution-mode .top-tabs { background:#fffdfa; border-bottom-color:#e3ddd4; }
+body.ai-evolution-mode .top-tab-btn { color:#667085; }
+body.ai-evolution-mode .top-tab-btn:hover { color:#20252b; }
+body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:#ff6338; }
+
+/* AI Evolution — premium standalone visual language; existing dashboard is untouched */
+/* AI EVOLUTION — LIGHT AI LAB THEME (scoped only to this tab) */
+
+/* Historical AI Data Observatory */
+.ai-data-observatory{display:grid;grid-template-columns:360px 1fr;gap:18px;align-items:stretch}
+.ai-globe-card{position:relative;min-height:310px;overflow:hidden;border:1px solid #e2e6eb;border-radius:16px;background:radial-gradient(circle at 50% 42%,#fff8f3 0%,#f5f7fa 48%,#edf1f5 100%);box-shadow:inset 0 0 50px rgba(255,99,56,.06)}
+#aiGlobe{width:100%;height:310px;display:block}
+.ai-globe-label{position:absolute;left:16px;top:14px;font-size:9px;letter-spacing:.16em;text-transform:uppercase;font-weight:900;color:#667085}
+.ai-globe-live{position:absolute;right:14px;top:13px;display:flex;gap:6px;align-items:center;font-size:9px;color:#218653;font-weight:800}.ai-globe-live i{width:7px;height:7px;border-radius:50%;background:#34c77b;box-shadow:0 0 0 4px rgba(52,199,123,.12);animation:aiPulse 1.6s infinite}
+@keyframes aiPulse{0%,100%{transform:scale(.8);opacity:.7}50%{transform:scale(1.2);opacity:1}}
+.ai-data-side{display:flex;flex-direction:column;gap:12px}.ai-data-status{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.ai-data-stat{background:#fff;border:1px solid #e2e6eb;border-radius:11px;padding:12px}.ai-data-stat .k{font-size:8px;color:#667085;text-transform:uppercase;letter-spacing:.12em;font-weight:900}.ai-data-stat .v{font-size:18px;font-weight:850;color:#20252b;margin-top:5px}.ai-stream{flex:1;min-height:180px;background:#10151c;border-radius:12px;padding:12px 14px;color:#b8c2cf;overflow:hidden;position:relative}.ai-stream:after{content:"";position:absolute;left:0;right:0;bottom:0;height:45px;background:linear-gradient(transparent,#10151c);pointer-events:none}.ai-stream-line{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.8;white-space:nowrap;opacity:.88}.ai-stream-line b{color:#ff8a68}.ai-stream-line .ok{color:#67d69b}.ai-stream-line .blue{color:#8db8ff}
+.ai-hist-table{width:100%;border-collapse:collapse;font-size:10px;background:#fff}.ai-hist-table th,.ai-hist-table td{padding:8px;border-bottom:1px solid #e6e9ed;text-align:left}.ai-hist-table th{font-size:8px;color:#667085;background:#f3f5f7;text-transform:uppercase;letter-spacing:.06em}.ai-hist-ready{color:#218653;font-weight:800}.ai-hist-wait{color:#b84a2f;font-weight:800}
+@media(max-width:900px){.ai-data-observatory{grid-template-columns:1fr}.ai-data-status{grid-template-columns:1fr 1fr}}
+
 </style>
+<style id="ai-premium-theme">
+</style>
+
+<style id="ai-institutional-v2">
+.ai-institutional{max-width:1540px;margin:0 auto;padding:20px 22px 60px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.ai-hero{position:relative;overflow:hidden;border:1px solid #18344a;border-radius:20px;padding:24px 26px;background:radial-gradient(circle at 80% 20%,rgba(25,184,255,.10),transparent 34%),linear-gradient(135deg,#0b1723,#071019 70%);box-shadow:0 18px 60px rgba(0,0,0,.28)}
+.ai-hero:after{content:"";position:absolute;inset:auto -10% -80px -10%;height:130px;background:linear-gradient(90deg,transparent,rgba(33,208,255,.06),transparent);transform:rotate(-3deg);animation:aiSweep 7s linear infinite}
+@keyframes aiSweep{from{transform:translateX(-35%) rotate(-3deg)}to{transform:translateX(35%) rotate(-3deg)}}
+.ai-hero-top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.ai-eyebrow,.ai-section-label{font-size:10px;letter-spacing:.19em;font-weight:900;color:#5f88a6}.ai-hero h2{margin:6px 0 5px;font-size:32px;letter-spacing:-.03em;color:#f2f8fc}.ai-hero p{margin:0;color:#7894aa;font-size:13px}.ai-hero-status{display:flex;align-items:center;gap:8px;border:1px solid #21435a;background:#091723;padding:10px 13px;border-radius:999px;color:#8fa9bc;font-size:10px;font-weight:800;white-space:nowrap}.ai-hero-status b{color:#35dba1}.ai-dot{width:7px;height:7px;border-radius:50%;background:#32d99b;box-shadow:0 0 0 4px rgba(50,217,155,.10),0 0 14px rgba(50,217,155,.5);display:inline-block;animation:aiPulse2 1.8s infinite}@keyframes aiPulse2{50%{opacity:.55;transform:scale(.75)}}
+.ai-controlbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:20px;padding-top:16px;border-top:1px solid #163044}.ai-mode,.ai-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.ai-badge{display:inline-flex;align-items:center;border-radius:999px;padding:6px 9px;font-size:9px;font-weight:900;letter-spacing:.07em}.ai-badge.safe{background:#092b22;border:1px solid #1a6b53;color:#4ee2ae}.ai-badge.neutral{background:#0d1a26;border:1px solid #244257;color:#7895aa}.ai-run-btn{background:#12a9d8;border:1px solid #2cd4ff;color:#00131c;font-weight:900;border-radius:9px;padding:9px 13px;cursor:pointer}.ai-run-btn:hover{filter:brightness(1.12)}.ai-status-text{font-size:10px;color:#7894aa}
+.ai-kpi-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:8px;margin:12px 0}.ai-kpi{background:linear-gradient(145deg,#0b1722,#08111a);border:1px solid #17344a;border-radius:12px;padding:13px 12px;min-height:83px}.ai-kpi span{display:block;font-size:8px;letter-spacing:.13em;color:#65839b;font-weight:900}.ai-kpi strong{display:block;color:#eef7fd;font-size:19px;margin-top:7px}.ai-kpi small{display:block;color:#587187;font-size:8px;margin-top:4px;line-height:1.3}.ai-kpi-primary{border-color:#1c6b83;background:linear-gradient(145deg,#0c202b,#08131c)}
+.ai-panel{margin-top:12px!important;padding:17px 18px!important;border:1px solid #16344a!important;border-radius:16px!important;background:linear-gradient(145deg,#0a141e,#071019)!important;box-shadow:0 12px 35px rgba(0,0,0,.18)!important}.ai-section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:14px}.ai-section-head h3{margin:4px 0 0;color:#edf6fb;font-size:17px}.ai-lock{padding:6px 9px;border-radius:999px;background:#271a0b;border:1px solid #705020;color:#ffc65a;font-size:8px;font-weight:900;letter-spacing:.09em}.ai-lock.red{background:#2a1115;border-color:#71303a;color:#ff7b84}.ai-lifecycle{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.ai-phase{position:relative;padding:12px 10px;border:1px solid #17374c;background:#08141e;border-radius:11px;min-height:90px}.ai-phase:after{content:"→";position:absolute;right:-10px;top:34px;color:#2aaed0;font-weight:900}.ai-phase:last-child:after{display:none}.ai-phase i{font-style:normal;color:#3d718f;font-size:8px;font-weight:900}.ai-phase b{display:block;color:#9bb4c7;font-size:11px;margin-top:5px}.ai-phase span{display:block;color:#607b90;font-size:8px;line-height:1.45;margin-top:4px}.ai-phase.active{border-color:#147b95;background:linear-gradient(145deg,#0b202b,#09151e);box-shadow:inset 0 0 25px rgba(24,196,236,.06)}.ai-phase.active b{color:#45d9f4}.ai-phase.complete{border-color:#1b604c}.ai-phase.complete b{color:#4fe0ad}.ai-lifecycle-note,.ai-note-line{margin-top:12px;padding:10px 12px;border-left:2px solid #1b92b3;background:#08131c;color:#6e8ba0;font-size:10px;line-height:1.55}.ai-lifecycle-note b{color:#a9c3d4}
+.ai-two-col{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(360px,.8fr);gap:12px}.ai-data-layout{display:grid;grid-template-columns:330px 1fr;gap:12px}.ai-globe-card{height:300px!important;min-height:300px!important;border:1px solid #16475e!important;border-radius:14px!important;background:radial-gradient(circle at 50% 45%,#103248,#07141e 55%,#050b11)!important;position:relative;overflow:hidden}.ai-globe-card canvas{width:100%;height:100%}.ai-globe-caption{position:absolute;bottom:13px;left:15px;right:15px;display:flex;justify-content:space-between;font-size:8px;color:#5c89a2;letter-spacing:.09em}.ai-globe-caption b{color:#8eb5ca}.ai-data-readout{display:flex;flex-direction:column;gap:10px}.ai-readout-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.ai-readout-grid.five{grid-template-columns:repeat(5,1fr)}.ai-readout-grid>div{padding:10px;border:1px solid #17374b;border-radius:10px;background:#09141e;min-height:54px}.ai-readout-grid span{display:block;color:#5d7b90;font-size:8px;text-transform:uppercase;letter-spacing:.08em;font-weight:800}.ai-readout-grid b{display:block;color:#e7f3f9;font-size:13px;margin-top:5px}.ai-stream{flex:1;min-height:155px;background:#03080d!important;border:1px solid #132d3e;border-radius:10px;padding:10px 12px!important}.ai-table-wrap{overflow:auto;margin-top:10px;border:1px solid #17344a;border-radius:10px}.ai-hist-table{background:#08121b!important;color:#b9cedc!important}.ai-hist-table th{background:#0c1c29!important;color:#6489a1!important;border-color:#17364a!important}.ai-hist-table td{border-color:#122a3b!important;color:#a9bfce!important}.ai-hist-table tr:hover td{background:#0c1b27!important}
+.ai-model-stack{display:flex;flex-direction:column;gap:7px}.ai-model-row{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;padding:11px;border:1px solid #17364a;border-radius:10px;background:#09141e}.ai-model-icon{width:32px;height:32px;display:grid;place-items:center;border-radius:8px;background:#0c3850;color:#40d8f4;font-size:9px;font-weight:900}.ai-model-icon.deep{background:#2c1c45;color:#c88cff}.ai-model-icon.ens{background:#123b2f;color:#4ee0ad}.ai-model-row b{display:block;color:#e7f2f8;font-size:11px}.ai-model-row span{display:block;color:#5f7d91;font-size:8px;margin-top:3px}.ai-model-row>strong{font-size:9px;color:#ffc65a}.ai-model-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:9px}.ai-model-metrics div{padding:9px;border:1px solid #17344a;border-radius:9px}.ai-model-metrics span{font-size:8px;color:#5f7d91}.ai-model-metrics b{display:block;color:#e9f5fb;font-size:13px;margin-top:4px}.ai-model-warning{margin-top:10px;padding:10px;border:1px solid #5b4420;background:#19140b;border-radius:9px}.ai-model-warning b{display:block;color:#ffc85a;font-size:9px}.ai-model-warning span{display:block;color:#89785d;font-size:9px;line-height:1.45;margin-top:3px}
+.ai-option-memory{margin-top:12px!important}.ai-decision-row{margin-top:12px}.ai-score-board{display:flex;align-items:center;gap:18px;padding:16px;border:1px solid #183b50;border-radius:13px;background:radial-gradient(circle at 10% 50%,rgba(21,180,220,.08),transparent 45%),#09141e}.ai-score-ring{width:105px;height:105px;flex:0 0 105px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:7px solid #20c4ea;border-right-color:#17617a;border-bottom-color:#173444;box-shadow:0 0 25px rgba(24,198,237,.12)}.ai-score-ring b{font-size:28px;color:#effaff}.ai-score-ring small{color:#67859a}.ai-score-title{font-size:16px;font-weight:900;color:#edf7fc}.ai-score-board p{font-size:9px;color:#668399;line-height:1.55;margin:6px 0 0}.ai-factor-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:9px}.ai-factor-grid div{padding:10px;border:1px solid #17364a;border-radius:9px;background:#09141e}.ai-factor-grid span{font-size:8px;color:#5d7a90}.ai-factor-grid b{display:block;color:#2ed0ef;font-size:13px;margin-top:4px}.ai-readiness-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.ai-readiness-grid>div{padding:11px;border:1px solid #17364a;border-radius:10px;background:#09141e}.ai-readiness-grid span{display:block;color:#5f7d91;font-size:8px;text-transform:uppercase;letter-spacing:.08em}.ai-readiness-grid b{display:block;font-size:12px;margin-top:5px;color:#dfeef5}.ai-readiness-grid small{display:block;color:#5a7487;font-size:8px;margin-top:4px}.green-text{color:#4ee0ad!important}.red-text{color:#ff7b84!important}.ai-execution-roadmap{display:flex;align-items:center;gap:5px;margin-top:12px;flex-wrap:wrap}.ai-execution-roadmap span{padding:5px 7px;border-radius:999px;background:#0c1924;border:1px solid #1b384b;color:#7894a8;font-size:8px;font-weight:800}.ai-execution-roadmap i{width:12px;height:1px;background:#27566b}
+.ai-memory-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.ai-memory-grid>div{border:1px solid #17364a;border-radius:11px;padding:12px;background:#09141e}.ai-memory-grid h4,.ai-subsection h4{margin:0 0 8px;color:#8eabc0;font-size:10px;text-transform:uppercase;letter-spacing:.11em}.ai-evo-learning{padding:9px 0!important;border-bottom:1px solid #142c3d!important;color:#b8ccd8!important}.ai-evo-learning b{color:#e5f1f6!important}.ai-evo-note{color:#648096!important;font-size:9px!important;line-height:1.5}.ai-subsection{margin-top:14px}.ai-subsection:first-of-type{margin-top:0}.ai-evo-scroll{max-height:330px!important;overflow:auto;border:1px solid #17364a;border-radius:9px}.ai-evo-table{background:#08121b!important;color:#b9cedc!important}.ai-evo-table th{background:#0c1c29!important;color:#6489a1!important;border-color:#17364a!important}.ai-evo-table td{border-color:#122a3b!important;color:#a9bfce!important}.ai-evo-table tr:hover td{background:#0c1b27!important}
+@media(max-width:1200px){.ai-kpi-grid{grid-template-columns:repeat(4,1fr)}.ai-lifecycle{grid-template-columns:repeat(3,1fr)}.ai-two-col{grid-template-columns:1fr}}
+@media(max-width:800px){.ai-institutional{padding:12px}.ai-hero-top,.ai-controlbar{flex-direction:column;align-items:flex-start}.ai-kpi-grid{grid-template-columns:repeat(2,1fr)}.ai-lifecycle{grid-template-columns:1fr 1fr}.ai-phase:after{display:none}.ai-data-layout,.ai-memory-grid{grid-template-columns:1fr}.ai-readout-grid,.ai-readout-grid.five{grid-template-columns:1fr 1fr}.ai-factor-grid{grid-template-columns:repeat(2,1fr)}}
+
+.ai-research-strip{display:grid;grid-template-columns:auto 1fr auto 1fr auto 1.5fr;gap:8px;align-items:center;margin-top:8px;padding:9px 10px;border:1px solid #17364a;border-radius:9px;background:#08131d}.ai-research-strip span{font-size:8px;color:#55748a;letter-spacing:.08em;font-weight:900}.ai-research-strip b{font-size:9px;color:#d9eaf2}.ai-research-strip b:nth-of-type(1){color:#49d8ad}.ai-research-strip b:nth-of-type(2){color:#4cd6ef}.ai-research-strip b:nth-of-type(3){color:#9ab4c5}
+@media(max-width:800px){.ai-research-strip{grid-template-columns:1fr 1fr}}
+</style>
+<style id="ai-directional-theme">
+.ai-directional-panel{margin-top:12px!important;padding:17px 18px!important;border:1px solid #16344a!important;border-radius:16px!important;background:linear-gradient(145deg,#0a141e,#071019)!important;color:#dbe7f5}.ai-dir-flow{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:10px 12px;border:1px solid #17364a;border-radius:10px;background:#08131d;color:#7d9bb0;font-size:9px;font-weight:800}.ai-dir-flow span{padding:5px 8px;border-radius:999px;background:#0c1924;border:1px solid #1b384b}.ai-dir-flow i{font-style:normal;color:#2bc9ef}.ai-dir-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}.ai-dir-card{padding:13px;border:1px solid #17364a;border-radius:11px;background:linear-gradient(145deg,#0b1722,#08111a)}.ai-dir-head{display:flex;justify-content:space-between;align-items:center}.ai-dir-head b{font-size:13px;color:#edf7fc}.ai-dir-action{margin:12px 0;padding:10px;border-radius:9px;background:#091923;border:1px solid #173a4e;color:#40d8f4;font-size:16px;font-weight:900}.ai-dir-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.ai-dir-metrics div{padding:8px;border:1px solid #17364a;border-radius:8px}.ai-dir-metrics small{display:block;color:#5f7d91;font-size:7px}.ai-dir-metrics strong{display:block;color:#e8f4fa;font-size:13px;margin-top:3px}.ai-dir-card p{margin:9px 0 0;color:#617d91;font-size:9px;line-height:1.45;min-height:27px}.ai-dir-bottom{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.ai-dir-bottom>div{padding:9px;border:1px solid #17364a;border-radius:9px;background:#09141e}.ai-dir-bottom small{display:block;color:#5d7b90;font-size:7px;letter-spacing:.08em}.ai-dir-bottom b{display:block;color:#dcecf4;font-size:10px;margin-top:4px}.ai-dir-card.up .ai-dir-action{color:#4ee0ad;border-color:#1b604c}.ai-dir-card.down .ai-dir-action{color:#ff7b84;border-color:#71303a}.ai-dir-card.wait .ai-dir-action{color:#ffc65a;border-color:#705020}@media(max-width:900px){.ai-dir-grid{grid-template-columns:1fr}.ai-dir-bottom{grid-template-columns:1fr 1fr}}
+</style>
+
+<style id="autotrade-ai-visual-upgrade">
+/* ===== Auto Buy/Sell AI — visual upgrade ===== */
+#atAI{
+  --at-bg:#07111b;
+  --at-panel:#0b1824;
+  --at-panel2:#0d1e2d;
+  --at-line:#183448;
+  --at-cyan:#38d9f5;
+  --at-green:#55e0ad;
+  --at-amber:#ffc857;
+  --at-red:#ff7583;
+  --at-text:#e9f5fa;
+  --at-muted:#7894a8;
+  position:relative;
+}
+#atAI .ai-wrap{gap:14px}
+#atAI .ai-card{
+  position:relative;
+  overflow:hidden;
+  background:linear-gradient(145deg,rgba(13,30,45,.97),rgba(7,17,27,.98));
+  border:1px solid rgba(56,217,245,.13);
+  box-shadow:0 12px 40px rgba(0,0,0,.20);
+  transition:transform .2s ease,border-color .2s ease,box-shadow .2s ease;
+}
+#atAI .ai-card:hover{
+  transform:translateY(-1px);
+  border-color:rgba(56,217,245,.28);
+  box-shadow:0 18px 55px rgba(0,0,0,.28);
+}
+#atAI .ai-card:before{
+  content:"";
+  position:absolute;inset:0;
+  background:radial-gradient(circle at 95% 0%,rgba(56,217,245,.09),transparent 32%);
+  pointer-events:none;
+}
+#atAI .ai-title{letter-spacing:-.02em}
+#atAI .ai-sub{color:#8ea9ba}
+#atAI .ai-flow{
+  gap:7px!important;
+  padding:10px!important;
+  border:1px solid #17364a;
+  background:rgba(5,14,23,.55);
+  border-radius:13px;
+}
+#atAI .ai-flow>div{
+  position:relative;
+  min-height:58px;
+  display:flex!important;
+  flex-direction:column;
+  justify-content:center;
+  border:1px solid #17364a;
+  border-radius:10px;
+  padding:8px 9px;
+  background:linear-gradient(180deg,#0d2030,#091621);
+}
+#atAI .ai-flow>div b{color:#dff6fb;font-size:10px}
+#atAI .ai-flow>div small{color:#67869a;margin-top:4px}
+#atAI .ai-flow>div:not(:last-child):after{
+  content:"›";
+  position:absolute;
+  right:-9px;top:50%;
+  transform:translateY(-50%);
+  z-index:2;
+  width:18px;height:18px;
+  border-radius:50%;
+  background:#0b1824;
+  border:1px solid #23465c;
+  color:#43d9f4;
+  text-align:center;
+  line-height:16px;
+  font-size:15px;
+}
+#atAI .ai-metric{
+  position:relative;
+  border:1px solid #17364a!important;
+  background:linear-gradient(145deg,#0d2130,#091621)!important;
+  border-radius:12px!important;
+  padding:12px!important;
+  min-height:62px;
+}
+#atAI .ai-metric:after{
+  content:"";
+  position:absolute;left:12px;right:12px;bottom:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(56,217,245,.35),transparent);
+}
+#atAI .ai-metric small{color:#638197!important;letter-spacing:.09em}
+#atAI .ai-metric b{font-size:15px!important;margin-top:5px;display:block}
+#atAI #atModePill,#atAI #atArmedPill{
+  padding:5px 9px!important;
+  border-radius:999px!important;
+  border:1px solid #23465c;
+  background:#091621;
+  font-size:9px!important;
+  letter-spacing:.09em;
+}
+#atAI #atModeBanner{
+  box-shadow:inset 0 0 30px rgba(0,0,0,.12);
+}
+#atAI .learning-hero{
+  display:grid;
+  grid-template-columns:1.2fr 1fr;
+  gap:12px;
+  margin-top:12px;
+}
+#atAI .learning-status-card{
+  border:1px solid #173b4e;
+  background:linear-gradient(145deg,#0b2130,#091620);
+  border-radius:13px;
+  padding:13px;
+}
+#atAI .learning-status-top{
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+}
+#atAI .learning-live{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:5px 9px;border-radius:999px;
+  border:1px solid #245f4a;background:#0c241c;color:#7ee2b1;
+  font-size:9px;font-weight:800;letter-spacing:.07em;
+}
+#atAI .learning-dot{
+  width:7px;height:7px;border-radius:50%;background:#55e0ad;
+  box-shadow:0 0 12px #55e0ad;
+  animation:atPulse 1.6s infinite;
+}
+@keyframes atPulse{50%{opacity:.45;transform:scale(.75)}}
+#atAI .learning-big{
+  font-family:'JetBrains Mono',ui-monospace,monospace;
+  font-size:24px;font-weight:900;color:#e9faff;margin-top:7px;
+}
+#atAI .learning-caption{font-size:9px;color:#718da2;margin-top:3px}
+#atAI .learning-progress{
+  height:9px!important;border-radius:99px!important;
+  background:#07131d!important;border:1px solid #163247;
+  overflow:hidden;
+}
+#atAI .learning-progress i{
+  display:block;height:100%;border-radius:99px;
+  background:linear-gradient(90deg,#2bc9ef,#55e0ad)!important;
+  box-shadow:0 0 14px rgba(56,217,245,.28);
+}
+#atAI .learning-mini-grid{
+  display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px;
+}
+#atAI .learning-mini{
+  border:1px solid #17364a;border-radius:10px;padding:9px;background:#091621;
+}
+#atAI .learning-mini span{display:block;color:#668398;font-size:8px;text-transform:uppercase;letter-spacing:.07em}
+#atAI .learning-mini b{display:block;color:#dff5fa;font:800 12px 'JetBrains Mono',monospace;margin-top:4px}
+#atAI .stage{
+  padding:7px 0;
+}
+#atAI .stage b{color:#b9d0db}
+#atAI .edge-check{
+  padding:10px 0!important;
+}
+#atAI .edge-check .ok,#atAI .edge-check .no{
+  padding:3px 7px;border-radius:999px;
+}
+#atAI button{
+  border-radius:9px!important;
+  transition:transform .15s ease,box-shadow .15s ease,filter .15s ease;
+}
+#atAI button:hover{transform:translateY(-1px);filter:brightness(1.08)}
+#atAI #atArmBtn{box-shadow:0 0 0 1px rgba(85,224,173,.12),0 7px 24px rgba(85,224,173,.08)}
+#atAI .ai-table-wrap{
+  background:#07131d;
+  border-color:#17364a!important;
+}
+#atAI .ai-table th{
+  background:#0b1b29!important;
+  color:#7593a7!important;
+}
+#atAI .ai-table tr:hover td{background:rgba(56,217,245,.025)}
+@media(max-width:800px){
+  #atAI .learning-hero{grid-template-columns:1fr}
+  #atAI .ai-flow>div:not(:last-child):after{display:none}
+}
+</style>
+
+
+<style id="at-index-visual-style">
+/* === AI BUY/SELL INDEX — command-centre visual layer === */
+#atAI .atv-dashboard{padding:22px 24px 24px;max-width:1450px;margin:0 auto;background:radial-gradient(circle at 50% 15%,rgba(24,85,112,.12),transparent 38%),linear-gradient(145deg,#06101a,#081722 55%,#06111b);border:1px solid #153b52;border-radius:20px;box-shadow:0 20px 70px rgba(0,0,0,.35);position:relative;overflow:hidden}
+#atAI .atv-dashboard:before{content:"";position:absolute;inset:0;background-image:linear-gradient(rgba(40,120,150,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(40,120,150,.035) 1px,transparent 1px);background-size:36px 36px;pointer-events:none}
+#atAI .atv-head,#atAI .atv-kpis,#atAI .atv-main,#atAI .atv-learning{position:relative;z-index:1}
+#atAI .atv-head{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:14px}
+#atAI .atv-brand{display:flex;gap:12px;align-items:center}.atv-logo{width:43px;height:43px;border-radius:12px;border:1px solid #176281;background:linear-gradient(145deg,#0c2b40,#081923);display:grid;place-items:center;font-size:22px;box-shadow:0 0 22px rgba(38,200,244,.13)}
+#atAI .atv-title{font-size:21px;font-weight:900;letter-spacing:.02em;color:#effaff}.atv-subtitle{color:#45c9ef;font-size:11px;margin-top:3px;letter-spacing:.03em}
+#atAI .atv-status{display:flex;align-items:center;gap:16px}.atv-status-box{min-width:205px;border:1px solid #17425a;background:#071521;border-radius:11px;padding:9px 13px}.atv-status-box small{display:block;color:#7897aa;font-size:8px;letter-spacing:.1em;text-transform:uppercase}.atv-status-box b{display:block;margin-top:4px;font-size:12px;color:#55e0ad}.atv-status-box span{display:block;margin-top:2px;color:#6f8da0;font-size:9px}
+#atAI .atv-clock{border:1px solid #173a50;border-radius:10px;padding:8px 13px;text-align:center;background:#07131e;min-width:115px}.atv-clock b{font:800 16px 'JetBrains Mono',monospace}.atv-clock span{display:block;color:#688599;font-size:8px;margin-top:2px}
+#atAI .atv-kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px}.atv-kpi{border:1px solid #15384d;background:linear-gradient(145deg,#0b1d2b,#08141f);border-radius:11px;padding:10px 11px;min-height:66px}.atv-kpi small{display:block;color:#68869a;font-size:8px;letter-spacing:.08em;text-transform:uppercase}.atv-kpi b{display:block;color:#eaf8fb;font:800 15px 'JetBrains Mono',monospace;margin-top:6px}.atv-kpi em{font-style:normal;color:#5d8196;font-size:8px}.atv-kpi.green b{color:#55e0ad}.atv-kpi.red b{color:#ff7583}.atv-kpi.cyan b{color:#3dd9f5}
+#atAI .atv-main{display:grid;grid-template-columns:1.25fr .9fr 1fr;gap:10px}.atv-panel{border:1px solid #163b50;background:linear-gradient(145deg,rgba(7,22,33,.96),rgba(5,14,23,.98));border-radius:15px;min-height:320px;padding:16px;position:relative;overflow:hidden}.atv-panel:after{content:"";position:absolute;inset:auto 10% 0;height:1px;background:linear-gradient(90deg,transparent,#1d718e,transparent);opacity:.5}.atv-panel-title{color:#8db0c2;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px}
+#atAI .atv-decision{display:flex;flex-direction:column;align-items:center;justify-content:center}.atv-ring{width:238px;height:238px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#2bc9ef 0deg,#2bc9ef var(--ring,0deg),#18384b var(--ring,0deg),#18384b 360deg);box-shadow:0 0 45px rgba(43,201,239,.08);position:relative}.atv-ring:before{content:"";position:absolute;inset:11px;border-radius:50%;background:radial-gradient(circle at 50% 42%,#102a3a,#07141f 70%);border:1px solid #19465d}.atv-ring-inner{position:relative;text-align:center}.atv-ring-inner .decision{font-size:31px;font-weight:950;letter-spacing:.05em;color:#dff7ff}.atv-ring-inner .prob{font:800 18px 'JetBrains Mono',monospace;color:#3dd9f5;margin-top:3px}.atv-ring-inner .note{font-size:8px;color:#7593a6;margin-top:4px;letter-spacing:.1em}.atv-decision-meta{display:grid;grid-template-columns:repeat(3,1fr);width:100%;gap:6px;margin-top:14px}.atv-decision-meta div{border:1px solid #17364a;background:#081722;border-radius:8px;text-align:center;padding:8px}.atv-decision-meta small{display:block;color:#5e7d91;font-size:7px}.atv-decision-meta b{display:block;color:#d9edf4;font-size:10px;margin-top:3px}
+#atAI .atv-bars{padding-top:3px}.atv-bar-row{display:grid;grid-template-columns:78px 1fr 43px;align-items:center;gap:8px;margin:16px 0}.atv-bar-row label{font-size:8px;color:#81a2b5;text-transform:uppercase}.atv-bar{height:9px;border:1px solid #174056;background:#07131d;border-radius:99px;overflow:hidden}.atv-bar i{display:block;height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,#1a9dc7,#42e0ad);box-shadow:0 0 13px rgba(56,217,245,.18);transition:width .6s}.atv-bar-row b{font:800 10px 'JetBrains Mono',monospace;text-align:right;color:#dceff5}.atv-signal-box{margin-top:23px;border:1px solid #183b50;border-radius:11px;padding:11px;background:#081722;text-align:center}.atv-signal-box small{display:block;color:#628195;font-size:7px;letter-spacing:.1em}.atv-signal-box b{display:block;font-size:19px;margin-top:4px;color:#ffc857}.atv-signal-box span{font-size:8px;color:#6c899c}
+#atAI .atv-radar{height:190px;position:relative;margin-top:4px;display:grid;place-items:center}.atv-radar:before,.atv-radar:after{content:"";position:absolute;border:1px solid #1b5068;border-radius:50%}.atv-radar:before{width:165px;height:165px}.atv-radar:after{width:92px;height:92px}.atv-radar .cross{position:absolute;width:166px;height:1px;background:#1b5068}.atv-radar .cross2{position:absolute;height:166px;width:1px;background:#1b5068}.atv-radar .dot{position:absolute;width:14px;height:14px;border-radius:50%;background:#38d9f5;box-shadow:0 0 18px #38d9f5;transform:translate(48px,-40px)}.atv-radar .center{z-index:2;text-align:center;color:#6d8da0;font-size:8px}.atv-radar .center b{display:block;color:#d9edf3;font-size:16px;margin-bottom:3px}.atv-state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:5px}.atv-state{border:1px solid #17384c;background:#081722;border-radius:8px;padding:8px;text-align:center}.atv-state small{display:block;color:#628095;font-size:7px}.atv-state b{display:block;color:#39d9f4;font:800 10px 'JetBrains Mono',monospace;margin-top:3px}
+#atAI .atv-learning{margin-top:10px;border:1px solid #163b50;background:linear-gradient(145deg,#081b29,#06131e);border-radius:15px;padding:14px}.atv-learning-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.atv-learning-head h3{margin:0;font-size:13px;color:#e9f7fb}.atv-learning-head span{font-size:8px;color:#55e0ad;border:1px solid #245f4a;background:#0b241c;padding:5px 8px;border-radius:99px}.atv-learning-grid{display:grid;grid-template-columns:1.1fr repeat(5,1fr);gap:7px;margin-top:10px}.atv-train-card{border:1px solid #17384b;border-radius:9px;padding:9px;background:#071520}.atv-train-card small{display:block;color:#638196;font-size:7px;text-transform:uppercase}.atv-train-card b{display:block;color:#dff6fa;font:800 12px 'JetBrains Mono',monospace;margin-top:5px}.atv-train-main b{color:#55e0ad;font-size:17px}.atv-train-card span{display:block;color:#5d7d91;font-size:7px;margin-top:3px}.atv-progress{height:7px;background:#06111a;border:1px solid #17384b;border-radius:99px;overflow:hidden;margin-top:8px}.atv-progress i{display:block;height:100%;width:0;background:linear-gradient(90deg,#29c8ef,#55e0ad);transition:width .6s}
+@media(max-width:1050px){#atAI .atv-kpis{grid-template-columns:repeat(3,1fr)}#atAI .atv-main{grid-template-columns:1fr}.atv-panel{min-height:260px}#atAI .atv-learning-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:650px){#atAI .atv-dashboard{padding:14px}.atv-head{flex-direction:column;align-items:flex-start!important}.atv-status{width:100%;flex-wrap:wrap}.atv-kpis{grid-template-columns:repeat(2,1fr)!important}.atv-learning-grid{grid-template-columns:1fr 1fr!important}.atv-ring{width:200px;height:200px}}
+</style>
+
 </head>
 <body>
 
@@ -133,9 +384,13 @@
 
 <div class="top-tabs">
   <button class="top-tab-btn active" id="tabBtnCondor" onclick="switchTopTab('condor')">Option Selling — Condor / Strangle</button>
-  <button class="top-tab-btn" id="tabBtnNiftyBreakout" onclick="switchTopTab('niftyBreakout')">🎯 NIFTY Bullish Breakout</button>
+<button class="top-tab-btn" id="tabBtnMove" onclick="switchTopTab('move')">📈 Long Straddle / Strangle (Breakout)</button>
+<button class="top-tab-btn" id="tabBtnAutoTradeAI" onclick="switchTopTab('autoTradeAI')">🤖 Auto Buy/Sell AI</button>
   
 </div>
+
+
+
 
 <div class="tab-page active" id="tabPageCondor">
 <div class="wrap">
@@ -489,64 +744,399 @@
 </div>
 </div><!-- /tabPageCondor -->
 
-<div class="tab-page" id="tabPageNiftyBreakout">
+
+<div class="tab-page" id="tabPageMove">
 <div class="wrap">
+
   <div class="panel">
-    <h2>🎯 Continuous Index Breakout Monitor</h2>
-    <div class="legend">Monitors <b>NIFTY, BANKNIFTY, SENSEX and FINNIFTY</b> continuously. Bullish breakout → BUY ATM CE; bearish breakout → BUY ATM PE. The exit is a SELL of the same option. Paper mode simulates the exact live quote path; Live mode sends real Zerodha MIS orders only after explicit confirmation.</div>
-    <div class="row" style="margin-top:14px;align-items:center;gap:10px;">
-      <label class="inline">Candle <select id="bmInterval"><option value="5minute" selected>5 min</option><option value="15minute">15 min</option></select></label>
-      <label class="inline">Lookback <input type="number" id="bmLookback" value="20" min="10" max="60" style="width:70px;"></label>
-      <label class="inline">Scan every <input type="number" id="bmPoll" value="20" min="10" max="120" style="width:65px;"> sec</label>
-      <label class="inline">Capital / trade ₹ <input type="number" id="bmCapital" value="15000" min="1000" step="500" style="width:95px;"></label>
-      <label class="inline">Min score <select id="bmMinScore"><option value="7">7/7 only</option><option value="6" selected>6/7+</option><option value="5">5/7+</option></select></label>
+    <h2>1. Breakout Screener — independent scan for stocks COILED for a big move (Long Straddle/Strangle candidates)</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <label class="inline">Scan depth
+        <input type="number" id="mvMaxSymbols" value="40" min="10" max="80" style="width:70px;" /></label>
+      <label class="inline">Show
+        <input type="number" id="mvLimit" value="20" min="5" max="50" style="width:65px;" /></label>
+      <button id="mvRunScreenerBtn">Run Breakout Screener</button>
+      <button class="secondary small-btn" id="mvRefreshScreenerBtn">Force refresh</button>
+      <span id="mvScreenerStatus" class="loading"></span>
     </div>
-    <div class="row" style="margin-top:12px;align-items:center;">
-      <button id="bmPaperBtn" class="secondary">📝 PAPER MODE</button>
-      <button id="bmLiveBtn" class="secondary">🔴 LIVE MODE</button>
-      <button id="bmArmBtn">▶ START MONITOR</button>
-      <button id="bmStopBtn" class="secondary">■ STOP NEW ENTRIES</button>
-      <button id="bmBacktestBtn" class="secondary">📊 BACKTEST</button>
-      <span id="bmStatus" class="loading"></span>
+    <table id="mvScreenerTable" style="display:none;">
+      <thead><tr>
+        <th>Rank</th><th>Symbol</th><th>Entry Gate</th><th>Move Score</th><th>Squeeze</th><th>ADX (base/rising)</th>
+        <th>Volume</th><th>Near Trigger</th><th>ATM IV</th><th>Buyer IV Value</th><th>Spread / OI</th><th>Suggested</th><th>Event</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="mvScreenerExcluded" class="legend" style="display:none;"></div>
+    <div class="legend">
+      Opposite thesis to the Option-Selling screeners above: this looks for a tightening range
+      (Bollinger squeeze), an unusually narrow recent day (NR7), volume drying up (or already
+      picking up), ADX still low or just turning up off a low base, and spot sitting close to a
+      recent range edge — the classic pre-breakout "coiled spring" setup — combined with options
+      that are still relatively CHEAP to buy (low IV vs historical vol). The shortlist is now
+      liquidity-first instead of simply choosing the highest-ATR names. Weights: squeeze 25%, IV
+      cheapness 25%, momentum building 20%, volume setup 15%, proximity to trigger 10%, scheduled
+      event 5%. This is a fully independent module — it does not require the Option-Selling
+      screener above to have been run, and does not predict direction, only that a move is more
+      plausible than usual right now.
     </div>
-    <div id="bmModeBanner" class="warn-box" style="margin-top:12px;">PAPER MODE — no broker orders are sent.</div>
-    <div class="insight-grid" style="margin-top:16px;">
-      <div class="insight-card"><div class="k">Monitor</div><div class="v" id="bmRunning">STOPPED</div></div>
-      <div class="insight-card"><div class="k">Execution</div><div class="v" id="bmExecMode">PAPER</div></div>
-      <div class="insight-card"><div class="k">Trades Today</div><div class="v" id="bmTradesToday">0</div></div>
-      <div class="insight-card"><div class="k">Realized P&amp;L</div><div class="v" id="bmDayPnl">₹0</div></div>
-      <div class="insight-card"><div class="k">Last Scan</div><div class="v" id="bmLastScan">—</div></div>
-      <div class="insight-card"><div class="k">Disarm Reason</div><div class="v" id="bmReason">—</div></div>
-    </div>
-    <h3 style="font-size:12px;color:var(--muted);text-transform:uppercase;margin-top:20px;">Live signal board</h3>
-    <div id="bmSignalBoard" class="insight-grid"></div>
-    <h3 style="font-size:12px;color:var(--muted);text-transform:uppercase;margin-top:20px;">Open positions</h3>
-    <div style="overflow:auto;"><table id="bmOpenTable"><thead><tr><th>Time</th><th>Index</th><th>Action</th><th>Option</th><th>Entry</th><th>LTP</th><th>P&amp;L</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
-    <h3 style="font-size:12px;color:var(--muted);text-transform:uppercase;margin-top:20px;">Recent paper / live trades</h3>
-    <div style="overflow:auto;"><table id="bmTradeTable"><thead><tr><th>Time</th><th>Index</th><th>Direction</th><th>Option</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Exit reason</th></tr></thead><tbody></tbody></table></div>
-    <div class="panel" style="margin-top:18px;padding:14px;">
-      
-<div id="breakoutDiagnostics">
-<h3>🔎 Breakout Confirmation Diagnostics</h3>
-<p>Historical breakouts are tested against six index-side confirmations. Historical option momentum is not fabricated.</p>
-<table><thead><tr><th>Index</th><th>Raw</th><th>Breakout</th><th>VWAP</th><th>EMA</th><th>RSI</th><th>Volume</th><th>S/R</th><th>Strong close</th></tr></thead>
-<tbody id="diagRows"><tr><td colspan="9">Run backtest to populate diagnostics.</td></tr></tbody></table>
-</div>
-<h3 style="margin-top:0;">📊 Historical Backtest — did the breakout actually move?</h3>
-      <div class="row">
-        <label class="inline">Past days <select id="bmBtDays"><option>10</option><option selected>30</option><option>60</option><option>90</option><option>120</option></select></label>
-        <label class="inline">Historical score <select id="bmBtMinScore"><option value="4">4/6+</option><option value="5" selected>5/6+</option><option value="6">6/6 only</option></select></label>
-        <label class="inline">Stop <input type="number" id="bmBtStop" value="1" min="0.25" step="0.25" style="width:60px;"> ATR</label>
-        <label class="inline">Target <input type="number" id="bmBtTarget" value="2" min="0.5" step="0.5" style="width:60px;"> ATR</label>
-      </div>
-      <div id="bmBacktestSummary" style="margin-top:12px;"></div>
-      <div style="overflow:auto;margin-top:12px;"><table id="bmBtTable"><thead><tr><th>Index</th><th>Raw breaks</th><th>Qualified</th><th>Trades</th><th>Win %</th><th>Wins</th><th>Losses</th><th>Total points</th><th>Best</th><th>Worst</th></tr></thead><tbody></tbody></table></div>
-      <div class="legend" id="bmBtNote" style="margin-top:10px;">Backtest points are on the underlying index. It does not invent historical option premiums from today's option chain.</div>
-    </div>
-    <div class="disclaimer">Live monitor: 7 confirmations = breakout beyond 0.15 ATR + VWAP + EMA20/50 + RSI + ≥1.5× volume + resistance/support break + ATM option momentum. Historical backtest: 6 index-side confirmations are testable from historical candles; ATM option momentum/premium is deliberately NOT fabricated. The backtest now reports raw breakouts, qualified signals and rejection diagnostics. Strong-close remains an additional false-breakout guard.</div>
   </div>
+
+  <div class="panel">
+    <h2>2. Build &amp; Adjust — Long Straddle / Strangle</h2>
+    <div class="row">
+      <input type="text" id="mvSymbolInput" placeholder="e.g. ITC, NIFTY, BANKNIFTY" />
+      <button class="secondary index-btn" onclick="mvQuickSymbol('NIFTY')">NIFTY</button>
+      <button class="secondary index-btn" onclick="mvQuickSymbol('BANKNIFTY')">BANKNIFTY</button>
+      <button class="secondary index-btn" onclick="mvQuickSymbol('FINNIFTY')">FINNIFTY</button>
+      <button class="toggle active" id="mvTypeStraddle">Long Straddle (ATM)</button>
+      <button class="toggle" id="mvTypeStrangle">Long Strangle (OTM, cheaper)</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label class="inline">Expiry
+        <select id="mvExpirySelect"><option value="">Nearest (auto)</option></select></label>
+      <button class="secondary small-btn" id="mvLoadExpiriesBtn">Load Expiries</button>
+      <label class="inline">Lots
+        <input type="number" id="mvLotsInput" value="1" step="1" min="1" max="50" /></label>
+      <label class="inline" id="mvSelectionLabel" style="display:none;">Strike selection
+        <select id="mvSelectionMode"><option value="smart_delta">Smart delta (recommended)</option><option value="fixed_otm">Fixed OTM width</option></select></label>
+      <label class="inline" id="mvTargetDeltaLabel" style="display:none;">Target |delta|
+        <input type="number" id="mvTargetDeltaInput" value="0.30" step="0.01" min="0.18" max="0.40" /></label>
+      <label class="inline" id="mvOtmWidthLabel" style="display:none;">Fixed strangle width %
+        <input type="number" id="mvOtmPctInput" value="3" step="0.5" min="0.5" max="15" /></label>
+      <label class="inline">Max debit risk ₹
+        <input type="number" id="mvMaxRiskInput" value="25000" step="1000" min="1000" /></label>
+      <button id="mvBuildBtn">Calculate</button>
+      <span id="mvStrategyStatus" class="loading"></span>
+    </div>
+    <div class="legend">
+      Straddle buys the same ATM strike on both call and put (simplest, closest breakevens).
+      Strangle defaults to balanced ~30-delta legs; fixed-width remains available for manual use.
+      The debit, loss and breakevens are calculated at best Ask, not an optimistic midpoint.
+      "Load Expiries" lets you pick a specific expiry. Nothing is saved until you click "Track This Position".
+    </div>
+
+    <div id="mvStrategyBox" style="display:none;">
+      <div class="rank-badge" id="mv_score_badge"></div>
+      <p style="color:var(--muted); font-size:13px;">
+        Spot: <b id="mv_spot" style="color:var(--text)"></b> ·
+        Expiry: <b id="mv_expiry" style="color:var(--text)"></b>
+        (<span id="mv_dte"></span> days) · Lot size: <b id="mv_lot"></b> · Lots: <b id="mv_lots"></b> · Quantity: <b id="mv_qty"></b>
+      </p>
+
+      <div class="leg-grid" id="mvLegGrid"></div>
+
+      <div class="metric-row">
+        <div class="metric loss"><div class="k">Debit Paid (Max Loss)</div><div class="v" id="mv_debit"></div></div>
+        <div class="metric"><div class="k">Max Profit</div><div class="v">Unlimited (long options)</div></div>
+        <div class="metric"><div class="k">Margin / Investment Required</div><div class="v" id="mv_margin"></div></div>
+        <div class="metric"><div class="k">Breakevens</div><div class="v" id="mv_be"></div></div>
+        <div class="metric"><div class="k">Move Needed (Up / Down)</div><div class="v" id="mv_move_needed"></div></div>
+        <div class="metric"><div class="k">Est. Entry Charges</div><div class="v" id="mv_charges"></div></div>
+        <div class="metric"><div class="k">Ask Debit vs Mid</div><div class="v" id="mv_pricing"></div></div>
+        <div class="metric"><div class="k">Breakeven / Expected Move</div><div class="v" id="mv_be_ratio"></div></div>
+        <div class="metric"><div class="k">Risk Budget / Suggested Lots</div><div class="v" id="mv_risk_budget"></div></div>
+        <div class="metric"><div class="k">Exit Plan</div><div class="v" id="mv_exit_plan"></div></div>
+      </div>
+
+      <div id="mvEntryGate" style="margin-top:12px;"></div>
+      <div id="mv_warnings"></div>
+
+      <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:18px;">Payoff Chart (P&amp;L)</h3>
+      <div class="row" style="margin-bottom:6px;">
+        <label class="inline" style="flex:1; min-width:260px;">
+          Simulate at days-to-expiry: <b id="mvDteSliderLabel">—</b>
+          <input type="range" id="mvDteSlider" min="0" max="30" value="0" style="flex:1; margin-left:10px;" />
+        </label>
+        <button class="secondary small-btn" id="mvDteResetBtn">Reset to Today</button>
+      </div>
+      <div class="chart-wrap"><canvas id="mvPayoffChart"></canvas></div>
+      <div id="mvCursorReadout" class="legend" style="min-height:18px; font-family:monospace;">Move the cursor over the chart to see Spot / P&amp;L at that point.</div>
+      <div class="legend">Solid blue = P&amp;L at expiry (pure intrinsic value). Dashed orange = today's model P&amp;L (current IV, time remaining). Dashed purple = simulated P&amp;L at the days-to-expiry set by the slider — drag it to see how the curve decays as time passes with the same IV assumption. X-axis is the underlying spot price at that point.</div>
+
+      <h3 style="font-size:12px; color:var(--muted); text-transform:uppercase; margin-top:18px;">Why this setup / what's needed</h3>
+      <div class="insight-grid">
+        <div class="insight-card"><div class="k">Move Score</div><div class="v" id="mv_ins_score">—</div></div>
+        <div class="insight-card"><div class="k">Buyer IV Value</div><div class="v" id="mv_ins_ivhv">—</div></div>
+        <div class="insight-card"><div class="k">Leg Liquidity / Pricing</div><div class="v" id="mv_ins_liquidity">—</div></div>
+        <div class="insight-card"><div class="k">Expected Move vs Breakeven</div><div class="v" id="mv_ins_em">—</div></div>
+        <div class="insight-card"><div class="k">Squeeze / NR7</div><div class="v" id="mv_ins_squeeze">—</div></div>
+        <div class="insight-card"><div class="k">Trend / ADX</div><div class="v" id="mv_ins_trend">—</div></div>
+        <div class="insight-card"><div class="k">Volatility Regime</div><div class="v" id="mv_ins_volregime">—</div></div>
+        <div class="insight-card"><div class="k">Event Before Expiry</div><div class="v" id="mv_ins_event">—</div></div>
+        <div class="insight-card"><div class="k">Suggested Mode</div><div class="v" id="mv_ins_suggested">—</div></div>
+      </div>
+      <ul id="mv_reasons" style="margin-top:12px; font-size:13px; color:var(--text);"></ul>
+
+      <div class="row" style="margin-top:16px;">
+        <button id="mvTrackBtn">Track This Position</button>
+        <span id="mvTrackStatus" class="loading"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>3. Open Positions — tracked Long Straddle/Strangle trades</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <button id="mvRefreshWatchlistBtn">Refresh</button>
+      <span id="mvWatchlistStatus" class="loading"></span>
+    </div>
+    <table id="mvWatchlistTable" style="display:none;">
+      <thead><tr>
+        <th>Symbol</th><th>Type</th><th>Qty</th><th>Entry Spot</th><th>Spot Now</th><th>Days Left</th>
+        <th>Position Value</th><th>P&amp;L</th><th>Net P&amp;L (after charges)</th><th>% of Debit</th>
+        <th>Peak / Giveback</th><th>Debit Paid (Max Loss)</th><th>Zone / Action</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="legend" id="mvWatchlistEmpty">No tracked positions yet — build one above and click "Track This Position".</div>
+    <div class="legend">
+      "Zone" shows whether spot is between the strikes (theta-bleed danger zone), moving toward a
+      breakeven, already past a breakeven (in-the-money on a net basis), or near expiry. "Action"
+      is a rule-based suggestion only: book/trim at +40%, cut premium loss at -30%, activate a
+      peak-P&amp;L trail after +25%, and use a time stop when theta is outrunning the move. It never
+      places an order automatically. P&amp;L is marked at executable Bid. Click "Prices" for a live per-leg breakdown, "Live Chart" for an updated
+      payoff curve, "Execute" to actually BUY both legs at your broker, or "Close" to SELL both legs
+      and square off.
+    </div>
+  </div>
+
 </div>
-</div><!-- /tabPageNiftyBreakout -->
+</div><!-- /tabPageMove -->
+
+
+<div class="tab-page" id="tabPageAutoTradeAI">
+<style>
+#atAI{padding:22px;background:#07101a;color:#dce8f3;min-height:calc(100vh - 100px)}
+#atAI .ai-wrap{max-width:1480px;margin:auto}
+#atAI .ai-card{background:linear-gradient(145deg,#0d1824,#09121b);border:1px solid #20384c;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 14px 45px rgba(0,0,0,.22)}
+#atAI .ai-title{font-size:22px;font-weight:800;color:#f2f7fb}.ai-sub{color:#8ca4b8;font-size:12px;margin-top:5px}
+#atAI .ai-top{display:flex;justify-content:space-between;gap:15px;align-items:flex-start}.ai-pill{padding:7px 11px;border-radius:999px;border:1px solid #31516b;font-size:10px;font-weight:800}.ai-pill.paper{color:#7ee2b1;border-color:#245f4a}.ai-pill.lock{color:#ffc857}
+#atAI .ai-flow{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:16px}.ai-flow div{padding:12px 8px;text-align:center;border:1px solid #1e3b51;border-radius:11px;background:#0a1520}.ai-flow b{display:block;font-size:11px;color:#eef6fc}.ai-flow small{display:block;color:#718da4;margin-top:5px;font-size:9px}
+#atAI .ai-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.ai-metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.ai-metric{background:#0a1520;border:1px solid #1d3548;border-radius:11px;padding:12px}.ai-metric small{display:block;color:#718da4;font-size:9px;text-transform:uppercase}.ai-metric b{display:block;margin-top:5px;font-size:19px;color:#eef6fc}
+#atAI .dir-card{border:1px solid #244158;border-radius:14px;padding:15px;background:#091521}.dir-head{display:flex;justify-content:space-between;align-items:center}.dir-head b{font-size:15px}.dir-action{font-size:20px;font-weight:900;margin:16px 0 12px}.dir-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.dir-stats div{background:#0d1c29;padding:8px;border-radius:8px}.dir-stats small{display:block;color:#718da4;font-size:8px}.dir-stats b{font-size:13px}.dir-reason{color:#91a8bb;font-size:10px;line-height:1.55;min-height:45px}.up{border-color:#2c8b65!important}.down{border-color:#8b4052!important}.wait{border-color:#405365!important}
+#atAI .bar{height:7px;background:#172b3b;border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3dd9a0,#28a8e0);transition:width .5s}.stage{display:flex;justify-content:space-between;gap:8px;font-size:10px;margin-bottom:7px}.stage span{color:#7f98ac}.ai-note{color:#718da4;font-size:10px;line-height:1.6}.ai-table-wrap{overflow:auto;max-height:360px;border:1px solid #1e3548;border-radius:10px}.ai-table{width:100%;border-collapse:collapse;font-size:10px}.ai-table th,.ai-table td{padding:8px;border-bottom:1px solid #182d3d;text-align:left;white-space:nowrap}.ai-table th{position:sticky;top:0;background:#0c1b28;color:#7894aa}.good{color:#72e0ad}.bad{color:#ff8e9c}.neutral{color:#c3d1dc}
+@media(max-width:1000px){#atAI .ai-grid{grid-template-columns:1fr}.ai-flow{grid-template-columns:repeat(3,1fr)!important}.ai-metric-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.ai-flow{grid-template-columns:1fr 1fr!important}.dir-stats{grid-template-columns:repeat(2,1fr)}}
+
+/* --- Stage 2: model-comparison design pass ---------------------------- */
+#atAI{--m-gru:#40d8f4;--m-a:#ffc65a;--m-a2:#5fe0c0;--m-b:#a98bff;--m-ens:#7ee2b1}
+#atAI .ai-num,#atAI .ai-metric b,#atAI .dir-stats b,#atAI .dir-action,#atAI .ai-table td{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace}
+#atAI .ai-sub{text-transform:uppercase;letter-spacing:.09em;font-weight:700;font-size:10.5px}
+#atAI .ai-card{transition:border-color .2s,box-shadow .2s}
+#atAI .ai-card:hover{border-color:#2a4c68;box-shadow:0 16px 50px rgba(0,0,0,.28)}
+#atAI .model-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:9px;color:#8ca4b8;text-transform:uppercase;letter-spacing:.06em}
+#atAI .model-legend span{display:inline-flex;align-items:center;gap:6px}
+#atAI .model-legend i{width:8px;height:8px;border-radius:50%;display:inline-block}
+#atAI .model-row{margin-top:12px}
+#atAI .model-row-head{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;margin-bottom:5px}
+#atAI .model-row-head b{color:#eef6fc;font-weight:700}
+#atAI .model-row-head .model-tag{color:#7d94a8;font-size:9px;text-transform:uppercase;letter-spacing:.06em}
+#atAI .model-row-head .model-val{font-family:'JetBrains Mono',ui-monospace,monospace;color:#eef6fc;font-weight:700}
+#atAI .model-track{height:10px;border-radius:99px;background:#0a1520;border:1px solid #1d3548;overflow:hidden;position:relative}
+#atAI .model-track i{display:block;height:100%;border-radius:99px;width:0;transition:width .6s cubic-bezier(.4,0,.2,1)}
+#atAI .model-track.champion{box-shadow:0 0 0 1px currentColor inset}
+#atAI .champion-flag{margin-left:7px;padding:1px 7px;border-radius:999px;font-size:8px;font-weight:800;letter-spacing:.06em;background:#0e2a1f;color:#7ee2b1;border:1px solid #245f4a}
+#atAI .conf-track{height:14px;border-radius:99px;background:#0a1520;border:1px solid #1d3548;overflow:hidden;position:relative;margin-top:6px}
+#atAI .conf-track .fill{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,#1d5c73,#2bc9ef);border-radius:99px;transition:width .6s}
+#atAI .conf-legend{display:flex;justify-content:space-between;font-size:9px;color:#7d94a8;margin-top:5px}
+
+#atAI .warn-box-live{border:1px solid #6b2b2b;background:#2a1010;color:#ffb4b4;border-radius:12px;padding:12px 14px;font-size:11px;line-height:1.6}
+#atAI .warn-box-paper{border:1px solid #245f4a;background:#0d2119;color:#9fe8c8;border-radius:12px;padding:12px 14px;font-size:11px;line-height:1.6}
+#atAI .edge-check{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #172b3c;font-size:11px}
+#atAI .edge-check:last-child{border-bottom:0}
+#atAI .edge-check .ok{color:#72e0ad;font-weight:800}
+#atAI .edge-check .no{color:#ff8e9c;font-weight:800}
+#atAI .btn-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+#atAI button.mode-btn.active-mode{outline:2px solid #2bc9ef;outline-offset:1px}
+#atAI .cfg-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+#atAI .cfg-grid label{display:flex;flex-direction:column;gap:4px;font-size:9px;color:#8ca4b8;text-transform:uppercase;letter-spacing:.05em}
+#atAI .cfg-grid input{background:#0a1520;border:1px solid #1d3548;color:#eef6fc;border-radius:8px;padding:7px 8px;font-size:12px}
+@media(max-width:1000px){#atAI .cfg-grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+<div id="atAI"><div class="ai-wrap">
+
+  <section class="atv-dashboard">
+    <div class="atv-head">
+      <div class="atv-brand">
+        <div class="atv-logo">🤖</div>
+        <div><div class="atv-title">AI AUTO BUY/SELL INDEX</div><div class="atv-subtitle">LEARN → PREDICT → SELECT → BUY → REASSESS → HOLD / REDUCE / SELL</div></div>
+      </div>
+      <div class="atv-status">
+        <div class="atv-status-box"><small>ENGINE STATUS</small><b id="atvEngineStatus">● DISARMED · PAPER</b><span id="atvNextScan">Waiting for live scan</span></div>
+        <div class="atv-clock"><b id="atvClock">--:--:--</b><span id="atvDate">--</span></div>
+      </div>
+    </div>
+
+    <div class="atv-kpis">
+      <div class="atv-kpi cyan"><small>Execution Mode</small><b id="atvMode">PAPER / TRACK</b><em>No real orders</em></div>
+      <div class="atv-kpi"><small>Positions</small><b id="atvPositions">0 / 3</b><em>Concurrent</em></div>
+      <div class="atv-kpi green"><small>Today P&amp;L · Paper</small><b id="atvPnl">₹0</b><em id="atvPnlPct">—</em></div>
+      <div class="atv-kpi"><small>Win Rate</small><b id="atvWin">—</b><em id="atvWinDetail">Paper track</em></div>
+      <div class="atv-kpi"><small>Avg R / Profit Factor</small><b id="atvRpf">—</b><em>Out-of-sample</em></div>
+      <div class="atv-kpi red"><small>Daily Loss Limit</small><b id="atvLoss">₹0 / ₹—</b><em>Risk guard</em></div>
+    </div>
+
+    <div class="atv-main">
+      <div class="atv-panel atv-decision">
+        <div class="atv-panel-title">LIVE AI EXECUTION DECISION</div>
+        <div class="atv-ring" id="atvRing" style="--ring:0deg"><div class="atv-ring-inner"><div class="decision" id="atvDecision">WAIT</div><div class="prob" id="atvProb">P(UP) —</div><div class="note" id="atvDecisionNote">NO LIVE DATA</div></div></div>
+        <div class="atv-decision-meta"><div><small>INDEX</small><b id="atvIndex">—</b></div><div><small>EDGE</small><b id="atvEdge">—</b></div><div><small>REGIME</small><b id="atvRegime">—</b></div></div>
+      </div>
+
+      <div class="atv-panel atv-bars">
+        <div class="atv-panel-title">LIVE MODEL CONSENSUS</div>
+        <div class="atv-bar-row"><label>GRU P(UP)</label><div class="atv-bar"><i id="atvGruBar"></i></div><b id="atvGruVal">—</b></div>
+        <div class="atv-bar-row"><label>ML READY</label><div class="atv-bar"><i id="atvMlBar"></i></div><b id="atvMlVal">—</b></div>
+        <div class="atv-bar-row"><label>ENSEMBLE</label><div class="atv-bar"><i id="atvEnsBar"></i></div><b id="atvEnsVal">—</b></div>
+        <div class="atv-bar-row"><label>WARM-UP</label><div class="atv-bar"><i id="atvWarmBar"></i></div><b id="atvWarmVal">—</b></div>
+        <div class="atv-signal-box"><small>CURRENT AI ACTION</small><b id="atvAction">WAIT</b><span id="atvActionReason">Waiting for executable index data</span></div>
+      </div>
+
+      <div class="atv-panel">
+        <div class="atv-panel-title">LIVE MARKET / OPTION STATE</div>
+        <div class="atv-radar"><div class="cross"></div><div class="cross2"></div><div class="dot" id="atvRadarDot"></div><div class="center"><b id="atvRadarCenter">—</b><span id="atvRadarNote">NO LIVE DATA</span></div></div>
+        <div class="atv-state-grid">
+          <div class="atv-state"><small>SPOT</small><b id="atvSpot">—</b></div><div class="atv-state"><small>VOLATILITY</small><b id="atvVol">—</b></div>
+          <div class="atv-state"><small>PCR</small><b id="atvPcr">—</b></div><div class="atv-state"><small>OPTION</small><b id="atvOption">—</b></div>
+          <div class="atv-state"><small>CE BIAS</small><b id="atvCeBias">—</b></div><div class="atv-state"><small>PE BIAS</small><b id="atvPeBias">—</b></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="atv-learning">
+      <div class="atv-learning-head"><h3>🧠 AI LEARNING &amp; MODEL STATUS</h3><span id="atvLearningBadge">● CHECKING MODEL</span></div>
+      <div class="atv-learning-grid">
+        <div class="atv-train-card atv-train-main"><small>Historical GRU Pre-training</small><b id="atvHistPct">0%</b><span id="atvHistStatus">Waiting for historical model</span><div class="atv-progress"><i id="atvHistBar"></i></div></div>
+        <div class="atv-train-card"><small>GRU Samples</small><b id="atvHistSamples">—</b><span>Historical sequences</span></div>
+        <div class="atv-train-card"><small>GRU Accuracy</small><b id="atvHistAcc">—</b><span>Validation</span></div>
+        <div class="atv-train-card"><small>GRU AUC</small><b id="atvHistAuc">—</b><span>ROC score</span></div>
+        <div class="atv-train-card"><small>Live ML / DL</small><b id="atvLiveEvidence">—</b><span id="atvLiveEvidenceSub">Evidence samples</span></div>
+        <div class="atv-train-card"><small>Model Warm-up</small><b id="atvLearnWarm">—</b><span>Adaptive score</span></div>
+      </div>
+      <div class="atv-progress" style="margin-top:10px"><i id="atvLiveBar"></i></div>
+      <div style="display:flex;justify-content:space-between;gap:8px;margin-top:5px;font-size:7px;color:#607f93"><span>LIVE LEARNING PROGRESS</span><span id="atvLivePct">0%</span></div>
+    </div>
+  </section>
+
+
+
+  <section class="ai-card">
+    <div class="ai-top">
+      <div>
+        <div class="ai-title">🤖 Automatic AI Buy/Sell Engine</div>
+        <div class="ai-sub" style="margin-top:6px">GRU + ML ensemble reads index direction &rarr; auto-BUYs the best-EV CE/PE &rarr; continuously reassesses &rarr; auto HOLD / REDUCE / SELL</div>
+      </div>
+      <div style="text-align:right">
+        <span class="ai-pill" id="atModePill">PAPER</span>
+        <span class="ai-pill" id="atArmedPill" style="margin-left:6px">DISARMED</span>
+      </div>
+    </div>
+    <div class="ai-flow">
+      <div><b>1. LEARN</b><small>12yr GRU + live ML</small></div>
+      <div><b>2. PREDICT</b><small>direction + confidence</small></div>
+      <div><b>3. SELECT</b><small>best-EV CE / PE</small></div>
+      <div><b>4. AUTO-BUY</b><small>strong signal only</small></div>
+      <div><b>5. REASSESS</b><small>every cycle, live</small></div>
+      <div><b>6. HOLD/REDUCE/SELL</b><small>edge-driven exit</small></div>
+    </div>
+    <div id="atModeBanner" class="warn-box-paper" style="margin-top:14px">PAPER MODE — no broker orders are sent. Every completed paper trade is fed back into the shared GRU/ML models as new learning data.</div>
+    <div class="btn-row">
+      <button class="mode-btn" id="atPaperBtn">📝 PAPER MODE</button>
+      <button class="mode-btn" id="atLiveBtn">🔴 LIVE MODE</button>
+      <button id="atArmBtn">▶ ARM (start automatic entries)</button>
+      <button class="secondary" id="atDisarmBtn">■ DISARM (stop new entries)</button>
+      <button class="secondary" id="atCloseAllBtn" style="border-color:#6b2b2b;color:#ffb4b4">⛔ CLOSE ALL NOW (kill switch)</button>
+      <span id="atStatus" class="loading"></span>
+    </div>
+    <div class="ai-metric-grid" style="margin-top:16px">
+      <div class="ai-metric"><small>Market</small><b id="atMarketOpen">—</b></div>
+      <div class="ai-metric"><small>Open Positions</small><b id="atOpenCount">0</b></div>
+      <div class="ai-metric"><small>Today P&amp;L (Paper)</small><b id="atPaperPnl">₹0</b></div>
+      <div class="ai-metric"><small>Today P&amp;L (Live)</small><b id="atLivePnl">₹0</b></div>
+    </div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">🔒 OUT-OF-SAMPLE EDGE VALIDATION — required before LIVE mode unlocks</div>
+    <div class="ai-note" style="margin-top:6px">This engine must prove a genuine edge on its own paper trades before it is ever allowed to place a real order. All five checks below must pass.</div>
+    <div class="ai-metric-grid" style="margin-top:12px">
+      <div class="ai-metric"><small>Closed Paper Trades</small><b id="atEdgeTrades">0</b></div>
+      <div class="ai-metric"><small>Track Record Span</small><b id="atEdgeSpan">0 days</b></div>
+      <div class="ai-metric"><small>Win Rate</small><b id="atEdgeWin">—</b></div>
+      <div class="ai-metric"><small>Avg R / Profit Factor</small><b id="atEdgeRPF">—</b></div>
+    </div>
+    <div style="margin-top:12px" id="atEdgeChecklist"></div>
+    <div id="atEdgeVerdict" class="warn-box-paper" style="margin-top:10px">Keep paper trading to build an out-of-sample track record.</div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">⚙️ ENGINE SETTINGS</div>
+    <div class="cfg-grid">
+      <label>Capital / trade — Paper (₹)<input type="number" id="atCapPaper" value="25000" step="1000"></label>
+      <label>Capital / trade — Live (₹)<input type="number" id="atCapLive" value="25000" step="1000"></label>
+      <label>Max concurrent positions<input type="number" id="atMaxPos" value="3" min="1" max="3"></label>
+      <label>Square-off time<input type="text" id="atSquareOff" value="15:15"></label>
+      <label>Max daily loss — Paper (₹)<input type="number" id="atMaxLossPaper" value="15000" step="500"></label>
+      <label>Max daily loss — Live (₹)<input type="number" id="atMaxLossLive" value="7500" step="500"></label>
+      <label>Max hold time (minutes)<input type="number" id="atMaxHold" value="180" step="15"></label>
+      <label>Confidence drop → REDUCE<input type="number" id="atConfReduce" value="0.12" step="0.01"></label>
+      <label>Confidence drop → SELL<input type="number" id="atConfExit" value="0.22" step="0.01"></label>
+      <label>Edge: min trades<input type="number" id="atEdgeMinTrades" value="60" step="5"></label>
+      <label>Edge: min days<input type="number" id="atEdgeMinDays" value="10" step="1"></label>
+      <label>Edge: min win rate %<input type="number" id="atEdgeMinWin" value="42" step="1"></label>
+    </div>
+    <div class="btn-row"><button class="secondary" id="atSaveCfgBtn">💾 Save Settings</button></div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">📡 LIVE SIGNAL BOARD</div>
+    <div class="ai-grid" id="atSignalBoard" style="margin-top:12px"></div>
+  </section>
+
+  <section class="ai-card" id="atLearningCard">
+    <div class="ai-sub">🧠 AI LEARNING STATUS <span style="font-weight:400;color:#8ca4b8">(historical GRU + live ML/DL evidence)</span></div>
+    <div class="ai-metric-grid" style="margin-top:12px">
+      <div class="ai-metric"><small>AI STATUS</small><b id="atTrainStatus">CHECKING…</b></div>
+      <div class="ai-metric"><small>HISTORICAL GRU</small><b id="atGRU">—</b></div>
+      <div class="ai-metric"><small>GRU ACCURACY</small><b id="atGRUAccuracy">—</b></div>
+      <div class="ai-metric"><small>GRU AUC</small><b id="atGRUAUC">—</b></div>
+      <div class="ai-metric"><small>LIVE ML EVIDENCE</small><b id="atLiveML">0</b></div>
+      <div class="ai-metric"><small>LIVE DL EVIDENCE</small><b id="atLiveDL">0</b></div>
+      <div class="ai-metric"><small>MODEL WARM-UP</small><b id="atWarmup">—</b></div>
+      <div class="ai-metric"><small>LAST HIST. TRAINING</small><b id="atHistLastTrain">—</b></div>
+    </div>
+    <div id="atLearningStages" style="margin-top:12px"></div><div id="atRetrainPanel" style="margin-top:14px;padding:14px;border:1px solid #24465a;border-radius:12px;background:linear-gradient(145deg,#0a1b28,#07131d)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <div><div style="font-size:10px;font-weight:800;letter-spacing:.08em;color:#cfe7ef">HISTORICAL GRU TRAINING MONITOR</div><div id="atRetrainStatus" style="font-size:9px;color:#7894a8;margin-top:4px">Checking backend training state…</div></div>
+        <button id="atRetrainBtn" type="button" onclick="atStartHistoricalRetrain()" style="padding:9px 13px;border:1px solid #2a7183;border-radius:9px;background:#0b2935;color:#8feafb;font-weight:800;cursor:pointer">▶ RETRAIN HISTORICAL GRU</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;margin-top:10px"><div style="height:8px;background:#07131d;border:1px solid #163247;border-radius:99px;overflow:hidden"><i id="atRetrainProgress" style="display:block;height:100%;width:0%;background:linear-gradient(90deg,#2bc9ef,#55e0ad);transition:width .35s"></i></div><b id="atRetrainPct" style="font:800 10px ui-monospace,monospace;color:#8feafb">0.0%</b></div>
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:10px"><div class="ai-metric"><small>PHASE</small><b id="atRetrainPhase" style="font-size:12px">—</b></div><div class="ai-metric"><small>EPOCH</small><b id="atRetrainEpoch" style="font-size:12px">—</b></div><div class="ai-metric"><small>ELAPSED</small><b id="atRetrainElapsed" style="font-size:12px">00:00</b></div><div class="ai-metric"><small>SAMPLES</small><b id="atRetrainSamples" style="font-size:12px">—</b></div><div class="ai-metric"><small id="atRetrainQualityLabel">NEW ACC / AUC</small><b id="atRetrainQuality" style="font-size:12px">—</b></div></div>
+    </div>
+    <div class="ai-note" id="atLearningDetail" style="margin-top:10px">Checking historical training and live learning status…</div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">OPEN AUTOMATIC POSITIONS</div>
+    <div class="ai-table-wrap" style="margin-top:10px"><table class="ai-table"><thead><tr><th>Time</th><th>Index</th><th>Mode</th><th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>Stop</th><th>Target</th><th>P&amp;L</th><th>Last Action</th></tr></thead><tbody id="atOpenTable"><tr><td colspan="11">No open automatic positions.</td></tr></tbody></table></div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">RECENT AUTOMATIC TRADES (PAPER + LIVE)</div>
+    <div class="ai-table-wrap" style="margin-top:10px"><table class="ai-table"><thead><tr><th>Time</th><th>Index</th><th>Mode</th><th>Option</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>Status</th><th>Exit Reason</th></tr></thead><tbody id="atTradesTable"><tr><td colspan="11">No automatic trades yet.</td></tr></tbody></table></div>
+  </section>
+
+  <section class="ai-card">
+    <div class="ai-sub">🧭 REASONING FEED — every HOLD / REDUCE / SELL / BUY decision</div>
+    <div class="ai-table-wrap" style="margin-top:10px"><table class="ai-table"><thead><tr><th>Time</th><th>Index</th><th>Action</th><th>Reason</th><th>LTP</th><th>Unrl. P&amp;L</th><th>p(UP)</th><th>Confidence</th></tr></thead><tbody id="atActionsTable"><tr><td colspan="8">No decisions logged yet.</td></tr></tbody></table></div>
+  </section>
+
+  <div class="disclaimer" style="margin-top:4px">Not investment advice. Paper mode simulates fills against the same live bid/ask this engine would trade on; Live mode sends real Zerodha MIS market orders only after Paper mode clears the edge thresholds above AND you explicitly arm Live with confirmation. The engine never forces a trade — an uncertain read is always WAIT.</div>
+
+</div></div>
+</div><!-- /tabPageAutoTradeAI -->
+
+
 
 <!-- Execute confirmation modal -->
 <div class="modal-overlay" id="execModal">
@@ -1946,99 +2536,34 @@ document.getElementById("refreshEventsBtn").onclick = loadEvents;
 // ============================================================================
 function switchTopTab(which) {
   const isCondor = which === "condor";
-  const isNiftyBreakout = which === "niftyBreakout";
+  const isMove = which === "move";
+  const isAutoTradeAI = which === "autoTradeAI";
+
+  // Switch the page content.
   document.getElementById("tabPageCondor").classList.toggle("active", isCondor);
-  document.getElementById("tabPageNiftyBreakout").classList.toggle("active", isNiftyBreakout);
+  document.getElementById("tabPageMove").classList.toggle("active", isMove);
+  document.getElementById("tabPageAutoTradeAI").classList.toggle("active", isAutoTradeAI);
+
+  // Switch the top navigation state.
   document.getElementById("tabBtnCondor").classList.toggle("active", isCondor);
-  document.getElementById("tabBtnNiftyBreakout").classList.toggle("active", isNiftyBreakout);
-  if (isNiftyBreakout && !window.__niftyBreakoutInitedOnce) {
-    window.__niftyBreakoutInitedOnce = true;
-    initNiftyBreakoutTab();
+  document.getElementById("tabBtnMove").classList.toggle("active", isMove);
+  document.getElementById("tabBtnAutoTradeAI").classList.toggle("active", isAutoTradeAI);
+
+  // AI-styled tab gets its own light-on-dark workspace. Condor/Move keep the original dark theme.
+  document.body.classList.toggle("ai-evolution-mode", isAutoTradeAI);
+
+  if (isAutoTradeAI) {
+    if (typeof initAutoTradeAIUI === "function") {
+      initAutoTradeAIUI();
+    } else {
+      console.error('[AUTOTRADE-AI] initAutoTradeAIUI is not defined — hard-refresh (Ctrl+Shift+R) or clear cache.');
+    }
   }
 }
 
-let bmTimer = null;
+
 function fmtMoney(v) { return v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", {maximumFractionDigits:2}); }
 function fmtTime(v) { return v ? new Date(v).toLocaleTimeString() : "—"; }
-
-function initNiftyBreakoutTab() {
-  document.getElementById("bmPaperBtn").onclick = () => setBreakoutMode("paper");
-  document.getElementById("bmLiveBtn").onclick = () => setBreakoutMode("live");
-  document.getElementById("bmArmBtn").onclick = armBreakoutMonitor;
-  document.getElementById("bmStopBtn").onclick = stopBreakoutMonitor;
-  document.getElementById("bmBacktestBtn").onclick = runBreakoutBacktest;
-  refreshBreakoutMonitor();
-  if (!bmTimer) bmTimer = setInterval(refreshBreakoutMonitor, 5000);
-}
-
-function renderBreakoutMonitor(d) {
-  const s = d.state || {};
-  document.getElementById("bmRunning").textContent = s.enabled ? "RUNNING" : "STOPPED";
-  document.getElementById("bmExecMode").textContent = (s.execution_mode || "paper").toUpperCase();
-  document.getElementById("bmTradesToday").textContent = s.trades_today ?? 0;
-  document.getElementById("bmDayPnl").textContent = fmtMoney(s.realized_pnl_today || 0);
-  document.getElementById("bmLastScan").textContent = fmtTime(s.last_scan_at);
-  document.getElementById("bmReason").textContent = s.disarm_reason || "—";
-  document.getElementById("bmModeBanner").textContent = s.execution_mode === "live"
-    ? "🔴 LIVE MODE — qualified signals may place REAL BUY orders; exits SELL the same option."
-    : "📝 PAPER MODE — no broker order is sent; entries/exits use live option prices for simulation.";
-
-  const sigs = s.last_signals || {};
-  document.getElementById("bmSignalBoard").innerHTML = ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY"].map(sym => {
-    const x=sigs[sym]||{};
-    if(x.error) return `<div class="insight-card"><div class="k">${sym}</div><div class="v">ERROR</div><div class="legend">${x.error}</div></div>`;
-    const dir=x.direction==="CE"?"🟢 BUY ATM CE":x.direction==="PE"?"🔴 BUY ATM PE":"WAIT";
-    const q=x.score>=7?"ok":x.score>=6?"warn":"bad";
-    const c=x.conditions||{};
-    const rows=[["Breakout",c.breakout],[x.direction==="PE"?"Below VWAP":"Above VWAP",c.above_vwap],["EMA20/50",c.ema20_50],[x.direction==="PE"?"RSI <45":"RSI >55",c.rsi],["Volume ≥1.5x",c.volume],[x.direction==="PE"?"Support broken":"Resistance broken",c.level_broken],[x.direction==="PE"?"Put momentum":"Call momentum",c.option_momentum]];
-    return `<div class="insight-card" style="grid-column:span 2;min-width:300px;"><div style="display:flex;justify-content:space-between;"><div class="k">${sym}</div><span class="pill ${q}">${x.score??0}/7</span></div><div class="v" style="margin-top:4px;">${dir} — ${x.quality||"NO BREAKOUT"}</div><div class="legend">Spot ${x.spot??"—"} · VWAP ${x.vwap??"—"} · EMA20 ${x.ema20??"—"} · EMA50 ${x.ema50??"—"} · RSI ${x.rsi??"—"} · RV ${x.rel_volume??"—"}x</div><div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:8px;">${rows.map(r=>`<span class="pill ${r[1]?"ok":"bad"}" style="font-size:10px;">${r[1]?"✓":"✕"} ${r[0]}</span>`).join("")}</div><div class="legend" style="margin-top:8px;">${x.option?.tradingsymbol?`Option: <b>${x.option.tradingsymbol}</b> @ ${fmtMoney(x.option.premium)}`:"No ATM option selected."}<br>${x.reason||"Waiting for a directional breakout."}</div></div>`;
-  }).join("");
-
-  const open=d.open_trades||[];
-  document.querySelector("#bmOpenTable tbody").innerHTML=open.length?open.map(t=>{const pnl=t.last_ltp!=null?(t.last_ltp-t.entry_price)*t.quantity:null;return `<tr><td>${fmtTime(t.opened_at)}</td><td>${t.symbol}</td><td>${t.direction==="CE"?"BUY CE":"BUY PE"}</td><td>${t.tradingsymbol}</td><td>${fmtMoney(t.entry_price)}</td><td>${fmtMoney(t.last_ltp)}</td><td>${fmtMoney(pnl)}</td><td>Open</td></tr>`}).join(""):"<tr><td colspan='8' class='legend'>No open breakout position.</td></tr>";
-  const recent=d.recent_trades||[];
-  document.querySelector("#bmTradeTable tbody").innerHTML=recent.length?recent.slice(0,25).map(t=>`<tr><td>${fmtTime(t.opened_at)}</td><td>${t.symbol}</td><td>${t.direction}</td><td>${t.tradingsymbol}</td><td>${fmtMoney(t.entry_price)}</td><td>${fmtMoney(t.exit_price)}</td><td>${fmtMoney(t.realized_pnl)}</td><td>${t.exit_reason||"—"}</td></tr>`).join(""):"<tr><td colspan='8' class='legend'>No breakout trades yet.</td></tr>";
-}
-
-async function refreshBreakoutMonitor(){
-  if(!document.getElementById("tabPageNiftyBreakout")?.classList.contains("active"))return;
-  try{const r=await apiFetch("/api/breakout-monitor/state");const d=await r.json();if(!d.error)renderBreakoutMonitor(d);}catch(e){document.getElementById("bmStatus").textContent="Refresh failed: "+e;}
-}
-
-async function setBreakoutMode(mode){
-  if(mode==="live"&&!confirm("LIVE MODE can place REAL BUY/SELL orders in Zerodha. Continue?"))return;
-  const r=await apiFetch("/api/breakout-monitor/mode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(mode==="live"?{mode,ack:true}:{mode})});
-  const d=await r.json();if(d.error)alert(d.error);else refreshBreakoutMonitor();
-}
-async function armBreakoutMonitor(){
-  const cfg={interval:document.getElementById("bmInterval").value,lookback:Number(document.getElementById("bmLookback").value)||20,poll_seconds:Number(document.getElementById("bmPoll").value)||20,capital_per_trade:Number(document.getElementById("bmCapital").value)||15000,min_score:Number(document.getElementById("bmMinScore").value)||6};
-  const c=await (await apiFetch("/api/breakout-monitor/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)})).json();
-  if(c.error){alert(c.error);return;}
-  if(c.state.execution_mode==="live"&&!confirm("ARM LIVE: automatic breakout entries/exits can place REAL orders. Continue?"))return;
-  const r=await apiFetch("/api/breakout-monitor/arm",{method:"POST",headers:{"Content-Type":"application/json"},body:c.state.execution_mode==="live"?{ack:true}:{}});const d=await r.json();if(d.error)alert(d.error);else refreshBreakoutMonitor();
-}
-async function stopBreakoutMonitor(){const r=await apiFetch("/api/breakout-monitor/disarm",{method:"POST"});const d=await r.json();if(d.error)alert(d.error);else refreshBreakoutMonitor();}
-async function runBreakoutBacktest(){
-  const status=document.getElementById("bmStatus");
-  status.textContent="Running historical identification for 4 indices…";
-  const q=`/api/breakout-monitor/backtest?days=${Number(document.getElementById("bmBtDays").value)||30}&interval=${encodeURIComponent(document.getElementById("bmInterval").value)}&lookback=${Number(document.getElementById("bmLookback").value)||20}&stop_atr=${Number(document.getElementById("bmBtStop").value)||1}&target_atr=${Number(document.getElementById("bmBtTarget").value)||2}&min_score=${Number(document.getElementById("bmBtMinScore").value)||5}`;
-  try{
-    const d=await (await apiFetch(q)).json();
-    if(d.error){status.textContent="Backtest error: "+d.error;return;}
-    document.querySelector("#bmBtTable tbody").innerHTML=d.results.map(x=>x.error
-      ? `<tr><td>${x.symbol}</td><td colspan='9'>${x.error}</td></tr>`
-      : `<tr><td><b>${x.symbol}</b></td><td>${x.raw_breakouts??0}</td><td>${x.qualified_signals??0}</td><td>${x.trade_count}</td><td>${x.win_rate}%</td><td>${x.wins}</td><td>${x.losses}</td><td><b>${x.points}</b></td><td>${x.best_points}</td><td>${x.worst_points}</td></tr>`
-    ).join("");
-    const v=d.results.filter(x=>!x.error);
-    const pts=v.reduce((a,x)=>a+(x.points||0),0);
-    const n=v.reduce((a,x)=>a+(x.trade_count||0),0);
-    const raw=v.reduce((a,x)=>a+(x.raw_breakouts||0),0);
-    const qual=v.reduce((a,x)=>a+(x.qualified_signals||0),0);
-    document.getElementById("bmBacktestSummary").innerHTML=`<div class='metric'><div class='k'>Historical identification</div><div class='v'>${raw} raw breakouts → ${qual} qualified signals → ${n} simulated trades</div><div class='legend'>Combined underlying result: ${pts.toFixed(2)} points across ${v.length} indices. Score threshold: ${d.min_score}/6. Option momentum is not assumed historically.</div></div>`;
-    document.getElementById("bmBtNote").textContent=d.note||"";
-    status.textContent="Backtest complete — breakout identification included.";
-  }catch(e){status.textContent="Backtest failed: "+e;}
-}
 </script>
 
 <script>
@@ -2132,6 +2657,1027 @@ setInterval(() => {
   if (document.visibilityState === "visible") loadExistingPositionIntel();
 }, 30000);
 loadExistingPositionIntel();
+</script>
+
+
+<script>
+// ============================================================================
+// Autonomous AI Evolution UI — directional index learning only.
+async function aiGet(url,opt){const r=await fetch(url,opt);const raw=await r.text();let d;try{d=JSON.parse(raw)}catch(e){throw Error('Backend returned non-JSON ('+r.status+')')};if(!r.ok)throw Error(d.error||d.message||'Request failed');return d;}
+function setN(id,v){const e=document.getElementById(id);if(e)e.textContent=v}
+</script>
+<script>
+// =====================================================================
+// AUTOMATIC AI BUY/SELL ENGINE — tab controller (Paper + Live)
+// =====================================================================
+let atTimer = null;
+let atLastConfig = null;
+
+function atEsc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function atFmtR(v) { return v == null ? "—" : (Number(v) >= 0 ? "+" : "") + Number(v).toFixed(2) + "R"; }
+
+function initAutoTradeAIUI() {
+  if (window.__atInit) { refreshAutoTradeAI(); return; }
+  window.__atInit = true;
+  window.addEventListener("error", ev => {
+    console.error("[AUTOTRADE-AI] uncaught error:", ev.message, ev.filename, ev.lineno);
+    setN("atStatus", "JS error: " + ev.message);
+  });
+
+  document.getElementById("atPaperBtn").onclick = () => atSetMode("paper");
+  document.getElementById("atLiveBtn").onclick = () => atSetMode("live");
+  document.getElementById("atArmBtn").onclick = atArm;
+  document.getElementById("atDisarmBtn").onclick = atDisarm;
+  document.getElementById("atCloseAllBtn").onclick = atCloseAll;
+  document.getElementById("atSaveCfgBtn").onclick = atSaveConfig;
+
+  refreshAutoTradeAI();
+  if (!atTimer) atTimer = setInterval(refreshAutoTradeAI, 8000);
+  console.info("[AUTOTRADE-AI] init complete");
+}
+
+async function atSetMode(mode) {
+  const status = document.getElementById("atStatus");
+  if (mode === "live") {
+    const ok = confirm(
+      "Switch the Automatic AI engine to LIVE mode?\n\n" +
+      "Once armed, LIVE mode places REAL Zerodha orders with REAL money — automatic BUY on entry " +
+      "and automatic SELL/REDUCE on exit, with no manual confirmation per trade.\n\n" +
+      "This is only allowed once the engine's own paper track record clears the edge-validation " +
+      "checks shown above. Continue?"
+    );
+    if (!ok) return;
+  }
+  status.textContent = "Switching mode…";
+  try {
+    const r = await apiFetch("/api/ai-autotrade/set-execution-mode", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, ack: true })
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); status.textContent = ""; return; }
+    status.textContent = "Mode set to " + mode.toUpperCase();
+    await refreshAutoTradeAI();
+  } catch (e) { alert(e.message); }
+  status.textContent = "";
+}
+
+async function atArm() {
+  const status = document.getElementById("atStatus");
+  const isLive = atLastConfig && atLastConfig.execution_mode === "live";
+  if (isLive) {
+    const ok = confirm(
+      "ARM the engine in LIVE mode?\n\n" +
+      "From this point on it will automatically place REAL BUY orders when a strong signal appears, " +
+      "and REAL SELL/REDUCE orders as it manages the position — with no per-trade confirmation.\n\n" +
+      "You can DISARM or use CLOSE ALL at any time. Continue?"
+    );
+    if (!ok) return;
+  }
+  status.textContent = "Arming…";
+  try {
+    const r = await apiFetch("/api/ai-autotrade/arm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ack: true })
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); status.textContent = ""; return; }
+    status.textContent = "Armed.";
+    await refreshAutoTradeAI();
+  } catch (e) { alert(e.message); }
+  status.textContent = "";
+}
+
+async function atDisarm() {
+  try {
+    await apiFetch("/api/ai-autotrade/disarm", { method: "POST" });
+    await refreshAutoTradeAI();
+  } catch (e) { alert(e.message); }
+}
+
+async function atCloseAll() {
+  const ok = confirm("Close ALL open automatic positions (paper and live) right now at the best executable price? This cannot be undone.");
+  if (!ok) return;
+  try {
+    const r = await apiFetch("/api/ai-autotrade/close-all", { method: "POST" });
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    alert("Closed " + (d.closed_trade_ids || []).length + " position(s).");
+    await refreshAutoTradeAI();
+  } catch (e) { alert(e.message); }
+}
+
+async function atSaveConfig() {
+  const body = {
+    capital_per_trade_paper: Number(document.getElementById("atCapPaper").value),
+    capital_per_trade_live: Number(document.getElementById("atCapLive").value),
+    max_concurrent_positions: Number(document.getElementById("atMaxPos").value),
+    square_off_time: document.getElementById("atSquareOff").value,
+    max_daily_loss_paper: Number(document.getElementById("atMaxLossPaper").value),
+    max_daily_loss_live: Number(document.getElementById("atMaxLossLive").value),
+    max_hold_minutes: Number(document.getElementById("atMaxHold").value),
+    confidence_drop_reduce: Number(document.getElementById("atConfReduce").value),
+    confidence_drop_exit: Number(document.getElementById("atConfExit").value),
+    edge_min_trades: Number(document.getElementById("atEdgeMinTrades").value),
+    edge_min_days: Number(document.getElementById("atEdgeMinDays").value),
+    edge_min_win_rate: Number(document.getElementById("atEdgeMinWin").value),
+  };
+  try {
+    const r = await apiFetch("/api/ai-autotrade/config", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    setN("atStatus", "Settings saved.");
+    setTimeout(() => setN("atStatus", ""), 1500);
+  } catch (e) { alert(e.message); }
+}
+
+function atFillConfigInputs(cfg) {
+  if (document.activeElement && document.activeElement.closest("#atAI .cfg-grid")) return; // don't clobber while typing
+  const map = {
+    atCapPaper: "capital_per_trade_paper", atCapLive: "capital_per_trade_live",
+    atMaxPos: "max_concurrent_positions", atSquareOff: "square_off_time",
+    atMaxLossPaper: "max_daily_loss_paper", atMaxLossLive: "max_daily_loss_live",
+    atMaxHold: "max_hold_minutes", atConfReduce: "confidence_drop_reduce",
+    atConfExit: "confidence_drop_exit", atEdgeMinTrades: "edge_min_trades",
+    atEdgeMinDays: "edge_min_days", atEdgeMinWin: "edge_min_win_rate",
+  };
+  for (const [id, key] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (el && cfg[key] != null) el.value = cfg[key];
+  }
+}
+
+function atRenderEdge(edge) {
+  setN("atEdgeTrades", edge.trades + " / " + (edge.required ? edge.required.edge_min_trades : "—"));
+  setN("atEdgeSpan", (edge.span_days || 0) + " / " + (edge.required ? edge.required.edge_min_days : "—") + " days");
+  setN("atEdgeWin", (edge.win_rate || 0) + "% (need " + (edge.required ? edge.required.edge_min_win_rate : "—") + "%)");
+  setN("atEdgeRPF", atFmtR(edge.avg_r) + " / PF " + (edge.profit_factor ?? "—"));
+
+  const labels = {
+    trades_ok: "Enough completed paper trades", span_ok: "Track record spans enough calendar days",
+    win_rate_ok: "Win rate at/above threshold", avg_r_ok: "Average R-multiple positive enough",
+    profit_factor_ok: "Profit factor at/above threshold"
+  };
+  const checks = edge.checks || {};
+  let html = "";
+  for (const [k, label] of Object.entries(labels)) {
+    const pass = checks[k];
+    html += `<div class="edge-check"><span>${label}</span><span class="${pass ? "ok" : "no"}">${pass ? "✓ PASS" : "— not yet"}</span></div>`;
+  }
+  document.getElementById("atEdgeChecklist").innerHTML = html || "<div class='ai-sub'>No data yet.</div>";
+
+  const verdictEl = document.getElementById("atEdgeVerdict");
+  if (edge.edge_confirmed) {
+    verdictEl.className = "warn-box-paper";
+    verdictEl.textContent = "✅ Edge confirmed — LIVE mode is unlocked. It still won't run until you switch to LIVE and explicitly ARM it.";
+  } else {
+    verdictEl.className = "warn-box-paper";
+    verdictEl.textContent = "🔒 LIVE mode is locked — " + (edge.reason || "keep paper trading to build an out-of-sample track record.");
+  }
+}
+
+function atRenderSignals(symbols, openPositions) {
+  const openBySymbol = {};
+  (openPositions || []).forEach(p => { openBySymbol[p.symbol] = p; });
+  let html = "";
+  (symbols || []).forEach(sym => {
+    const pos = openBySymbol[sym];
+    if (pos) {
+      const pnl = pos.unrealized_pnl;
+      html += `<div class="ai-card" style="margin-bottom:0">
+        <div class="ai-sub">${atEsc(sym)}</div>
+        <div style="font-size:15px;font-weight:800;margin-top:4px">IN POSITION — ${atEsc(pos.option_symbol)}</div>
+        <div class="ai-sub" style="margin-top:4px">Mode: ${atEsc((pos.execution_mode||"paper").toUpperCase())} · Entry ${fmtMoney(pos.entry)} · LTP ${fmtMoney(pos.last_ltp)}</div>
+        <div style="margin-top:6px;font-weight:800;color:${pnl >= 0 ? "#72e0ad" : "#ff8e9c"}">${fmtMoney(pnl)}</div>
+      </div>`;
+    } else {
+      html += `<div class="ai-card" style="margin-bottom:0">
+        <div class="ai-sub">${atEsc(sym)}</div>
+        <div style="font-size:15px;font-weight:800;margin-top:4px">Scanning…</div>
+        <div class="ai-sub" style="margin-top:4px">No open automatic position. Waiting for a strong, executable directional signal.</div>
+      </div>`;
+    }
+  });
+  document.getElementById("atSignalBoard").innerHTML = html;
+}
+
+function atRenderOpenTable(rows) {
+  const tbody = document.getElementById("atOpenTable");
+  if (!rows || !rows.length) { tbody.innerHTML = '<tr><td colspan="11">No open automatic positions.</td></tr>'; return; }
+  tbody.innerHTML = rows.map(t => `<tr>
+    <td>${fmtTime(t.ts)}</td>
+    <td>${atEsc(t.symbol)}</td>
+    <td>${atEsc((t.execution_mode||"").toUpperCase())}</td>
+    <td>${atEsc(t.option_symbol)}</td>
+    <td>${t.qty}</td>
+    <td>${fmtMoney(t.entry)}</td>
+    <td>${fmtMoney(t.last_ltp)}</td>
+    <td>${fmtMoney(t.stop)}</td>
+    <td>${fmtMoney(t.target)}</td>
+    <td style="color:${(t.unrealized_pnl||0) >= 0 ? "#72e0ad" : "#ff8e9c"}">${fmtMoney(t.unrealized_pnl)}</td>
+    <td>${atEsc(t.exit_reason || "—")}</td>
+  </tr>`).join("");
+}
+
+function atRenderTradesTable(rows) {
+  const tbody = document.getElementById("atTradesTable");
+  if (!rows || !rows.length) { tbody.innerHTML = '<tr><td colspan="11">No automatic trades yet.</td></tr>'; return; }
+  tbody.innerHTML = rows.map(t => `<tr>
+    <td>${fmtTime(t.ts)}</td>
+    <td>${atEsc(t.symbol)}</td>
+    <td>${atEsc((t.execution_mode||"").toUpperCase())}</td>
+    <td>${atEsc(t.option_symbol)}</td>
+    <td>${t.qty}</td>
+    <td>${fmtMoney(t.entry)}</td>
+    <td>${t.exit != null ? fmtMoney(t.exit) : "—"}</td>
+    <td style="color:${(t.pnl||0) >= 0 ? "#72e0ad" : "#ff8e9c"}">${fmtMoney(t.pnl)}</td>
+    <td>${atFmtR(t.r_multiple)}</td>
+    <td>${atEsc(t.status)}</td>
+    <td>${atEsc(t.exit_reason || "—")}</td>
+  </tr>`).join("");
+}
+
+function atRenderActionsTable(rows) {
+  const tbody = document.getElementById("atActionsTable");
+  if (!rows || !rows.length) { tbody.innerHTML = '<tr><td colspan="8">No decisions logged yet.</td></tr>'; return; }
+  tbody.innerHTML = rows.map(a => `<tr>
+    <td>${fmtTime(a.ts)}</td>
+    <td>${atEsc(a.symbol)}</td>
+    <td><b>${atEsc(a.action)}</b></td>
+    <td>${atEsc(a.reason || "—")}</td>
+    <td>${fmtMoney(a.ltp)}</td>
+    <td style="color:${(a.unrealized_pnl||0) >= 0 ? "#72e0ad" : "#ff8e9c"}">${a.unrealized_pnl != null ? fmtMoney(a.unrealized_pnl) : "—"}</td>
+    <td>${a.p_up != null ? Number(a.p_up).toFixed(3) : "—"}</td>
+    <td>${a.ensemble_conf != null ? Number(a.ensemble_conf).toFixed(3) : "—"}</td>
+  </tr>`).join("");
+}
+
+function atRenderLearningStatus(prog, st) {
+  prog = prog || {}; st = st || {};
+  const hp = prog.historical || {};
+  const dp = prog.dl || {};
+  const lp = prog.live || {};
+  const hg = st.historical_gru || {};
+  const model = hp.model || {};
+
+  const gruSamples = Number(dp.samples || hg.samples || model.samples || 0);
+  const gruAcc = dp.accuracy ?? hg.accuracy ?? model.accuracy;
+  const gruAuc = dp.auc ?? hg.auc ?? model.auc;
+  const histStatus = String(dp.status || hg.status || hp.status || st.historical_status || "WAITING");
+  const histProgress = Math.max(0, Math.min(100, Number(dp.progress ?? hp.progress ?? 0)));
+  const mlSamples = Number(lp.ml_samples ?? st.ml_samples ?? 0);
+  const dlSamples = Number(lp.dl_samples ?? st.dl_samples ?? 0);
+  const warmup = st.adaptive_min_score ?? prog.adaptive_min_score;
+  const lastTrain = st.hist_last_train_at || hp.last_train_at || model.updated_at || null;
+
+  let status = "WAITING FOR DATA";
+  if (/ERROR|FAILED/i.test(histStatus)) status = "⚠ TRAINING ERROR";
+  else if (/TRAINING|BUILDING|COLLECTING/i.test(histStatus)) status = "🟡 TRAINING";
+  else if (/PRETRAINED|TRAINED/i.test(histStatus) || gruSamples > 0) status = "🟢 TRAINED & LEARNING";
+  else if (histProgress > 0) status = "🟡 LEARNING";
+  setN("atTrainStatus", status);
+
+  setN("atGRU", gruSamples ? gruSamples.toLocaleString("en-IN") + " samples" : "0 · NOT TRAINED");
+  setN("atGRUAccuracy", gruAcc == null ? "—" : Number(gruAcc).toFixed(1) + "%");
+  setN("atGRUAUC", gruAuc == null || !isFinite(Number(gruAuc)) ? "—" : Number(gruAuc).toFixed(3));
+  setN("atLiveML", mlSamples.toLocaleString("en-IN"));
+  setN("atLiveDL", dlSamples.toLocaleString("en-IN"));
+  setN("atWarmup", warmup != null ? Number(warmup).toFixed(1) + "/100" : "—");
+  setN("atHistLastTrain", lastTrain ? atFormatLearningTime(lastTrain) : "Not trained yet");
+
+  const liveProgress = Math.min(100, Number(lp.progress || 0));
+  const stages = [
+    ["Historical GRU pre-training", histProgress, `${histStatus} · ${gruSamples.toLocaleString("en-IN")} sequences`],
+    ["Live paper + live evidence", liveProgress, `${mlSamples.toLocaleString("en-IN")} ML / ${dlSamples.toLocaleString("en-IN")} DL samples (includes this engine's trades)`],
+  ];
+  const box = document.getElementById("atLearningStages");
+  if (box) {
+    box.innerHTML = stages.map(x => `<div style="margin-bottom:11px"><div class="stage"><b>${atEsc(x[0])}</b><span>${Number(x[1]).toFixed(1)}% · ${atEsc(x[2])}</span></div><div class="bar"><i style="width:${Math.max(0, Math.min(100, Number(x[1]) || 0))}%"></i></div></div>`).join("");
+  }
+
+  const detail = document.getElementById("atLearningDetail");
+  if (detail) {
+    const histText = hp.status || st.hist_status || histStatus;
+    detail.textContent = `Historical: ${histText}. The Auto Buy/Sell engine uses the shared GRU/ML pipeline; completed paper and live trades are added as new evidence. Detailed per-model validation remains on the AI Evolution Engine tab.`;
+  }
+}
+
+function atFormatLearningTime(v) {
+  try {
+    const d = new Date(v);
+    if (isNaN(d.getTime())) return String(v);
+    return d.toLocaleString("en-IN", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"});
+  } catch(e) { return String(v); }
+}
+
+
+function atRenderVisualDashboard(state, prog, st) {
+  state = state || {}; prog = prog || {}; st = st || {};
+  const cfg = state.config || {};
+  const edge = state.edge_status || {};
+  const hp = prog.historical || {}; const dp = prog.dl || {}; const lp = prog.live || {};
+  const hg = st.historical_gru || {};
+  const symbol = (state.symbols && state.symbols[0]) || (state.open_positions && state.open_positions[0] && state.open_positions[0].symbol) || "INDEX";
+  const pUp = Number(st.up_probability);
+  const hasP = Number.isFinite(pUp) && pUp >= 0 && pUp <= 1;
+  const upGate = Number(st.up_probability); const downGate = Number(st.down_probability);
+  let decision = "WAIT", note = state.market_open ? "NO EXECUTABLE SIGNAL" : "NO LIVE DATA";
+  if (state.market_open && hasP) {
+    if (pUp >= upGate && pUp > 0.5) { decision = "BUY CE"; note = "INDEX BIAS UP"; }
+    else if (pUp <= downGate && pUp < 0.5) { decision = "BUY PE"; note = "INDEX BIAS DOWN"; }
+    else { decision = "WAIT"; note = "MODEL UNCERTAIN"; }
+  }
+  const pct = hasP ? pUp * 100 : 0;
+  const ring = hasP ? Math.max(0,Math.min(360,pct/100*360)) : 0;
+  const ringEl=document.getElementById("atvRing"); if(ringEl) ringEl.style.setProperty("--ring",ring+"deg");
+  setN("atvDecision",decision); setN("atvProb",hasP?`P(UP) ${pct.toFixed(1)}%`:"P(UP) —"); setN("atvDecisionNote",note); setN("atvIndex",symbol);
+  const regime = (st.research_ensemble && st.research_ensemble.regime) || "—";
+  setN("atvRegime",String(regime).replace(/_/g," ").toUpperCase());
+  const edgeText=edge.edge_confirmed?"CONFIRMED":((edge.win_rate!=null)?`${Number(edge.win_rate).toFixed(1)}% WIN`:"—"); setN("atvEdge",edgeText);
+  const live=cfg.execution_mode === "live"; const armed=!!cfg.armed;
+  setN("atvEngineStatus",`● ${armed?"ARMED":"DISARMED"} · ${live?"LIVE":"PAPER"}`); setN("atvMode",live?"LIVE":"PAPER / TRACK");
+  setN("atvPositions",`${(state.open_positions||[]).length} / ${cfg.max_concurrent_positions || 3}`);
+  const pnl=Number(state.today_pnl && state.today_pnl.paper || 0); setN("atvPnl",fmtMoney(pnl)); setN("atvPnlPct",pnl>=0?"Paper track positive":"Paper track negative");
+  setN("atvWin",edge.win_rate!=null?Number(edge.win_rate).toFixed(1)+"%":"—"); setN("atvWinDetail",`${edge.trades||0} closed paper trades`); setN("atvRpf",`${edge.avg_r!=null?atFmtR(edge.avg_r):"—"} / ${edge.profit_factor!=null?"PF "+edge.profit_factor:"PF —"}`);
+  const lossLimit=live?(cfg.max_daily_loss_live||0):(cfg.max_daily_loss_paper||0); setN("atvLoss",`${fmtMoney(Math.max(0,-pnl))} / ${fmtMoney(lossLimit)}`);
+  const ml=st.live_ml_model_a||{}; const ens=st.research_ensemble||{}; const mlReady=Math.min(100,Number(ml.samples||0)/Math.max(1,Number((cfg.ml_min_samples||40)))*100); const warm=Number(st.adaptive_min_score); const warmPct=Number.isFinite(warm)?Math.max(0,Math.min(100,(warm-55)/17*100)):0;
+  const vals=[hasP?pct:null,ml.samples?mlReady:null,ens.probability!=null?Number(ens.probability)*100:null,warmPct];
+  [["atvGruBar","atvGruVal",vals[0]],["atvMlBar","atvMlVal",vals[1]],["atvEnsBar","atvEnsVal",vals[2]],["atvWarmBar","atvWarmVal",vals[3]]].forEach(([b,v,x])=>{const be=document.getElementById(b),ve=document.getElementById(v);if(be)be.style.width=(x==null?0:x)+"%";if(ve)ve.textContent=x==null?"—":x.toFixed(0)+"%";});
+  setN("atvAction",decision); setN("atvActionReason",decision==="WAIT"?note:"Directional AI signal ready for option selection");
+  const histSamples=Number(dp.samples||hg.samples||hp.model&&hp.model.samples||0); const acc=dp.accuracy ?? hg.accuracy ?? (hp.model && hp.model.accuracy); const auc=dp.auc ?? hg.auc ?? (hp.model && hp.model.auc); const histPct=Math.max(0,Math.min(100,Number(dp.progress??hp.progress??0))); const livePct=Math.max(0,Math.min(100,Number(lp.progress||0)));
+  setN("atvHistPct",histPct.toFixed(0)+"%"); setN("atvHistStatus",String(dp.status||hg.status||hp.status||"WAITING").replace(/_/g," ")); setN("atvHistSamples",histSamples?histSamples.toLocaleString("en-IN"):"—"); setN("atvHistAcc",acc==null?"—":Number(acc).toFixed(1)+"%"); setN("atvHistAuc",auc==null?"—":Number(auc).toFixed(3)); setN("atvLiveEvidence",`${Number(lp.ml_samples||0).toLocaleString("en-IN")} / ${Number(lp.dl_samples||0).toLocaleString("en-IN")}`); setN("atvLiveEvidenceSub","ML / DL samples"); setN("atvLearnWarm",Number.isFinite(warm)?warm.toFixed(1)+"/100":"—");
+  const hb=document.getElementById("atvHistBar"),lb=document.getElementById("atvLiveBar");if(hb)hb.style.width=histPct+"%";if(lb)lb.style.width=livePct+"%";setN("atvLivePct",livePct.toFixed(0)+"%");
+  const trained=/TRAINED|PRETRAINED/i.test(String(dp.status||hg.status||hp.status||""))||histSamples>0; setN("atvLearningBadge",trained?"● TRAINED & LEARNING":"● WAITING / TRAINING");
+  const now=new Date();setN("atvClock",now.toLocaleTimeString("en-IN",{hour12:false}));setN("atvDate",now.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}));setN("atvNextScan",state.market_open?"Live AI cycle active":"Market closed");
+  const open=state.open_positions&&state.open_positions[0]; const setup=open&&open.setup_json; let snap={}; try{snap=typeof setup==='string'?JSON.parse(setup||"{}"):setup||{}}catch(e){}
+  setN("atvSpot",snap.spot!=null?fmtMoney(snap.spot):"—");setN("atvVol",snap.volatility!=null?Number(snap.volatility).toFixed(2):"—");setN("atvPcr",snap.pcr!=null?Number(snap.pcr).toFixed(2):"—");setN("atvOption",open&&open.option_symbol?open.option_symbol:"—");setN("atvCeBias",decision==="BUY CE"?"BULLISH":"—");setN("atvPeBias",decision==="BUY PE"?"BEARISH":"—");setN("atvRadarCenter",state.market_open?symbol:"—");setN("atvRadarNote",state.market_open?(decision+" · AI"):"NO LIVE DATA");
+}
+
+function atFmtElapsed(sec){sec=Math.max(0,Math.floor(Number(sec)||0));const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;return (h?String(h).padStart(2,"0")+":" : "")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");}
+let atHistoricalTrainingPollBusy=false;
+let atHistoricalTrainingTimer=null;
+async function atReadHistoricalTraining(){
+  if(atHistoricalTrainingPollBusy)return null;
+  atHistoricalTrainingPollBusy=true;
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),8000);
+  try{
+    const r=await fetch("/api/ai-evolution/historical",{signal:controller.signal,cache:"no-store"});
+    const raw=await r.text();let d;
+    try{d=JSON.parse(raw)}catch(e){throw Error("Backend returned non-JSON (HTTP "+r.status+")")}
+    if(!r.ok)throw Error(d.error||d.message||"Request failed");
+    const active=String(d.training_active||"0")==="1";
+    const stalled=!!d.training_stalled;
+    const pct=Math.max(0,Math.min(100,Number(d.training_progress||0)));
+    const phase=String(d.training_phase||d.model_status||d.status||"IDLE");
+    const btn=document.getElementById("atRetrainBtn");
+    if(btn){btn.disabled=active;btn.textContent=active?(stalled?"⚠ TRAINING STALLED":"⏳ TRAINING IN PROGRESS"):"▶ RETRAIN HISTORICAL GRU";}
+    const st=document.getElementById("atRetrainStatus");
+    if(st){
+      if(stalled){const age=d.training_heartbeat_age_sec==null?"missing":Math.round(Number(d.training_heartbeat_age_sec||0))+"s old";st.textContent="Worker heartbeat is "+age+" — restart the backend, then retry.";}
+      else if(active)st.textContent=phase+" · worker heartbeat healthy";
+      else if(phase==="COMPLETE")st.textContent="Training complete — model statistics updated.";
+      else st.textContent=(d.training_error?phase+" · "+d.training_error:phase);
+    }
+    const pb=document.getElementById("atRetrainProgress");if(pb)pb.style.width=pct+"%";
+    const pp=document.getElementById("atRetrainPct");if(pp)pp.textContent=pct.toFixed(1)+"%";
+    setN("atRetrainPhase",phase.replace(/_/g," "));
+    setN("atRetrainEpoch",d.training_epochs?((d.training_epoch||0)+" / "+d.training_epochs):"—");
+    let elapsed=Number(d.training_elapsed_sec||0);
+    if(active&&d.training_started_at){const live=(Date.now()-new Date(d.training_started_at).getTime())/1000;if(Number.isFinite(live))elapsed=Math.max(elapsed,live);}
+    setN("atRetrainElapsed",atFmtElapsed(elapsed));
+    const ms=d.model||{};
+    const shownSamples=active?Number(d.training_samples||0):Number(ms.samples||d.training_samples||0);
+    setN("atRetrainSamples",shownSamples?shownSamples.toLocaleString("en-IN"):"—");
+    setN("atRetrainQuality",ms.accuracy!=null?(Number(ms.accuracy).toFixed(1)+"% / "+(ms.auc==null?"—":Number(ms.auc).toFixed(3))):"—");
+    const ql=document.getElementById("atRetrainQualityLabel");if(ql)ql.textContent=active?"CURRENT MODEL ACC / AUC":"NEW ACC / AUC";
+    return active;
+  }catch(e){
+    const st=document.getElementById("atRetrainStatus");if(st)st.textContent=(e.name==="AbortError"?"Backend status timed out — retrying…":"Backend status unavailable: "+(e.message||e));return false;
+  }finally{clearTimeout(timeout);atHistoricalTrainingPollBusy=false;}
+}
+async function atStartHistoricalRetrain(){const btn=document.getElementById("atRetrainBtn"),st=document.getElementById("atRetrainStatus");if(btn)btn.disabled=true;if(st)st.textContent="Starting historical GRU retraining…";try{const r=await fetch("/api/ai-evolution/historical/retrain",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});const raw=await r.text();let d;try{d=JSON.parse(raw)}catch(e){throw Error("Backend returned non-JSON (HTTP "+r.status+")")};if(!r.ok||d.ok===false)throw Error(d.message||d.error||"Retraining could not be started");await atReadHistoricalTraining();}catch(e){if(st)st.textContent="ERROR · "+e.message;if(btn)btn.disabled=false;}}
+function atStartTrainingHeartbeat(){atReadHistoricalTraining();if(!atHistoricalTrainingTimer)atHistoricalTrainingTimer=setInterval(atReadHistoricalTraining,2000);}
+
+async function refreshAutoTradeAI() {
+  try {
+    const state = await aiGet("/api/ai-autotrade/state");
+    atLastConfig = state.config;
+    const isLive = state.config.execution_mode === "live";
+    const armed = !!state.config.armed;
+
+    setN("atModePill", isLive ? "LIVE" : "PAPER");
+    document.getElementById("atModePill").style.color = isLive ? "#ff8e9c" : "#7ee2b1";
+    setN("atArmedPill", armed ? "ARMED" : "DISARMED");
+    document.getElementById("atArmedPill").style.color = armed ? "#7ee2b1" : "#ffc857";
+
+    document.getElementById("atPaperBtn").classList.toggle("active-mode", !isLive);
+    document.getElementById("atLiveBtn").classList.toggle("active-mode", isLive);
+
+    const banner = document.getElementById("atModeBanner");
+    if (isLive) {
+      banner.className = "warn-box-live";
+      banner.textContent = "🔴 LIVE MODE — armed = TRUE means real BUY/SELL orders are sent to Zerodha automatically, with no per-trade confirmation.";
+    } else {
+      banner.className = "warn-box-paper";
+      banner.textContent = "📝 PAPER MODE — no broker orders are sent. Every completed paper trade is fed back into the shared GRU/ML models as new learning data.";
+    }
+
+    setN("atMarketOpen", state.market_open ? "OPEN" : "CLOSED");
+    setN("atOpenCount", (state.open_positions || []).length);
+    setN("atPaperPnl", fmtMoney(state.today_pnl ? state.today_pnl.paper : 0));
+    setN("atLivePnl", fmtMoney(state.today_pnl ? state.today_pnl.live : 0));
+
+    atFillConfigInputs(state.config);
+    atRenderEdge(state.edge_status || {});
+    atRenderSignals(state.symbols, state.open_positions);
+    atRenderOpenTable(state.open_positions);
+
+    const [trades, actions, learnProg, evoStatus, histStatus] = await Promise.all([
+      aiGet("/api/ai-autotrade/trades?limit=50"),
+      aiGet("/api/ai-autotrade/actions?limit=80"),
+      aiGet("/api/ai-evolution/learning-progress"),
+      aiGet("/api/ai-evolution/directional-status"),
+      aiGet("/api/ai-evolution/historical")
+    ]);
+    atReadHistoricalTraining();
+    atRenderTradesTable(trades);
+    atRenderActionsTable(actions);
+    atRenderLearningStatus(learnProg, evoStatus);
+    atRenderVisualDashboard(state, learnProg, evoStatus);
+  } catch (e) {
+    console.error("[AUTOTRADE-AI] refresh failed:", e);
+    setN("atStatus", e.message || "Refresh failed");
+  }
+}
+</script>
+<script>document.addEventListener("DOMContentLoaded",atStartTrainingHeartbeat);</script>
+<script>setInterval(()=>{const b=document.getElementById("atRetrainBtn");if(b&&b.disabled)atReadHistoricalTraining();},1000);</script>
+
+<script>
+// ============================================================================
+// Long Straddle / Strangle ("Volatility Breakout") tab — fully self-contained,
+// independent of the Option-Selling Condor/Strangle tab's state and endpoints.
+// ============================================================================
+let mvCurrentMode = "straddle";
+let mvBuiltResult = null;
+let mvPayoffChartInstance = null;
+let mvSimBasis = null;  // {callStrike, putStrike, callIv, putIv, debit, quantity, spots, daysToExpiry}
+function mvEsc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ---------- Minimal client-side Black-Scholes (mirrors backend bs_price) so the DTE slider can
+// re-simulate the curve instantly, with no extra server round-trip per drag. ----------
+function mvErf(x) {
+  const sign = x < 0 ? -1 : 1; x = Math.abs(x);
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1) * t * Math.exp(-x*x);
+  return sign * y;
+}
+function mvNormCdf(x) { return 0.5 * (1 + mvErf(x / Math.sqrt(2))); }
+function mvBsPrice(S, K, T, r, sigma, isCall) {
+  if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) {
+    const intrinsic = isCall ? (S - K) : (K - S);
+    return Math.max(0, intrinsic);
+  }
+  const d1 = (Math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  if (isCall) return S * mvNormCdf(d1) - K * Math.exp(-r * T) * mvNormCdf(d2);
+  return K * Math.exp(-r * T) * mvNormCdf(-d2) - S * mvNormCdf(-d1);
+}
+function mvSimulatedCurve(daysToExpiry) {
+  if (!mvSimBasis) return [];
+  const T = Math.max(daysToExpiry, 0) / 365.0;
+  return mvSimBasis.spots.map(s => {
+    const value = mvBsPrice(s, mvSimBasis.callStrike, T, 0.07, mvSimBasis.callIv, true) +
+                  mvBsPrice(s, mvSimBasis.putStrike, T, 0.07, mvSimBasis.putIv, false);
+    return {spot: s, pnl: Math.round((value - mvSimBasis.debit) * mvSimBasis.quantity * 100) / 100};
+  });
+}
+
+function mvUpdateStrikeControls() {
+  const isStrangle = mvCurrentMode === "strangle";
+  const smart = document.getElementById("mvSelectionMode").value === "smart_delta";
+  document.getElementById("mvSelectionLabel").style.display = isStrangle ? "flex" : "none";
+  document.getElementById("mvTargetDeltaLabel").style.display = isStrangle && smart ? "flex" : "none";
+  document.getElementById("mvOtmWidthLabel").style.display = isStrangle && !smart ? "flex" : "none";
+}
+document.getElementById("mvSelectionMode").onchange = mvUpdateStrikeControls;
+
+document.getElementById("mvTypeStraddle").onclick = () => {
+  mvCurrentMode = "straddle";
+  document.getElementById("mvTypeStraddle").classList.add("active");
+  document.getElementById("mvTypeStrangle").classList.remove("active");
+  mvUpdateStrikeControls();
+};
+document.getElementById("mvTypeStrangle").onclick = () => {
+  mvCurrentMode = "strangle";
+  document.getElementById("mvTypeStrangle").classList.add("active");
+  document.getElementById("mvTypeStraddle").classList.remove("active");
+  mvUpdateStrikeControls();
+};
+
+function mvQuickSymbol(sym) { document.getElementById("mvSymbolInput").value = sym; }
+
+function mvUseSymbol(sym) {
+  document.getElementById("mvSymbolInput").value = sym;
+  document.getElementById("mvBuildBtn").click();
+}
+
+// ---------- Breakout Screener ----------
+async function mvRunScreener(force = false) {
+  const status = document.getElementById("mvScreenerStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
+  const maxSymbols = document.getElementById("mvMaxSymbols").value || 40;
+  const limit = document.getElementById("mvLimit").value || 20;
+  status.textContent = "Scanning F&O universe for squeeze/breakout setups — this can take 30-60s...";
+  try {
+    const qs = new URLSearchParams({limit, max_symbols: maxSymbols, force: force ? "true" : "false"});
+    const r = await apiFetch(`/api/move-screener?${qs}`);
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok || d.error) { status.textContent = "Error: " + (d.message || d.error || `HTTP ${r.status}`); return; }
+    const tbody = document.querySelector("#mvScreenerTable tbody");
+    tbody.innerHTML = "";
+    (d.stocks || []).forEach((s, i) => {
+      const sq = s.squeeze || {};
+      const squeezeTxt = sq.is_squeeze ? `<span class="pill ok">Squeeze</span>` : (sq.bb_width_percentile != null ? `${sq.bb_width_percentile}%ile width` : "—");
+      const nr7Txt = sq.is_nr7 ? " NR7" : "";
+      const adxTxt = sq.adx14 != null ? `${sq.adx14}${sq.adx_rising ? " ↑" : ""}${sq.low_adx_base ? " (low base)" : ""}` : "—";
+      const volTxt = sq.volume_dry_up ? "Dry-up" : sq.volume_pickup_today ? "Pickup" : (sq.volume_ratio_5v20 != null ? `${sq.volume_ratio_5v20}x` : "—");
+      const nearTxt = sq.near_breakout_trigger ? `<span class="pill warn">Near edge</span>` : "—";
+      const ivHv = s.iv_hv ? `${s.iv_hv.ratio} ${s.iv_hv.label || ""}` : "—";
+      const buyerValue = s.long_vol_value ? `${s.long_vol_value.label} (${s.iv_hv?.ratio ?? "—"}x)` : ivHv;
+      const gateClass = s.entry_status === "READY" ? "ok" : s.entry_status === "AVOID" ? "bad" : "warn";
+      const liquidityTxt = `${s.atm_spread_pct != null ? s.atm_spread_pct + "%" : "—"} / ${(s.atm_oi_total || 0).toLocaleString()}`;
+      const eventTxt = s.near_macro_event ? `<span class="pill warn">Macro event soon</span>` : "—";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${s.rank || i + 1}/${s.total || d.eligible_count || 0}</td>
+        <td><b>${s.symbol}</b>${s.fo_banned_today ? " 🚫" : ""}</td>
+        <td><span class="pill ${gateClass}">${s.entry_status || "WAIT"}</span></td>
+        <td><b>${s.move_score}</b> ${s.move_score_label || ""}</td>
+        <td>${squeezeTxt}${nr7Txt}</td><td>${adxTxt}</td><td>${volTxt}</td><td>${nearTxt}</td>
+        <td>${s.atm_iv_pct != null ? s.atm_iv_pct + "%" : "—"}</td><td>${buyerValue}</td><td>${liquidityTxt}</td>
+        <td>${s.suggested_mode}</td><td>${eventTxt}</td>
+        <td><button class="secondary small-btn" onclick="mvUseSymbol('${s.symbol}')">Use</button></td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById("mvScreenerTable").style.display = "table";
+    status.textContent = `${d.count} scanned → ${d.shortlisted} deep-evaluated → ${d.eligible_count} candidates. Showing top ${d.stocks?.length || 0}.` +
+      (d.evaluation_error_count ? ` ${d.evaluation_error_count} data issues.` : "");
+    const ex = document.getElementById("mvScreenerExcluded");
+    if (d.excluded_sample && d.excluded_sample.length) {
+      ex.textContent = "Excluded (sample): " + d.excluded_sample.map(x => x.symbol + (x.fo_banned_today ? " (banned)" : !x.liquidity_ok ? " (illiquid)" : "")).join(", ");
+      ex.style.display = "block";
+    } else ex.style.display = "none";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+document.getElementById("mvRunScreenerBtn").onclick = () => mvRunScreener(false);
+document.getElementById("mvRefreshScreenerBtn").onclick = () => mvRunScreener(true);
+
+// ---------- Expiry loading ----------
+document.getElementById("mvLoadExpiriesBtn").onclick = async () => {
+  const sym = document.getElementById("mvSymbolInput").value.trim().toUpperCase();
+  if (!sym) return;
+  const loggedIn = await checkSession();
+  if (!loggedIn) return;
+  try {
+    const r = await apiFetch(`/api/expiries/${sym}`);
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    const sel = document.getElementById("mvExpirySelect");
+    sel.innerHTML = `<option value="">Nearest (auto)</option>`;
+    d.expiries.forEach(e => {
+      const opt = document.createElement("option");
+      opt.value = e; opt.textContent = e;
+      sel.appendChild(opt);
+    });
+  } catch (e) { alert("Could not load expiries: " + e); }
+};
+
+// ---------- Build / Calculate ----------
+function mvFmtMoney(v) { return v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", {maximumFractionDigits: 2}); }
+
+document.getElementById("mvBuildBtn").onclick = async () => {
+  const sym = document.getElementById("mvSymbolInput").value.trim().toUpperCase();
+  const status = document.getElementById("mvStrategyStatus");
+  if (!sym) { status.textContent = "Enter a symbol first."; return; }
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first (top right)."; return; }
+  status.textContent = "Fetching option chain and computing strikes...";
+
+  const otmPct = (document.getElementById("mvOtmPctInput").value || 3) / 100;
+  const lots = document.getElementById("mvLotsInput").value || 1;
+  const expiry = document.getElementById("mvExpirySelect").value;
+  const selectionMode = document.getElementById("mvSelectionMode").value;
+  const targetDelta = document.getElementById("mvTargetDeltaInput").value || 0.30;
+  const maxRisk = document.getElementById("mvMaxRiskInput").value || 25000;
+
+  try {
+    const params = new URLSearchParams({mode: mvCurrentMode, otm_pct: otmPct, lots,
+      selection_mode: selectionMode, target_delta: targetDelta, max_risk_rupees: maxRisk});
+    if (expiry) params.append("expiry", expiry);
+    const r = await apiFetch(`/api/move-strategy/${sym}?${params}`);
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; document.getElementById("mvStrategyBox").style.display = "none"; return; }
+    mvBuiltResult = d;
+    status.textContent = "";
+    document.getElementById("mvStrategyBox").style.display = "block";
+    document.getElementById("mv_score_badge").textContent = `Move Score: ${d.move_score} (${d.move_score_label})`;
+    document.getElementById("mv_spot").textContent = d.spot;
+    document.getElementById("mv_expiry").textContent = d.expiry;
+    document.getElementById("mv_dte").textContent = d.days_to_expiry;
+    document.getElementById("mv_lot").textContent = d.lot_size;
+    document.getElementById("mv_lots").textContent = d.lots;
+    document.getElementById("mv_qty").textContent = d.quantity;
+
+    const legGrid = document.getElementById("mvLegGrid");
+    legGrid.innerHTML = "";
+    [["buy_call", "Buy Call"], ["buy_put", "Buy Put"]].forEach(([k, label]) => {
+      const lg = d.legs[k];
+      const div = document.createElement("div");
+      div.className = "leg-card";
+      div.innerHTML = `<div class="k">${label}</div><div style="font-size:14px;">Strike ${lg.strike}</div>
+        <div>Buy mark ₹${lg.entry_price} (${lg.pricing_source}) · Mid ₹${lg.mid}</div>
+        <div style="color:var(--muted); font-size:12px;">Bid/Ask ₹${lg.bid ?? "—"} / ₹${lg.ask ?? "—"} · Spread ${lg.spread_pct ?? "—"}%</div>
+        <div style="color:var(--muted); font-size:12px;">Δ ${lg.delta} · IV ${lg.iv}% · OI ${(lg.oi || 0).toLocaleString()} · Vol ${(lg.volume || 0).toLocaleString()}</div>`;
+      legGrid.appendChild(div);
+    });
+
+    document.getElementById("mv_debit").textContent = mvFmtMoney(d.max_loss) + ` (₹${d.net_debit_per_share}/share)`;
+    document.getElementById("mv_margin").textContent = d.margin_required != null ? mvFmtMoney(d.margin_required) : (d.margin_error || "—");
+    document.getElementById("mv_be").textContent = `${d.breakeven_lower} — ${d.breakeven_upper}`;
+    document.getElementById("mv_move_needed").textContent = `+${d.move_required_up_pct}% / -${d.move_required_down_pct}%`;
+    document.getElementById("mv_charges").textContent = mvFmtMoney(d.estimated_entry_charges?.total);
+    document.getElementById("mv_pricing").textContent = `Ask ₹${d.executable_debit_per_share} vs mid ₹${d.mid_debit_per_share} (+${d.entry_slippage_pct ?? "—"}%)`;
+    document.getElementById("mv_be_ratio").textContent = d.breakeven_expected_move_ratio != null ? `${d.breakeven_expected_move_ratio}×` : "—";
+    document.getElementById("mv_risk_budget").textContent = `${mvFmtMoney(d.max_risk_rupees)} · ${mvFmtMoney(d.risk_per_lot)}/lot · max ${d.recommended_lots} lot(s)`;
+    const rp = d.risk_plan || {};
+    document.getElementById("mv_exit_plan").textContent = `Target +${rp.profit_target_pct_of_debit ?? 40}% · Stop -${rp.stop_loss_pct_of_debit ?? 30}% · trail after +${rp.trail_activate_pct_of_debit ?? 25}% · time stop ${rp.time_stop_after_pct ?? 40}%/${rp.time_stop_if_move_below_pct ?? 35}%`;
+
+    const gate = d.entry_gate || {decision: "WAIT", blockers: [], warnings: []};
+    const gateColor = gate.decision === "ENTER" ? "#66d9a6" : gate.decision === "AVOID" ? "#ff7b89" : "#e0b25a";
+    const gateItems = [...(gate.blockers || []).map(x => `BLOCK: ${x}`), ...(gate.warnings || [])];
+    document.getElementById("mvEntryGate").innerHTML = `<div style="border:1px solid ${gateColor}; border-radius:8px; padding:10px 12px; color:${gateColor};">
+      <b>Entry Gate: ${gate.decision}</b> · ${gate.trade_ready ? "All execution checks passed." : "Tracking is allowed, but live entry is blocked until READY."}
+      ${gateItems.length ? `<ul style="margin:6px 0 0 18px; color:var(--muted);">${gateItems.map(x => `<li>${mvEsc(x)}</li>`).join("")}</ul>` : ""}</div>`;
+    const trackBtn = document.getElementById("mvTrackBtn");
+    trackBtn.textContent = gate.trade_ready ? "Track Ready Position" : "Track for Research (not executable)";
+
+    const warnDiv = document.getElementById("mv_warnings");
+    warnDiv.innerHTML = "";
+    if (d.entry_event_warning) warnDiv.innerHTML += `<div class="legend" style="color:#e0b25a;">⚠️ ${mvEsc(d.entry_event_warning)}</div>`;
+    if (d.event_before_expiry) warnDiv.innerHTML += `<div class="legend" style="color:#e0b25a;">⚠️ ${mvEsc(d.event_before_expiry.label)} on ${mvEsc(d.event_before_expiry.date)} (${d.event_before_expiry.days_away}d away) falls before this expiry.</div>`;
+
+    document.getElementById("mv_ins_score").textContent = `${d.move_score} — ${d.move_score_label}`;
+    document.getElementById("mv_ins_ivhv").textContent = d.iv_hv ? `${d.long_vol_value?.label || "—"} · ${d.iv_hv.ratio}x · ATM IV ${d.atm_iv_pct}% vs HV ${d.hv_annualized_pct}%` : "—";
+    document.getElementById("mv_ins_liquidity").textContent = `Call ${d.legs.buy_call.spread_pct ?? "—"}% / OI ${(d.legs.buy_call.oi || 0).toLocaleString()} · Put ${d.legs.buy_put.spread_pct ?? "—"}% / OI ${(d.legs.buy_put.oi || 0).toLocaleString()} · ${d.selection_used}`;
+    document.getElementById("mv_ins_em").textContent = d.expected_move_vs_breakeven || "—";
+    const sq = d.squeeze;
+    document.getElementById("mv_ins_squeeze").textContent = sq ? `${sq.is_squeeze ? "Squeeze" : "No squeeze"}${sq.is_nr7 ? " + NR7" : ""} (width %ile ${sq.bb_width_percentile})` : (d.squeeze_note || "—");
+    document.getElementById("mv_ins_trend").textContent = d.trend ? `${d.trend.regime} (ADX ${d.trend.adx14}, RSI ${d.trend.rsi14})` : "—";
+    document.getElementById("mv_ins_volregime").textContent = d.volatility_regime ? `${d.volatility_regime.label} (VIX ${d.volatility_regime.india_vix ?? "—"})` : "—";
+    document.getElementById("mv_ins_event").textContent = d.event_before_expiry ? `${d.event_before_expiry.label} (${d.event_before_expiry.days_away}d away)` : "None flagged";
+    document.getElementById("mv_ins_suggested").textContent = `${d.suggested_mode} — ${d.suggested_mode_reason}`;
+
+    const reasonsList = document.getElementById("mv_reasons");
+    reasonsList.innerHTML = "";
+    (d.move_reasons || []).forEach(r => {
+      const li = document.createElement("li");
+      li.textContent = r;
+      reasonsList.appendChild(li);
+    });
+
+    mvRenderPayoffChart(d);
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+function mvRenderPayoffChart(d) {
+  const ctx = document.getElementById("mvPayoffChart").getContext("2d");
+  if (mvPayoffChartInstance) mvPayoffChartInstance.destroy();
+  const spots = d.curve_at_expiry.map(pt => pt.spot);
+
+  // Basis for the DTE slider's live re-simulation. Works both for a freshly-built strategy
+  // (full leg detail available) and for a tracked position's live curve (curve endpoint now
+  // returns the same fields) — falls back to "no slider" if neither is present.
+  if (d.legs && d.legs.buy_call && d.legs.buy_put) {
+    mvSimBasis = {
+      callStrike: d.legs.buy_call.strike, putStrike: d.legs.buy_put.strike,
+      callIv: (d.legs.buy_call.iv || 20) / 100, putIv: (d.legs.buy_put.iv || 20) / 100,
+      debit: d.net_debit_per_share, quantity: d.quantity, spots, daysToExpiry: d.days_to_expiry,
+    };
+  } else if (d.call_strike != null) {
+    mvSimBasis = {
+      callStrike: d.call_strike, putStrike: d.put_strike,
+      callIv: (d.call_iv_pct || 20) / 100, putIv: (d.put_iv_pct || 20) / 100,
+      debit: d.entry_debit_per_share, quantity: d.quantity, spots, daysToExpiry: d.days_left,
+    };
+  } else {
+    mvSimBasis = null;
+  }
+
+  const slider = document.getElementById("mvDteSlider");
+  const sliderLabel = document.getElementById("mvDteSliderLabel");
+  if (mvSimBasis) {
+    slider.min = 0; slider.max = mvSimBasis.daysToExpiry; slider.value = mvSimBasis.daysToExpiry;
+    slider.disabled = false;
+    sliderLabel.textContent = `${mvSimBasis.daysToExpiry} (today)`;
+  } else {
+    slider.disabled = true;
+    sliderLabel.textContent = "unavailable for this chart";
+  }
+  const simCurve = mvSimBasis ? mvSimulatedCurve(mvSimBasis.daysToExpiry) : [];
+
+  mvPayoffChartInstance = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: spots,
+      datasets: [
+        {label: "P&L at Expiry", data: d.curve_at_expiry.map(pt => pt.pnl), borderColor: "#5ac8fa", backgroundColor: "rgba(90,200,250,0.08)", fill: true, pointRadius: 0, tension: 0.1},
+        {label: "P&L Today (model)", data: d.curve_today.map(pt => pt.pnl), borderColor: "#e0b25a", borderDash: [6, 4], pointRadius: 0, fill: false, tension: 0.1},
+        {label: "Simulated (slider)", data: simCurve.map(pt => pt.pnl), borderColor: "#c58af9", borderDash: [2, 3], pointRadius: 0, fill: false, tension: 0.1},
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: {mode: "index", intersect: false},
+      plugins: {
+        legend: {labels: {color: "#cfd8e3"}},
+        tooltip: {
+          callbacks: {
+            title: (items) => `Spot ₹${items[0].label}`,
+            label: (item) => `${item.dataset.label}: ₹${item.formattedValue}`,
+          }
+        }
+      },
+      scales: {
+        x: {ticks: {color: "#8892a0"}, grid: {color: "#232a35"}, title: {display: true, text: "Underlying Spot", color: "#8892a0"}},
+        y: {ticks: {color: "#8892a0"}, grid: {color: "#232a35"}, title: {display: true, text: "P&L (₹)", color: "#8892a0"}},
+      },
+      onHover: (event, elements, chart) => {
+        const readout = document.getElementById("mvCursorReadout");
+        if (!elements || !elements.length) return;
+        const idx = elements[0].index;
+        const spot = chart.data.labels[idx];
+        const parts = chart.data.datasets.map(ds => `${ds.label}: ₹${ds.data[idx]}`);
+        readout.textContent = `Spot ₹${spot}  →  ${parts.join("   |   ")}`;
+      },
+    }
+  });
+}
+
+document.getElementById("mvDteSlider").oninput = (e) => {
+  if (!mvSimBasis || !mvPayoffChartInstance) return;
+  const days = parseInt(e.target.value, 10);
+  document.getElementById("mvDteSliderLabel").textContent =
+    `${days}${days === mvSimBasis.daysToExpiry ? " (today)" : days === 0 ? " (expiry)" : ""}`;
+  const simCurve = mvSimulatedCurve(days);
+  mvPayoffChartInstance.data.datasets[2].data = simCurve.map(pt => pt.pnl);
+  mvPayoffChartInstance.update("none");
+};
+document.getElementById("mvDteResetBtn").onclick = () => {
+  if (!mvSimBasis) return;
+  document.getElementById("mvDteSlider").value = mvSimBasis.daysToExpiry;
+  document.getElementById("mvDteSlider").dispatchEvent(new Event("input"));
+};
+
+// ---------- Track position ----------
+document.getElementById("mvTrackBtn").onclick = async () => {
+  const sym = document.getElementById("mvSymbolInput").value.trim().toUpperCase();
+  const status = document.getElementById("mvTrackStatus");
+  if (!sym || !mvBuiltResult) { status.textContent = "Calculate a strategy first."; return; }
+  status.textContent = "Saving...";
+  const otmPct = (document.getElementById("mvOtmPctInput").value || 3) / 100;
+  const lots = document.getElementById("mvLotsInput").value || 1;
+  const expiry = document.getElementById("mvExpirySelect").value || null;
+  const selectionMode = document.getElementById("mvSelectionMode").value;
+  const targetDelta = document.getElementById("mvTargetDeltaInput").value || 0.30;
+  const maxRisk = document.getElementById("mvMaxRiskInput").value || 25000;
+  try {
+    const r = await apiFetch("/api/move-watchlist/add", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({symbol: sym, mode: mvCurrentMode, otm_pct: otmPct, lots, expiry,
+        selection_mode: selectionMode, target_delta: targetDelta, max_risk_rupees: maxRisk})
+    });
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    status.textContent = "Tracked. See Open Positions section below.";
+    mvLoadWatchlist();
+  } catch (e) { status.textContent = "Request failed: " + e; }
+};
+
+// ---------- Open Positions ----------
+function mvZonePill(zone) {
+  if (zone === "past_breakeven") return `<span class="pill ok">Past breakeven</span>`;
+  if (zone === "moving") return `<span class="pill warn">Moving, not there yet</span>`;
+  if (zone === "between_strikes") return `<span class="pill warn">Between strikes (theta bleed)</span>`;
+  if (zone === "near_expiry") return `<span class="pill bad">Near expiry</span>`;
+  return `<span class="pill warn">Unknown</span>`;
+}
+
+async function mvLoadWatchlist() {
+  const status = document.getElementById("mvWatchlistStatus");
+  const loggedIn = await checkSession();
+  if (!loggedIn) { status.textContent = "Connect your Kite account first."; return; }
+  status.textContent = "Refreshing against today's market data...";
+  try {
+    const r = await apiFetch("/api/move-watchlist");
+    const d = await r.json();
+    if (d.error) { status.textContent = "Error: " + d.error; return; }
+    const tbody = document.querySelector("#mvWatchlistTable tbody");
+    tbody.innerHTML = "";
+    if (!d.positions.length) {
+      document.getElementById("mvWatchlistTable").style.display = "none";
+      document.getElementById("mvWatchlistEmpty").style.display = "block";
+      status.textContent = "";
+      return;
+    }
+    document.getElementById("mvWatchlistEmpty").style.display = "none";
+    d.positions.forEach(p => {
+      const typeLabel = p.strategy_type === "long_strangle" ? "Strangle" : "Straddle";
+      const qty = p.quantity || p.lot_size;
+      const tr = document.createElement("tr");
+      if (p.mtm_error) {
+        tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot ?? "-"}</td>
+                        <td colspan="9" style="color:var(--red);">${p.mtm_error}</td>
+                        <td><button class="secondary small-btn" onclick="mvRemovePosition('${p.id}')">Remove</button></td>`;
+        tbody.appendChild(tr);
+        return;
+      }
+      const pnlClass = p.current.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+      const netPnlClass = p.current.net_pnl_after_charges >= 0 ? "pnl-pos" : "pnl-neg";
+      let zoneCell = mvZonePill(p.current.zone);
+      if (p.current.exit_suggested) {
+        const reasonsAttr = (p.current.exit_reasons || []).join(" ").replace(/"/g, "&quot;");
+        zoneCell += ` <span class="pill bad" title="${reasonsAttr}">Action suggested</span>`;
+      }
+      if (p.current.event_before_expiry) {
+        const ev = p.current.event_before_expiry;
+        zoneCell += ` <span class="pill warn" title="${ev.label} on ${ev.date}">Event in ${ev.days_away}d</span>`;
+      }
+      const digest = p.current.digest;
+      if (digest) {
+        const digestPillClass = {EXIT_NOW: "bad", EXIT_SOON: "bad", BOOK_PROFIT: "warn",
+                                  HOLD_FOR_EVENT: "ok", HOLD: "ok"}[digest.action] || "warn";
+        zoneCell += ` <span class="pill ${digestPillClass}" title="${(digest.headline || "").replace(/"/g, "&quot;")}">${digest.action.replace(/_/g, " ")}</span>`;
+      }
+      const detailId = `mv_legdetail_${p.id}`;
+      const brokerOrders = p.broker_orders || [];
+      const activeEntryLegs = new Set(brokerOrders.filter(o => o.transaction_type === "BUY" && ["placed", "pending", "filled"].includes(o.status)).map(o => o.leg));
+      const filledEntryLegs = new Set(brokerOrders.filter(o => o.transaction_type === "BUY" && o.status === "filled").map(o => o.leg));
+      const activeClose = brokerOrders.some(o => o.transaction_type === "SELL" && ["placed", "pending", "filled"].includes(o.status));
+      const entryReady = (p.entry_gate ? !!p.entry_gate.trade_ready : true) && activeEntryLegs.size === 0;
+      const canClose = filledEntryLegs.has("buy_call") && filledEntryLegs.has("buy_put") && !activeClose;
+      if (filledEntryLegs.has("buy_call") && filledEntryLegs.has("buy_put")) zoneCell += ` <span class="pill ok">Broker filled</span>`;
+      else if (activeEntryLegs.size) zoneCell += ` <span class="pill warn">Entry pending/partial</span>`;
+      else zoneCell += ` <span class="pill warn">Research only</span>`;
+      const peakTxt = `${mvFmtMoney(p.current.peak_pnl)} / ${mvFmtMoney(p.current.giveback_from_peak)} back`;
+      tr.innerHTML = `<td>${p.symbol}</td><td>${typeLabel}</td><td>${qty}</td><td>${p.entry_spot}</td><td>${p.current.spot}</td>
+                      <td>${p.current.days_left}</td>
+                      <td>₹${p.current.current_position_value}</td>
+                      <td class="${pnlClass}">₹${p.current.pnl}</td>
+                      <td class="${netPnlClass}" title="After estimated round-trip charges: ₹${p.current.estimated_round_trip_charges}">₹${p.current.net_pnl_after_charges}</td>
+                      <td>${p.current.pct_of_debit ?? "-"}%</td>
+                      <td title="Peak P&amp;L / giveback from peak">${peakTxt}</td>
+                      <td>₹${p.entry_max_loss}</td>
+                      <td>${zoneCell}</td>
+                      <td>
+                        <div class="action-cell">
+                          <button class="secondary small-btn" onclick="mvToggleLegDetail('${detailId}')">Prices</button>
+                          <button class="secondary small-btn" onclick="mvShowLiveCurve('${p.id}')">Live Chart</button>
+                          <button class="small-btn" onclick="mvExecutePosition('${p.id}')" ${entryReady ? "" : "disabled"} title="${entryReady ? "Entry gate READY" : "Live entry blocked: tracked for research only"}">Execute</button>
+                          <button class="danger small-btn" onclick="mvClosePosition('${p.id}')" ${canClose ? "" : "disabled"} title="${canClose ? "Both entry legs filled" : "Close enabled only after both recorded BUY fills; reconcile manual/partial trades at broker"}">Close</button>
+                          <button class="secondary small-btn" onclick="mvRemovePosition('${p.id}')">Remove</button>
+                        </div>
+                      </td>`;
+      tbody.appendChild(tr);
+
+      const detailTr = document.createElement("tr");
+      detailTr.id = detailId;
+      detailTr.style.display = "none";
+      const legLabels = {buy_call: "Buy Call", buy_put: "Buy Put"};
+      let legHtml = `<td colspan="14"><div style="display:flex; gap:20px; padding:10px 0; flex-wrap:wrap;">`;
+      Object.keys(legLabels).forEach(k => {
+        const lg = p.current.legs_current && p.current.legs_current[k];
+        if (!lg) return;
+        const legPnlClass = lg.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+        const deltaLine = lg.current_delta !== undefined ? `<div style="color:var(--muted); font-size:11px;">Current delta: ${lg.current_delta}</div>` : "";
+        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:8px 12px; min-width:190px;">
+                      <div style="color:var(--muted); font-size:11px;">${legLabels[k]} (strike ${lg.strike})</div>
+                      <div style="font-size:13px;">Entry Ask ₹${lg.entry_price} → executable ${lg.price_source} ₹${lg.current_price}</div>
+                      <div style="color:var(--muted); font-size:11px;">Bid/Ask ₹${lg.bid ?? "—"} / ₹${lg.ask ?? "—"} · spread ${lg.spread_pct ?? "—"}%</div>
+                      <div class="${legPnlClass}" style="font-size:13px;">P&amp;L ₹${lg.pnl}</div>
+                      ${deltaLine}
+                    </div>`;
+      });
+      if (digest) {
+        const reasonsHtml = (digest.reasons || []).map(r => `<li>${r}</li>`).join("");
+        legHtml += `<div style="background:#0f1115; border-radius:6px; padding:10px 14px; min-width:320px; flex:1;">
+                      <div style="color:var(--muted); font-size:11px; margin-bottom:4px;">Today's read: ${digest.action.replace(/_/g, " ")}</div>
+                      <div style="font-size:13px; font-weight:600;">${digest.headline}</div>
+                      <ul style="margin:6px 0 6px 16px; padding:0; font-size:12px; color:var(--muted);">${reasonsHtml}</ul>
+                      <div style="font-size:12px;"><b>Tomorrow:</b> ${digest.tomorrow_outlook || "—"}</div>
+                      <div style="color:var(--muted); font-size:11px; margin-top:6px;">
+                        Move realized ${digest.realized_move_pct ?? "-"}%${digest.move_progress_pct != null ? ` (${digest.move_progress_pct}% of entry-expected move)` : ""} ·
+                        Time elapsed ${digest.time_progress_pct ?? "-"}% of window ·
+                        IV ${digest.entry_atm_iv_pct ?? "-"} → ${digest.atm_iv_now ?? "-"}${digest.iv_change_pct != null ? ` (${digest.iv_change_pct > 0 ? "+" : ""}${digest.iv_change_pct}%)` : ""} ·
+                        Peak ${mvFmtMoney(digest.peak_pnl)} · Giveback ${mvFmtMoney(digest.giveback_from_peak)}${digest.trail_active ? " · Trail active" : ""} ·
+                        Momentum: ${digest.momentum} · Event: ${digest.event_status.replace(/_/g, " ")}
+                      </div>
+                    </div>`;
+      }
+      legHtml += `</div></td>`;
+      detailTr.innerHTML = legHtml;
+      tbody.appendChild(detailTr);
+    });
+    document.getElementById("mvWatchlistTable").style.display = "table";
+    status.textContent = "Updated just now.";
+  } catch (e) { status.textContent = "Request failed: " + e; }
+}
+document.getElementById("mvRefreshWatchlistBtn").onclick = mvLoadWatchlist;
+
+function mvToggleLegDetail(detailId) {
+  const el = document.getElementById(detailId);
+  if (el) el.style.display = el.style.display === "none" ? "table-row" : "none";
+}
+
+async function mvRemovePosition(id) {
+  await apiFetch(`/api/move-watchlist/${id}`, {method: "DELETE"});
+  mvLoadWatchlist();
+}
+
+async function mvShowLiveCurve(id) {
+  try {
+    const r = await apiFetch(`/api/move-watchlist/${id}/curve`);
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    document.getElementById("mvStrategyBox").style.display = "block";
+    document.getElementById("mvStrategyBox").scrollIntoView({behavior: "smooth"});
+    mvRenderPayoffChart({
+      curve_at_expiry: d.curve, curve_today: d.curve,
+      call_strike: d.call_strike, put_strike: d.put_strike,
+      call_iv_pct: d.call_iv_pct, put_iv_pct: d.put_iv_pct,
+      quantity: d.quantity, entry_debit_per_share: d.entry_debit_per_share, days_left: d.days_left,
+    });
+  } catch (e) { alert("Could not load live curve: " + e); }
+}
+
+// ---------- Execute / Close (simplified, explicit-confirmation flow) ----------
+async function mvExecutePosition(id) {
+  const loggedIn = await checkSession();
+  if (!loggedIn) { alert("Connect your Kite account first."); return; }
+  try {
+    const r = await apiFetch(`/api/move-execute/${id}/preview`);
+    const d = await r.json();
+    if (d.error) { alert(d.error + (d.blockers?.length ? "\n\n" + d.blockers.join("\n") : "")); return; }
+    const lines = d.orders.map(o => `${o.transaction_type} ${o.tradingsymbol} x${o.quantity} @ ~₹${o.recommended_limit_price ?? o.ltp ?? "MARKET"} (${o.price_source})`).join("\n");
+    const ok = confirm(`This will place REAL orders on your Zerodha account:\n\n${lines}\n\n${d.warning}\n\nProceed with LIMIT orders at the prices shown?`);
+    if (!ok) return;
+    const orders = d.orders.map(o => ({leg: o.leg, tradingsymbol: o.tradingsymbol, transaction_type: o.transaction_type, quantity: o.quantity, price: o.recommended_limit_price}));
+    const cr = await apiFetch(`/api/move-execute/${id}/confirm`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirmed: true, product: "NRML", order_type: "LIMIT", orders})
+    });
+    const cd = await cr.json();
+    alert(cd.note || JSON.stringify(cd));
+    mvLoadWatchlist();
+  } catch (e) { alert("Execution failed: " + e); }
+}
+
+async function mvClosePosition(id) {
+  const loggedIn = await checkSession();
+  if (!loggedIn) { alert("Connect your Kite account first."); return; }
+  try {
+    const r = await apiFetch(`/api/move-execute/${id}/close/preview`);
+    const d = await r.json();
+    if (d.error) { alert(d.error + (d.blockers?.length ? "\n\n" + d.blockers.join("\n") : "")); return; }
+    const lines = d.orders.map(o => `${o.transaction_type} ${o.tradingsymbol} x${o.quantity} @ ₹${o.reference_price ?? "—"} LIMIT (${o.price_source || "BID"})`).join("\n");
+    const ok = confirm(`This will CLOSE the position (real orders):\n\n${lines}\n\n${d.warning}\n\nProceed with the displayed marketable LIMIT orders?`);
+    if (!ok) return;
+    const orders = d.orders.map(o => ({leg: o.leg, tradingsymbol: o.tradingsymbol,
+      transaction_type: o.transaction_type, quantity: o.quantity, price: o.reference_price,
+      reference_price: o.reference_price, entry_price: o.entry_price}));
+    const cr = await apiFetch(`/api/move-execute/${id}/close/confirm`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirmed: true, product: "NRML", order_type: "LIMIT", orders})
+    });
+    const cd = await cr.json();
+    alert(cd.note || JSON.stringify(cd));
+    mvLoadWatchlist();
+  } catch (e) { alert("Close failed: " + e); }
+}
+
+// Load tracked positions once the person actually opens this tab (cheap, no harm doing it now too).
+mvLoadWatchlist();
 </script>
 
 </body>
