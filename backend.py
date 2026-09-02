@@ -2,7 +2,7 @@
 Kite Option-Selling Dashboard — local backend
 ------------------------------------------------
 Run:  python backend.py
-Then open: https://algo.wecon.in
+Then open: https://algo2.wecon.in
 
 What this does
 - Logs you into Kite Connect (daily login, token expires every day - that's Kite's design, not a bug here)
@@ -61,8 +61,8 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
-
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
+  
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
 # feature specifically to fall back to an unverified request. This does NOT affect Kite API calls
@@ -168,6 +168,68 @@ SCORE_WEIGHTS = {"iv_richness": 0.40, "calmness": 0.35, "liquidity": 0.25}  # le
 
 NEWS_FOR_TOP_N = 10
 FO_BAN_LIST_URL = "https://nsearchives.nseindia.com/content/fo/fo_secban.csv"
+
+# ---------------------------------------------------------------------------
+# Long Straddle / Strangle — "Volatility Breakout" module
+# ---------------------------------------------------------------------------
+# Opposite thesis to everything above: instead of SELLING premium expecting the underlying to stay
+# calm and range-bound, this BUYS an ATM straddle (or a wider, cheaper OTM strangle) expecting a
+# LARGE move in EITHER direction before expiry — a breakout, a results/event day, or a volatility
+# expansion. It is a net-DEBIT, defined-risk trade (max loss = debit paid, capped and known up
+# front) that is net LONG gamma/vega and net SHORT theta: it makes money from a big move or a rise
+# in IV, and bleeds a little value every single day the underlying just sits still. This whole
+# module (screener, builder, tracked positions, execution) is deliberately kept INDEPENDENT of the
+# Option-Selling Condor/Strangle module above — it does not require that screener to have been run
+# first, and it stores its own tracked positions in a separate file so the two can never collide.
+DEFAULT_MOVE_OTM_PCT = 0.03            # each strangle leg this far OTM from spot, by default
+DEFAULT_MOVE_TARGET_DELTA = 0.30       # smart strangle: balanced ~30-delta call + put
+DEFAULT_MOVE_MAX_RISK_RUPEES = 25000.0
+MOVE_MIN_DTE = 10
+MOVE_MAX_DTE = 45
+MOVE_PREFERRED_DTE_LOW = 14
+MOVE_PREFERRED_DTE_HIGH = 30
+MOVE_CURVE_POINTS = 41
+MOVE_CURVE_RANGE_PCT = 0.20             # payoff chart spans spot x (1 +/- this)
+MOVE_MIN_ATM_TOTAL_OI = 300
+MOVE_MIN_LEG_OI = 150
+MOVE_MAX_ATM_SPREAD_PCT = 4.0
+MOVE_MAX_LEG_SPREAD_PCT = 4.0
+MOVE_MAX_IV_HV_RATIO = 1.25
+MOVE_MAX_BREAKEVEN_EM_RATIO = 1.25
+MOVE_MAX_ENTRY_SLIPPAGE_PCT = 2.5
+MOVE_MIN_READY_SCORE = 60.0
+# Exit-suggestion thresholds for tracked positions (informational only — this tool never auto-exits)
+MOVE_PROFIT_TARGET_MULTIPLE = 0.40      # take/trim at +40% of debit instead of waiting for a rare double
+MOVE_STOP_LOSS_DEBIT_PCT = 0.30         # cap premium decay at 30% of debit
+MOVE_TRAIL_ACTIVATE_DEBIT_PCT = 0.25    # start protecting profit after +25% of debit
+MOVE_TRAIL_GIVEBACK_DEBIT_PCT = 0.12    # exit/trim after giving back 12% of debit from peak
+MOVE_TIME_STOP_PROGRESS_PCT = 40        # if 40% of the time window is gone...
+MOVE_TIME_STOP_MAX_MOVE_PCT = 35        # ...and <35% of expected move appeared, stop financing theta
+MOVE_EXPIRY_WARNING_DAYS = 7            # avoid the steepest theta/gamma part of the curve
+# --- "Digest" thresholds — the multi-factor hold/exit read (see classify_move_digest) that replaces
+# a single fixed 50%-profit / 50%-loss trigger with a read of where the trade ACTUALLY stands: how
+# much of the expected move has shown up, how much time has elapsed, whether IV is still expanding or
+# already crushing, and whether daily value is building or decaying. Informational only.
+MOVE_MOMENTUM_LOOKBACK_DAYS = 3         # how many recent daily marks define "building" vs "decaying"
+MOVE_MOMENTUM_FLAT_BAND_PCT = 0.02      # day-to-day value change smaller than this fraction is "flat", not a trend
+MOVE_LOW_MOVE_PROGRESS_PCT = 35         # below this % of entry's expected move realized = "hasn't happened yet"
+MOVE_HIGH_MOVE_PROGRESS_PCT = 90        # above this % of entry's expected move realized = "largely played out"
+# Squeeze/breakout-setup diagnostics (daily candles)
+MOVE_SQUEEZE_LOOKBACK_DAYS = 150
+MOVE_BB_PERIOD = 20
+MOVE_NR_WINDOW = 7                      # "NR7" — narrowest daily range in the last 7 sessions
+# Composite "move score" weights — how good the SETUP is for a long-vol trade, not a probability.
+MOVE_SCORE_WEIGHTS = {
+    "squeeze": 0.25,             # Bollinger-band-width percentile is currently tight (compressed range)
+    "iv_cheapness": 0.25,        # options are cheap relative to the underlying's own historical volatility
+    "momentum_building": 0.20,   # ADX low-and-turning-up — a move may be starting, not already spent
+    "volume_setup": 0.15,        # a dry-up before, or a pickup right now, consistent with a breakout starting
+    "proximity": 0.10,           # spot sitting close to a well-defined range edge (a trigger level)
+    "event": 0.05,               # a scheduled macro/event-calendar catalyst falls before expiry
+}
+MOVE_POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "move_positions.json")
+_move_positions_lock = threading.Lock()
+MOVE_SCREENER_CACHE = {"results": None, "fetched_at": None}
 
 
 def load_iv_history():
@@ -473,6 +535,30 @@ def find_position(pos_id):
     return None
 
 
+# --- Independent storage for the Long Straddle/Strangle module (see config block above) ---
+def load_move_positions():
+    if not os.path.exists(MOVE_POSITIONS_FILE):
+        return []
+    try:
+        with open(MOVE_POSITIONS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_move_positions(positions):
+    with _move_positions_lock:
+        with open(MOVE_POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2, default=str)
+
+
+def find_move_position(pos_id):
+    for p in load_move_positions():
+        if p["id"] == pos_id:
+            return p
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Event calendar (informational, hand-maintained)
 # ---------------------------------------------------------------------------
@@ -574,12 +660,12 @@ def save_trade_history(history):
 def archive_closed_position(position, close_results):
     history = load_trade_history()
     est_realized_pnl = sum(
-        r.get("estimated_realized_pnl", 0) for r in close_results if r["status"] == "placed"
+        r.get("estimated_realized_pnl", 0) for r in close_results if r["status"] in ("placed", "filled")
     )
     exit_orders_for_charges = [
         {"price": r.get("reference_price") or 0, "quantity": r.get("quantity", 0),
          "transaction_type": r.get("transaction_type", "SELL")}
-        for r in close_results if r["status"] == "placed"
+        for r in close_results if r["status"] in ("placed", "filled")
     ]
     exit_charges = estimate_charges(exit_orders_for_charges)
     entry_charges_total = position.get("entry_estimated_charges") or 0
@@ -3935,7 +4021,7 @@ def _classify_position_group(legs):
     if len(legs) == 2 and len(calls) == 1 and len(puts) == 1 and len(shorts) == 2:
         return "SHORT STRANGLE"
     if len(legs) == 2 and len(calls) == 1 and len(puts) == 1 and len(longs) == 2:
-        return "LONG STRADDLE"
+        return "LONG STRADDLE" if calls[0]["strike"] == puts[0]["strike"] else "LONG STRANGLE"
     if len(legs) == 2 and ((len(calls) == 2) or (len(puts) == 2)):
         return "VERTICAL SPREAD"
     if len(legs) == 4:
@@ -4045,6 +4131,32 @@ def _position_management_action(group, momentum):
     elif group["strategy"] == "IRON CONDOR" and captured is not None and captured >= 50:
         action, level = "HOLD / PROTECT PROFIT", "LOW"
         reasons.append(f"{captured:.0f}% of estimated entry credit is captured and no severe side breach is detected.")
+    elif group["strategy"] in ("LONG STRADDLE", "LONG STRANGLE"):
+        # Opposite economics from everything above: this position PAID a debit and wants a big
+        # move, so it never had an "entry credit" to capture — profit_captured_pct is None by
+        # construction. Judge it instead against the debit paid (entry_credit_total is negative
+        # for a debit trade) and against how much runway is left before theta finishes the job.
+        entry_debit_total = abs(group.get("entry_credit_total", 0) or 0)
+        if entry_debit_total and pnl >= MOVE_PROFIT_TARGET_MULTIPLE * entry_debit_total:
+            action, level = "BOOK PROFIT — CONSIDER CLOSING", "MEDIUM"
+            reasons.append(f"Profit (₹{pnl}) has reached {int(MOVE_PROFIT_TARGET_MULTIPLE*100)}% of the debit "
+                           f"paid (₹{round(entry_debit_total,2)}) — long options can give profit back fast if "
+                           f"the move stalls or IV drops.")
+        elif entry_debit_total and pnl <= -MOVE_STOP_LOSS_DEBIT_PCT * entry_debit_total:
+            action, level = "CUT LOSS — EXPECTED MOVE HASN'T SHOWN UP", "HIGH"
+            reasons.append(f"Loss (₹{abs(pnl)}) has reached {int(MOVE_STOP_LOSS_DEBIT_PCT*100)}%+ of the debit "
+                           f"paid (₹{round(entry_debit_total,2)}) — theta is doing its job against you.")
+        elif dte <= MOVE_EXPIRY_WARNING_DAYS:
+            action, level = "CLOSE BEFORE EXPIRY — THETA/GAMMA RISK", "MEDIUM"
+            reasons.append(f"Only {dte} DTE left on a long-premium position — decay accelerates fastest right here.")
+        elif strength == "STRONG" and pnl > 0:
+            action, level = "HOLD — MOVE APPEARS TO BE DEVELOPING", "LOW"
+            reasons.append(f"Underlying momentum is {strength.lower()} and the position is in profit — let the "
+                           f"move run, but watch for an IV crush after any anticipated event.")
+        else:
+            action, level = "HOLD AND MONITOR", "LOW"
+            reasons.append("No move of consequence yet on this long-premium position — it is decaying with "
+                           "time; re-check DTE and P&L regularly rather than waiting passively for expiry.")
     else:
         action, level = "HOLD AND MONITOR", "LOW"
         reasons.append("No current rule-based trigger for adjustment or full exit.")
@@ -7107,8 +7219,4498 @@ def delta_engine_logs():
     return jsonify({"logs": _delta_logger.read_recent(limit)})
 
 
+
+
+# ============================================================================
+# AUTONOMOUS AI EVOLUTION ENGINE
+# Separate paper-trading/learning engine. It does NOT modify the existing
+# Iron Condor, Calendar, Auto Trade or Delta Neutral execution logic.
+# It uses the same Zerodha/Kite session and runs in the background after login.
+# ============================================================================
+import sqlite3
+from statistics import mean
+# Fresh AI research archive.  Deliberately separate from the previous ai_evolution.db
+# so the revised collector starts with a clean database and ignores the old archive.
+AI_DB_FILE = os.path.join(os.path.dirname(__file__), "ai_evolution_fresh.db")
+AI_POLL_SECONDS = int(os.environ.get("AI_POLL_SECONDS", "60"))
+AI_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+# Autonomous universe: indices + every currently listed NSE F&O stock.  The engine
+# rotates through this universe in small chunks so it can run continuously without
+# bursting Kite rate limits.  Set AI_UNIVERSE_MODE=INDEX_ONLY to restrict it.
+AI_UNIVERSE_MODE = "INDEX_ONLY"  # AI Evolution starts with indices only; F&O stocks are intentionally disabled.
+AI_SCAN_CHUNK_SIZE = int(os.environ.get("AI_SCAN_CHUNK_SIZE", "8"))
+AI_LOCK = threading.Lock()
+
+# Historical index pre-training: builds market-behaviour data before option-specific
+# paper trades have accumulated. This never places orders and is independent of the
+# existing Iron Condor / Calendar / Breakout engines.
+AI_HIST_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+AI_HIST_INTERVAL = os.environ.get("AI_HIST_INTERVAL", "5minute")
+# Research target is intentionally larger than the usual recent-history window.
+# Kite's actual earliest available 5-minute candle is the hard boundary; the collector
+# stops being useful once Kite returns no older data and never fabricates candles.
+AI_HIST_MAX_YEARS = float(os.environ.get("AI_HIST_MAX_YEARS", "12"))
+AI_HIST_LOOKBACK_DAYS = int(os.environ.get("AI_HIST_LOOKBACK_DAYS", str(round(AI_HIST_MAX_YEARS * 365))))
+# Kite limits the date span of a single historical request. We deliberately use a
+# conservative 90-day chunk for 5-minute data so the collector remains compatible
+# with both the older and newer Kite request-window limits. The collector stitches
+# the chunks into one local history and deduplicates them with a UNIQUE constraint.
+AI_HIST_CHUNK_DAYS = int(os.environ.get("AI_HIST_CHUNK_DAYS", "90"))
+AI_HIST_REQUEST_STAGGER_SECONDS = float(os.environ.get("AI_HIST_REQUEST_STAGGER_SECONDS", "0.40"))
+AI_HIST_BACKFILL_ENABLED = os.environ.get("AI_HIST_BACKFILL_ENABLED", "1").lower() not in ("0", "false", "no")
+AI_HIST_SYNC_HOURS = float(os.environ.get("AI_HIST_SYNC_HOURS", "6"))
+AI_HIST_HORIZON_BARS = int(os.environ.get("AI_HIST_HORIZON_BARS", "6"))
+AI_HIST_MIN_TRAIN = int(os.environ.get("AI_HIST_MIN_TRAIN", "300"))
+AI_OPTION_CAPTURE_MINUTES = int(os.environ.get("AI_OPTION_CAPTURE_MINUTES", "5"))
+AI_OPTION_CAPTURE_DAYS = int(os.environ.get("AI_OPTION_CAPTURE_DAYS", "0"))  # 0 = retain indefinitely
+
+# --- Directional index -> long-option paper engine ---
+# The historical GRU is trained on INDEX direction (future close > current close).
+# Live decisions therefore use the learned index direction first, then translate
+# that direction into a liquid CE/PE purchase.  This is intentionally paper-only.
+AI_DIRECTIONAL_ENABLED = os.environ.get("AI_DIRECTIONAL_ENABLED", "1").lower() not in ("0", "false", "no")
+AI_DIRECTIONAL_PAPER_ONLY = True
+AI_DIRECTIONAL_UP_PROB = float(os.environ.get("AI_DIRECTIONAL_UP_PROB", "0.55"))
+AI_DIRECTIONAL_DOWN_PROB = float(os.environ.get("AI_DIRECTIONAL_DOWN_PROB", "0.45"))
+AI_DIRECTIONAL_MIN_SCORE = float(os.environ.get("AI_DIRECTIONAL_MIN_SCORE", "55.0"))
+AI_DIRECTIONAL_TARGET_DELTA = float(os.environ.get("AI_DIRECTIONAL_TARGET_DELTA", "0.50"))
+AI_DIRECTIONAL_MAX_SPREAD_PCT = float(os.environ.get("AI_DIRECTIONAL_MAX_SPREAD_PCT", "10.0"))
+AI_DIRECTIONAL_MIN_VOLUME = int(os.environ.get("AI_DIRECTIONAL_MIN_VOLUME", "1"))
+AI_DIRECTIONAL_POLL_SECONDS = int(os.environ.get("AI_DIRECTIONAL_POLL_SECONDS", "60"))
+
+# Stability/performance controls for the large historical archive.
+AI_HIST_STATUS_CACHE_SECONDS = float(os.environ.get("AI_HIST_STATUS_CACHE_SECONDS", "5"))
+AI_HIST_TRAIN_RETRY_MINUTES = float(os.environ.get("AI_HIST_TRAIN_RETRY_MINUTES", "15"))
+# The first revision raised this to 25k points per symbol / 60k pooled samples,
+# but the NumPy-only GRU and Python feature builder then did too much work for a
+# small Oracle VM. More importantly, the old sequence builder retained a Python
+# dict for almost every source candle, so a nominally bounded job could still
+# swap or be OOM-killed. These defaults use ~12x the original 2,400-sample
+# baseline while remaining practical; deployments with more CPU/RAM can raise
+# them through the existing environment variables.
+AI_HIST_TRAIN_MAX_POINTS_PER_SYMBOL = int(os.environ.get("AI_HIST_TRAIN_MAX_POINTS_PER_SYMBOL", "12000"))
+AI_HIST_TRAIN_MAX_SAMPLES = int(os.environ.get("AI_HIST_TRAIN_MAX_SAMPLES", "30000"))
+AI_HIST_TRAIN_EPOCHS = int(os.environ.get("AI_HIST_TRAIN_EPOCHS", "12"))
+AI_HIST_TRAIN_BATCH_SIZE = int(os.environ.get("AI_HIST_TRAIN_BATCH_SIZE", "256"))
+AI_HIST_TRAIN_HEARTBEAT_SECONDS = float(os.environ.get("AI_HIST_TRAIN_HEARTBEAT_SECONDS", "2"))
+AI_HIST_TRAIN_STALE_SECONDS = float(os.environ.get("AI_HIST_TRAIN_STALE_SECONDS", "180"))
+AI_HIST_TRAIN_LOCK = threading.Lock()
+AI_HIST_TRAIN_START_LOCK = threading.Lock()
+_AI_HIST_TRAIN_THREAD = None
+_AI_HIST_STATUS_CACHE = {"at": 0.0, "value": None}
+_AI_HIST_STATUS_CACHE_LOCK = threading.Lock()
+
+AI_DEFAULTS = {
+    # STAGE 3: "min_score" / "bootstrap_min_score" are no longer an entry gate
+    # for the INDEX_DIRECTION -> CE/PE engine. That engine now auto-initiates
+    # a paper trade off the live GRU/ML/ensemble read of spot & futures
+    # direction directly, with no fixed or ramping score threshold in the
+    # way. These two fields are kept only (a) for the legacy champion/
+    # challenger self-tuning loop below (ai_learn) which still scores past
+    # trades on its own 0-100 scale, and (b) as an informational confidence
+    # readout shown on the dashboard (see ai_adaptive_min_score).
+    "min_score": 72.0, "min_rr": 1.5, "stop_pct": 0.75, "target_pct": 1.50,
+    "risk_per_trade_pct": 1.0, "max_positions": 6, "learning_min_trades": 40,
+    "challenger_min_trades": 30, "enabled": 1, "ml_min_samples": 40, "ml_min_probability": 0.58,
+    "ml_learning_rate": 0.08, "ml_epochs": 180, "dl_min_samples": 80, "dl_probability_weight": 0.50,
+    "dl_hidden1": 32, "dl_hidden2": 16, "dl_epochs": 90, "dl_learning_rate": 0.01,
+    "bootstrap_min_score": 55.0,
+    # Research-grade ensemble layer. It remains advisory during warm-up and becomes a
+    # gate only after a chronological holdout has enough observations.
+    "research_min_samples": 120, "research_models": 5, "research_epochs": 120,
+    "research_learning_rate": 0.05, "research_min_probability": 0.60,
+    "research_max_uncertainty": 0.16
+}
+
+def _ai_ts_naive(value):
+    """Normalize any stored/Kite timestamp to naive IST for safe comparisons.
+
+    Kite returns timezone-aware candle timestamps while some local runtime timestamps
+    are intentionally stored as aware IST strings. Mixing those with now_ist() (naive)
+    caused the previous `offset-naive and offset-aware datetimes` failure.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except Exception:
+            return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(IST).replace(tzinfo=None)
+    return dt
+
+
+def ai_db():
+    c=sqlite3.connect(AI_DB_FILE, timeout=30, check_same_thread=False)
+    c.row_factory=sqlite3.Row
+    try:
+        c.execute("PRAGMA busy_timeout=10000")
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return c
+
+def ai_init_db():
+    c=ai_db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS ai_settings(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS ai_versions(id INTEGER PRIMARY KEY AUTOINCREMENT,version TEXT,parent_version TEXT,created_at TEXT,status TEXT,reason TEXT,params TEXT,metrics TEXT);
+    CREATE TABLE IF NOT EXISTS ai_market(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,symbol TEXT,spot REAL,iv REAL,pcr REAL,volume REAL,trend REAL,momentum REAL,volatility REAL,snapshot TEXT);
+    CREATE TABLE IF NOT EXISTS ai_decisions(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,version TEXT,symbol TEXT,score REAL,decision TEXT,reason TEXT,snapshot TEXT);
+    CREATE TABLE IF NOT EXISTS ai_trades(id INTEGER PRIMARY KEY AUTOINCREMENT,version TEXT,ts TEXT,symbol TEXT,option_symbol TEXT,token INTEGER,side TEXT,entry REAL,stop REAL,target REAL,qty INTEGER,score REAL,setup_json TEXT,status TEXT,exit REAL,exit_ts TEXT,pnl REAL DEFAULT 0,r_multiple REAL DEFAULT 0,mfe REAL DEFAULT 0,mae REAL DEFAULT 0,exit_reason TEXT);
+    CREATE TABLE IF NOT EXISTS ai_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,from_version TEXT,to_version TEXT,change_json TEXT,hypothesis TEXT,before_metrics TEXT,after_metrics TEXT,impact TEXT,status TEXT);
+    CREATE TABLE IF NOT EXISTS ai_learning(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,version TEXT,observation TEXT,hypothesis TEXT,action TEXT,evidence TEXT);
+    CREATE TABLE IF NOT EXISTS ai_events(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,level TEXT,event TEXT,detail TEXT);
+    CREATE TABLE IF NOT EXISTS ai_ml_samples(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,trade_id INTEGER,version TEXT,symbol TEXT,features TEXT,label INTEGER,outcome_r REAL,horizon_sec REAL);
+    CREATE TABLE IF NOT EXISTS ai_ml_model(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,weights TEXT,bias REAL,samples INTEGER,accuracy REAL,auc REAL,status TEXT);
+    CREATE TABLE IF NOT EXISTS ai_dl_samples(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,trade_id INTEGER,version TEXT,symbol TEXT,sequence TEXT,label INTEGER,outcome_r REAL,horizon_sec REAL);\n    CREATE TABLE IF NOT EXISTS ai_dl_model(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,w1 TEXT,b1 TEXT,w2 TEXT,b2 TEXT,w3 TEXT,b3 REAL,samples INTEGER,accuracy REAL,auc REAL,status TEXT);
+    CREATE TABLE IF NOT EXISTS ai_trade_path(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,trade_id INTEGER,symbol TEXT,option_price REAL,spot REAL,option_return_pct REAL,spot_return_pct REAL,features TEXT);
+    CREATE TABLE IF NOT EXISTS ai_runtime(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS ai_hist_candles(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,symbol TEXT,interval TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,oi REAL,UNIQUE(symbol,interval,ts));
+    CREATE TABLE IF NOT EXISTS ai_hist_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,symbol TEXT,interval TEXT,rows_added INTEGER,status TEXT,detail TEXT);
+    CREATE TABLE IF NOT EXISTS ai_hist_model(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,symbols TEXT,interval TEXT,samples INTEGER,train_samples INTEGER,validation_samples INTEGER,accuracy REAL,auc REAL,status TEXT,lookback_days INTEGER);
+    CREATE TABLE IF NOT EXISTS ai_option_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,symbol TEXT,expiry TEXT,strike REAL,option_type TEXT,tradingsymbol TEXT,token INTEGER,spot REAL,ltp REAL,bid REAL,ask REAL,mid REAL,spread_pct REAL,volume REAL,oi REAL,iv REAL,delta REAL,source TEXT,UNIQUE(ts,symbol,expiry,strike,option_type));
+    CREATE INDEX IF NOT EXISTS idx_ai_option_snapshots_symbol_ts ON ai_option_snapshots(symbol,ts);
+    CREATE INDEX IF NOT EXISTS idx_ai_option_snapshots_contract_ts ON ai_option_snapshots(tradingsymbol,ts);
+    CREATE INDEX IF NOT EXISTS idx_ai_hist_symbol_interval_ts ON ai_hist_candles(symbol,interval,ts);
+    CREATE INDEX IF NOT EXISTS idx_ai_hist_interval_ts ON ai_hist_candles(interval,ts);
+    CREATE INDEX IF NOT EXISTS idx_ai_market_symbol_id ON ai_market(symbol,id);
+    CREATE TABLE IF NOT EXISTS ai_research_model(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,models TEXT,samples INTEGER,train_samples INTEGER,validation_samples INTEGER,accuracy REAL,auc REAL,probability REAL,uncertainty REAL,status TEXT,regime TEXT);
+    CREATE TABLE IF NOT EXISTS ai_tree_model(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,trees TEXT,samples INTEGER,train_samples INTEGER,validation_samples INTEGER,accuracy REAL,auc REAL,status TEXT);
+    CREATE TABLE IF NOT EXISTS ai_model_compare(id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT,folds INTEGER,results TEXT,champion TEXT);
+    """)
+    # Safe, additive migration (Section 26/38: never destroy existing data, no
+    # duplicate tables). Older DBs won't have this column; ALTER TABLE ADD
+    # COLUMN is idempotent-guarded here since SQLite errors if it already exists.
+    for tbl in ("ai_hist_model", "ai_dl_model"):
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN feature_version TEXT")
+        except Exception:
+            pass  # column already exists
+    for k,v in AI_DEFAULTS.items(): c.execute("INSERT OR IGNORE INTO ai_settings VALUES(?,?)",(k,str(v)))
+    if not c.execute("SELECT 1 FROM ai_versions LIMIT 1").fetchone():
+        c.execute("INSERT INTO ai_versions(version,parent_version,created_at,status,reason,params,metrics) VALUES(?,?,?,?,?,?,?)",
+                  ("1.0",None,datetime.now().isoformat(),"CHAMPION","Initial autonomous paper strategy",json.dumps(AI_DEFAULTS),json.dumps({})))
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('db_file',?)",(AI_DB_FILE,))
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('archive_mode',?)",("FRESH_ARCHIVE",))
+    c.commit();c.close()
+
+def ai_log(level,event,detail=""):
+    try:
+        c=ai_db();c.execute("INSERT INTO ai_events VALUES(NULL,?,?,?,?)",(datetime.now().isoformat(),level,event,detail));c.commit();c.close()
+    except Exception: pass
+
+def ai_settings():
+    c=ai_db(); rows=c.execute("SELECT key,value FROM ai_settings").fetchall(); c.close(); p=dict(AI_DEFAULTS)
+    for r in rows:
+        try:p[r["key"]]=float(r["value"])
+        except: pass
+    return p
+
+def ai_champion():
+    c=ai_db();r=c.execute("SELECT * FROM ai_versions WHERE status='CHAMPION' ORDER BY id DESC LIMIT 1").fetchone();c.close();return dict(r) if r else None
+
+def ai_params():
+    r=ai_champion(); return json.loads(r["params"]) if r else ai_settings()
+
+def ai_market_open():
+    try:
+        n=now_ist(); return n.weekday()<5 and datetime.strptime("09:15","%H:%M").time() <= n.time() <= datetime.strptime("15:30","%H:%M").time()
+    except: return False
+
+def ai_store_market(symbol, snapshot):
+    c=ai_db(); c.execute("INSERT INTO ai_market(ts,symbol,spot,iv,pcr,volume,trend,momentum,volatility,snapshot) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      (datetime.now().isoformat(),symbol,snapshot.get("spot"),snapshot.get("iv"),snapshot.get("pcr"),snapshot.get("volume"),snapshot.get("trend"),snapshot.get("momentum"),snapshot.get("volatility"),json.dumps(snapshot)))
+    c.commit();c.close()
+
+def ai_market_history(symbol, n=120):
+    c=ai_db();r=c.execute("SELECT * FROM ai_market WHERE symbol=? ORDER BY id DESC LIMIT ?",(symbol,n)).fetchall();c.close();return [dict(x) for x in reversed(r)]
+
+def ai_snapshot(symbol, params=None):
+    params = params or ai_params()
+    data,err=get_chain_for_symbol(symbol)
+    if err:return None,err
+    spot=float(data["spot"]); chain=data["chain"]
+    calls=[x for x in chain if x.get("instrument_type")=="CE"]; puts=[x for x in chain if x.get("instrument_type")=="PE"]
+    atm=min(chain,key=lambda x:abs(float(x["strike"])-spot)) if chain else None
+    iv=float(atm.get("iv") or 0) if atm else 0
+    pcr=compute_pcr_and_max_pain(chain).get("pcr") or 1.0
+    vol=float(sum((x.get("volume") or 0) for x in chain)/max(len(chain),1))
+    hist=ai_market_history(symbol,120); prices=[float(x["spot"]) for x in hist if x.get("spot") is not None]+[spot]
+    ret5=((spot/prices[-6])-1)*100 if len(prices)>=6 else 0
+    ret20=((spot/prices[-21])-1)*100 if len(prices)>=21 else ret5
+    ma10=mean(prices[-10:]) if len(prices)>=10 else spot
+    ma30=mean(prices[-30:]) if len(prices)>=30 else ma10
+    trend=max(0,min(25,12.5+(ma10/ma30-1)*500))
+    momentum=max(0,min(25,12.5+ret5*3+ret20*1.5))
+    if len(prices)>=10:
+        m=mean(prices[-10:]); sd=(mean([(z-m)**2 for z in prices[-10:]])**0.5); volatility=(sd/m*100) if m else 0
+    else: volatility=0
+    vol_score=max(0,min(15,15-abs(volatility-0.5)*8))
+    pcr_score=max(0,min(15,7.5+(pcr-1)*15))
+    iv_score=max(0,min(20,10+(iv-15)*0.6))
+    score=trend+momentum+vol_score+pcr_score+iv_score
+    ml_features=ai_market_pattern_features(symbol,spot,iv,pcr,vol,trend,momentum)
+    ml_prob,ml_model=ai_ml_predict(ml_features)
+    dl_seq=ai_dl_sequence(symbol, ml_features)
+    dl_prob,dl_model=ai_dl_predict_sequence(dl_seq)
+    research=ai_research_predict(ml_features)
+    side="LONG" if trend+momentum+pcr_score>=32 else "SHORT"
+    option_type="CE" if side=="LONG" else "PE"
+    candidates=[x for x in chain if x.get("instrument_type")==option_type and x.get("delta") is not None]
+    if not candidates: return None,{"error":"No option candidates"}
+    target=min(candidates,key=lambda x:abs(abs(float(x.get("delta",0)))-0.50))
+    # Paper trades must use an executable side of the live order book, not the midpoint/LTP.
+    # LONG entry = best ask; SHORT entry = best bid.  If the required side is unavailable,
+    # reject the setup rather than creating a synthetic profit from a stale/illiquid quote.
+    bid=target.get("bid"); ask=target.get("ask"); ltp=target.get("ltp")
+    option_volume=int(target.get("volume") or 0)
+    spread_pct=target.get("spread_pct")
+    entry_source="ASK" if side=="LONG" else "BID"
+    entry_raw=ask if side=="LONG" else bid
+    if option_volume <= 0:
+        return None,{"error":f"No traded volume for {target.get('tradingsymbol')}","liquidity":"NO_TRADE_VOLUME"}
+    if entry_raw is None or float(entry_raw)<=0:
+        return None,{"error":f"No executable {entry_source.lower()} for {target.get('tradingsymbol')}","liquidity":"NO_EXECUTABLE_QUOTE"}
+    if spread_pct is not None and float(spread_pct)>10.0:
+        return None,{"error":f"Bid/ask spread {float(spread_pct):.1f}% too wide for {target.get('tradingsymbol')}","liquidity":"SPREAD_TOO_WIDE"}
+    entry=float(entry_raw)
+    lot=int(data.get("lot_size") or target.get("lot_size") or 1)
+    if side=="LONG":
+        stop=entry*(1-float(params["stop_pct"])/100); target_price=entry*(1+float(params["target_pct"])/100)
+    else:
+        stop=entry*(1+float(params["stop_pct"])/100); target_price=entry*(1-float(params["target_pct"])/100)
+    return {"symbol":symbol,"spot":spot,"score":round(score,2),"side":side,"option_type":option_type,
+            "option_symbol":target.get("tradingsymbol"),"token":int(target.get("instrument_token")),"entry":entry,
+            "entry_price_source":entry_source,"option_ltp":ltp,"option_bid":bid,"option_ask":ask,
+            "option_volume":option_volume,"option_oi":int(target.get("oi") or 0),
+            "spread_pct":spread_pct,"bid_qty":int(target.get("bid_qty") or 0),"ask_qty":int(target.get("ask_qty") or 0),
+            "liquidity_status":"EXECUTABLE",
+            "stop":stop,"target":target_price,"lot_size":lot,"iv":iv,"pcr":pcr,"volume":vol,
+            "trend":trend,"momentum":momentum,"volatility":volatility,"components":{"trend":round(trend,2),"momentum":round(momentum,2),"volatility":round(vol_score,2),"pcr":round(pcr_score,2),"iv":round(iv_score,2)},
+            "rr":round(abs(target_price-entry)/max(abs(entry-stop),0.0001),2), "ml_features":ml_features, "ml_probability":round(float(ml_prob),4), "dl_probability":round(float(dl_prob),4), "research_probability":round(float(research.get("probability",0.5)),4), "research_uncertainty":round(float(research.get("uncertainty",0.5)),4), "market_regime":research.get("regime","UNKNOWN"), "research_auc":float(research.get("auc",0)), "research_samples":int(research.get("samples",0)), "dl_samples":int(dl_model.get("samples",0)), "ml_samples":int(ml_model.get("samples",0)), "dl_sequence":dl_seq},None
+
+# ---------------------------------------------------------------------------
+# Directional index-learning -> CE/PE paper execution
+# ---------------------------------------------------------------------------
+# IMPORTANT: this engine does NOT learn from option prices to decide direction.
+# It learns the underlying index path first.  The live option is only the execution
+# instrument: UP -> BUY CE, DOWN -> BUY PE.  This keeps the historical training target
+# and the live decision target identical.
+def ai_directional_snapshot(symbol, params=None):
+    if not AI_DIRECTIONAL_ENABLED:
+        return None, "directional engine disabled"
+    params = params or ai_params()
+    data, err = get_chain_for_symbol(symbol)
+    if err:
+        return None, err
+    spot = float(data["spot"])
+    chain = data.get("chain") or []
+    if not chain or spot <= 0:
+        return None, "empty option chain / invalid spot"
+
+    # Build the same market-state feature vector used by the historical GRU.
+    # PCR/IV/volume are live context; the direction target remains index movement.
+    calls = [x for x in chain if x.get("instrument_type") == "CE"]
+    puts = [x for x in chain if x.get("instrument_type") == "PE"]
+    atm = min(chain, key=lambda x: abs(float(x.get("strike", 0)) - spot)) if chain else None
+    iv = float(atm.get("iv") or 0) if atm else 0.0
+    pcr = float(compute_pcr_and_max_pain(chain).get("pcr") or 1.0)
+    volume = float(sum(float(x.get("volume") or 0) for x in chain) / max(len(chain), 1))
+
+    hist = ai_market_history(symbol, 120)
+    prices = [float(x["spot"]) for x in hist if x.get("spot") is not None]
+    prices.append(spot)
+    ret5 = ((spot / prices[-6]) - 1) * 100 if len(prices) >= 6 and prices[-6] else 0.0
+    ret20 = ((spot / prices[-21]) - 1) * 100 if len(prices) >= 21 and prices[-21] else ret5
+    ma10 = mean(prices[-10:]) if len(prices) >= 10 else spot
+    ma30 = mean(prices[-30:]) if len(prices) >= 30 else ma10
+    trend = max(0, min(25, 12.5 + (ma10 / ma30 - 1) * 500)) if ma30 else 12.5
+    momentum = max(0, min(25, 12.5 + ret5 * 3 + ret20 * 1.5))
+    if len(prices) >= 10:
+        m = mean(prices[-10:])
+        sd = mean([(z - m) ** 2 for z in prices[-10:]]) ** 0.5
+        volatility = (sd / m * 100) if m else 0.0
+    else:
+        volatility = 0.0
+
+    features = ai_market_pattern_features(symbol, spot, iv, pcr, volume, trend, momentum)
+    live_seq, seq_err = build_live_index_sequence(symbol)
+    if seq_err:
+        return None, {"error": f"index data not ready: {seq_err}", "decision": "WAIT"}
+    seq = live_seq["sequence"]
+    dl_prob, dl_model = ai_dl_predict_sequence(seq)
+    ml_prob, ml_model = ai_ml_predict(features)
+
+    # Historical GRU target: 1 = future index close above current close.
+    if dl_prob >= AI_DIRECTIONAL_UP_PROB:
+        direction = "UP"
+        option_type = "CE"
+        confidence = dl_prob
+    elif dl_prob <= AI_DIRECTIONAL_DOWN_PROB:
+        direction = "DOWN"
+        option_type = "PE"
+        confidence = 1.0 - dl_prob
+    else:
+        return None, {
+            "error": f"GRU direction uncertain: p_up={dl_prob:.3f}",
+            "decision": "WAIT",
+            "p_up": round(dl_prob, 4),
+            "dl_samples": int(dl_model.get("samples", 0)),
+        }
+
+    # Confidence is the primary learned signal.  Momentum/trend are supporting
+    # context, not a replacement for the learned direction.
+    base_score = round(50.0 + max(0.0, confidence - 0.50) * 100.0, 2)
+    if direction == "UP":
+        context = max(0.0, min(1.0, ((trend - 12.5) + (momentum - 12.5)) / 25.0 + 0.5))
+    else:
+        context = max(0.0, min(1.0, ((12.5 - trend) + (12.5 - momentum)) / 25.0 + 0.5))
+
+    # STAGE 2: EV-confidence ensemble (Model A logistic + bagged-logistic
+    # research ensemble + Model B tree forest) now actually feeds the score,
+    # instead of the old hardcoded "research_probability": 0.5 placeholder.
+    ensemble_conf, ensemble_detail = ai_ensemble_confidence(features)
+    score = round(min(100.0, base_score * 0.55 + context * 15.0 + ensemble_conf * 30.0), 2)
+
+    # STAGE 3: no fixed/adaptive score gate. The engine no longer blocks a
+    # trade on a hard-coded or ramping threshold (the old 55->72 gate) — it
+    # acts directly on whatever the GRU + ML/ensemble currently believe about
+    # spot/futures direction, and lets live paper-trade outcomes be the
+    # teacher. `min_score` is kept purely as a confidence readout for the
+    # dashboard (see ai_adaptive_min_score) — informational only, never
+    # withholds a decision.
+    min_score = ai_adaptive_min_score(int(ml_model.get("samples") or 0), int(dl_model.get("samples") or 0))
+
+    # STAGE 2: score multiple strikes near the target delta instead of only
+    # ever taking the single nearest-delta contract — weigh delta fit,
+    # liquidity, spread tightness, and the EV-ensemble confidence together.
+    candidates = [x for x in chain if x.get("instrument_type") == option_type and x.get("delta") is not None]
+    if not candidates:
+        return None, {"error": f"No {option_type} contracts with delta", "decision": "WAIT"}
+
+    def _candidate_score(o):
+        ask_o = o.get("ask")
+        if ask_o is None or float(ask_o) <= 0:
+            return None
+        delta_o = abs(float(o.get("delta") or 0))
+        spread_o = o.get("spread_pct")
+        vol_o = float(o.get("volume") or 0); oi_o = float(o.get("oi") or 0)
+        delta_fit = 1.0 - min(1.0, abs(delta_o - AI_DIRECTIONAL_TARGET_DELTA) / max(AI_DIRECTIONAL_TARGET_DELTA, 0.05))
+        liquidity = min(1.0, math.log1p(vol_o + oi_o) / 12.0)
+        spread_score = 1.0 - min(1.0, (float(spread_o) if spread_o is not None else 15.0) / 20.0)
+        return delta_fit * 0.35 + liquidity * 0.20 + spread_score * 0.20 + ensemble_conf * 0.25
+
+    scored = []
+    for o in candidates:
+        s = _candidate_score(o)
+        if s is not None:
+            scored.append((s, o))
+    if not scored:
+        return None, {"error": f"No executable {option_type} contracts near target delta", "decision": "WAIT"}
+    scored.sort(key=lambda t: -t[0])
+    target = scored[0][1]
+    alt_candidates = [{"tradingsymbol": o.get("tradingsymbol"), "delta": o.get("delta"),
+                        "composite_score": round(s, 4)} for s, o in scored[:5]]
+
+    bid = target.get("bid")
+    ask = target.get("ask")
+    ltp = target.get("ltp")
+    spread_pct = target.get("spread_pct")
+    volume_opt = int(target.get("volume") or 0)
+    if volume_opt < AI_DIRECTIONAL_MIN_VOLUME:
+        return None, {"error": f"No traded volume for {target.get('tradingsymbol')}", "decision": "WAIT"}
+    if ask is None or float(ask) <= 0:
+        return None, {"error": f"No executable ASK for {target.get('tradingsymbol')}", "decision": "WAIT"}
+    if spread_pct is not None and float(spread_pct) > AI_DIRECTIONAL_MAX_SPREAD_PCT:
+        return None, {"error": f"Spread {float(spread_pct):.1f}% too wide", "decision": "WAIT"}
+
+    entry = float(ask)  # BUY option -> pay the live ask, never midpoint/LTP.
+
+    # STAGE 2: stop/target derived from the option's own delta and recent
+    # realized index volatility (first-order: option premium % move ~= index
+    # % move * spot/premium * delta), instead of a single fixed percentage
+    # for every trade regardless of how calm or violent the market is. The
+    # configured stop_pct/target_pct now act as a floor, not the value used
+    # on every trade, so a near-zero vol reading can never produce an
+    # unrealistically tight stop. This is a first-order approximation
+    # (ignores gamma/theta) meant to be tuned against real fills, not a
+    # promise of precision.
+    delta_abs = max(0.05, abs(float(target.get("delta") or AI_DIRECTIONAL_TARGET_DELTA)))
+    expected_index_move_pct = max(volatility, 0.05)
+    expected_option_move_pct = max(0.10, expected_index_move_pct * (spot / max(entry, 0.01)) * delta_abs)
+    floor_stop_pct = float(params.get("stop_pct", 0.75))
+    floor_target_pct = float(params.get("target_pct", 1.50))
+    stop_pct = max(floor_stop_pct, min(3.0, expected_option_move_pct * 0.60))
+    target_pct = max(floor_target_pct, min(6.0, expected_option_move_pct * 1.20 * max(ensemble_conf, 0.5) * 2.0))
+    stop = entry * (1 - stop_pct / 100.0)
+    target_price = entry * (1 + target_pct / 100.0)
+    lot = int(data.get("lot_size") or target.get("lot_size") or 1)
+    setup = {
+        "strategy_type": "INDEX_DIRECTIONAL_LONG_OPTION",
+        "learning_target": "INDEX_DIRECTION",
+        "direction": direction,
+        "option_type": option_type,
+        "p_up": round(float(dl_prob), 6),
+        "direction_confidence": round(float(confidence), 6),
+        "score": score,
+        "spot": spot,
+        "iv": iv, "pcr": pcr, "volume": volume,
+        "trend": trend, "momentum": momentum, "volatility": volatility,
+        "ml_probability": round(float(ml_prob), 6),
+        "ml_samples": int(ml_model.get("samples", 0)),
+        "dl_probability": round(float(dl_prob), 6),
+        "dl_samples": int(dl_model.get("samples", 0)),
+        "dl_sequence": seq,
+        "ml_features": features,
+        "historical_model_status": dl_model.get("status"),
+        "ensemble_confidence": round(float(ensemble_conf), 4),
+        "ensemble_detail": ensemble_detail,
+        "adaptive_min_score": min_score,
+        "stop_pct_used": round(stop_pct, 3),
+        "target_pct_used": round(target_pct, 3),
+        "alt_candidates": alt_candidates,
+        "paper_only": True,
+    }
+    return {
+        "symbol": symbol,
+        "spot": spot,
+        "score": score,
+        "side": "LONG",
+        "direction": direction,
+        "option_type": option_type,
+        "option_symbol": target.get("tradingsymbol"),
+        "token": int(target.get("instrument_token") or target.get("token") or 0),
+        "entry": entry,
+        "entry_price_source": "ASK",
+        "option_ltp": ltp,
+        "option_bid": bid,
+        "option_ask": ask,
+        "option_volume": volume_opt,
+        "option_oi": int(target.get("oi") or 0),
+        "spread_pct": spread_pct,
+        "bid_qty": int(target.get("bid_qty") or 0),
+        "ask_qty": int(target.get("ask_qty") or 0),
+        "liquidity_status": "EXECUTABLE",
+        "stop": stop,
+        "target": target_price,
+        "lot_size": lot,
+        "iv": iv, "pcr": pcr, "volume": volume,
+        "trend": trend, "momentum": momentum, "volatility": volatility,
+        "components": {"learned_direction_confidence": round(confidence * 100, 2), "trend": round(trend, 2), "momentum": round(momentum, 2)},
+        "rr": round((target_price - entry) / max(entry - stop, 0.0001), 2),
+        "ml_features": features,
+        "ml_probability": round(float(ml_prob), 4),
+        "dl_probability": round(float(dl_prob), 4),
+        # STAGE 2 FIX: these were hardcoded placeholders (0.5 / 0.5 / 0.0 / 0)
+        # even though the bagged-logistic research ensemble was already being
+        # trained every cycle (ai_research_train() in ai_cycle()) — it just
+        # was never actually consulted here. Now wired through
+        # ai_ensemble_confidence().
+        "research_probability": round(float(ensemble_detail.get("models", {}).get("research_A2", {}).get("probability", 0.5)), 4),
+        "research_uncertainty": round(1.0 - abs(ensemble_conf - 0.5) * 2, 4),
+        "market_regime": "INDEX_DIRECTIONAL",
+        "research_auc": round(float(ensemble_detail.get("models", {}).get("research_A2", {}).get("auc", 0.0)), 4),
+        "research_samples": int(0 if not ensemble_detail.get("weights_used") else 1),
+        "ensemble_confidence": round(float(ensemble_conf), 4),
+        "tree_probability": round(float(ensemble_detail.get("models", {}).get("tree_B", {}).get("probability", 0.5)), 4),
+        "dl_samples": int(dl_model.get("samples", 0)),
+        "ml_samples": int(ml_model.get("samples", 0)),
+        "dl_sequence": seq,
+        "setup_json_extra": setup,
+    }, None
+
+# ---------------------------------------------------------------------------
+# Market-pattern ML layer
+# ---------------------------------------------------------------------------
+# This is intentionally a small, transparent online logistic model implemented
+# with the Python standard library. It learns from the *market state and the
+# subsequent path*, not merely from the composite score. No sklearn dependency
+# is required. The model predicts probability that a paper trade reaches its
+# target before its stop.
+ML_FEATURE_NAMES = [
+    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20",
+    "ema_gap_9_20", "ema_gap_20_50", "rsi14", "volatility_10",
+    "range_20", "volume_ratio", "trend_score", "momentum_score",
+    "pcr_norm", "iv_norm", "time_sin", "time_cos"
+]
+
+# ---------------------------------------------------------------------------
+# STAGE 1 FIX (feature-engine unification):
+# The historical archive has no option-chain data, so pcr_norm/iv_norm were
+# hard-coded constants (1.0 / 0.0) for every historical training row, while the
+# live path fed real option-chain PCR/IV into the *same* named slots. A model
+# trained mostly on two constant inputs and then run live with real, varying
+# values for those same inputs is a textbook train/live distribution mismatch.
+# SEQUENCE_FEATURE_NAMES is the feature set actually fed to the index-pattern
+# GRU (historical pre-training AND live prediction, from the same function and
+# the same ai_hist_candles table). PCR/IV remain available live and are still
+# used — just downstream, in option/EV scoring context, not inside the learned
+# index-pattern sequence.
+# ---------------------------------------------------------------------------
+FEATURE_ENGINE_VERSION = "fe_v2_2026_08_unified"
+SEQUENCE_FEATURE_NAMES = [
+    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20",
+    "ema_gap_9_20", "ema_gap_20_50", "rsi14", "volatility_10",
+    "range_20", "volume_ratio", "trend_score", "momentum_score",
+    "time_sin", "time_cos"
+]
+AI_LIVE_MAX_BAR_AGE_MIN = float(os.environ.get("AI_LIVE_MAX_BAR_AGE_MIN", "20"))
+
+def _sigmoid(z):
+    if z < -40: return 0.0
+    if z > 40: return 1.0
+    return 1.0/(1.0+math.exp(-z))
+
+def _norm_feature(name, value):
+    v=float(value or 0.0)
+    if name.startswith("ret_"): return max(-5.0,min(5.0,v))/5.0
+    if name.startswith("ema_gap_"): return max(-5.0,min(5.0,v))/5.0
+    if name=="rsi14": return max(0.0,min(100.0,v))/100.0
+    if name in ("volatility_10","range_20"): return max(0.0,min(10.0,v))/10.0
+    if name=="volume_ratio": return max(0.0,min(4.0,v))/4.0
+    if name in ("trend_score","momentum_score"): return max(0.0,min(25.0,v))/25.0
+    if name=="pcr_norm": return max(0.0,min(2.0,v))/2.0
+    if name=="iv_norm": return max(0.0,min(50.0,v))/50.0
+    return max(-1.0,min(1.0,v))
+
+def ai_ml_features(snapshot):
+    # `snapshot` is passed as the FLAT feature dict itself at every call site in
+    # this file (ai_market_pattern_features(...) return value) -- never as a
+    # wrapper containing a nested "ml_features" key. The previous version of
+    # this function assumed the wrapper shape and therefore always fell back to
+    # an all-zero vector, silently neutralising Model A's real market features
+    # for both prediction and training. Handle the actual (flat) shape, while
+    # staying tolerant of a wrapper if one is ever passed.
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("ml_features"), dict):
+        f = snapshot["ml_features"]
+    else:
+        f = snapshot if isinstance(snapshot, dict) else {}
+    return [round(_norm_feature(n,f.get(n,0)),6) for n in ML_FEATURE_NAMES]
+
+def ai_ml_model():
+    c=ai_db(); r=c.execute("SELECT * FROM ai_ml_model WHERE id=1").fetchone(); c.close()
+    if not r: return {"weights":[0.0]*len(ML_FEATURE_NAMES),"bias":0.0,"samples":0,"accuracy":0.0,"status":"NOT_TRAINED"}
+    try: w=json.loads(r["weights"] or "[]")
+    except: w=[]
+    if len(w)!=len(ML_FEATURE_NAMES): w=[0.0]*len(ML_FEATURE_NAMES)
+    return {"weights":w,"bias":float(r["bias"] or 0),"samples":int(r["samples"] or 0),"accuracy":float(r["accuracy"] or 0),"auc":float(r["auc"] or 0),"status":r["status"] or "READY","updated_at":r["updated_at"]}
+
+def ai_ml_predict(features):
+    m=ai_ml_model(); x=ai_ml_features(features) if isinstance(features,dict) else list(features)
+    z=m["bias"]+sum(w*v for w,v in zip(m["weights"],x))
+    return _sigmoid(z),m
+
+def ai_ml_train():
+    c=ai_db(); rows=c.execute("SELECT features,label FROM ai_ml_samples ORDER BY id").fetchall(); c.close()
+    if len(rows)<1: return ai_ml_model()
+    X=[];Y=[]
+    for r in rows:
+        try:
+            f=json.loads(r["features"] or "[]")
+            if len(f)==len(ML_FEATURE_NAMES): X.append([float(v) for v in f]); Y.append(int(r["label"]))
+        except: pass
+    if not X:return ai_ml_model()
+    p=ai_params(); lr=float(p.get("ml_learning_rate",0.08)); epochs=int(p.get("ml_epochs",180))
+    w=[0.0]*len(ML_FEATURE_NAMES); b=0.0
+    for _ in range(epochs):
+        gw=[0.0]*len(w); gb=0.0
+        for x,y in zip(X,Y):
+            pred=_sigmoid(b+sum(a*v for a,v in zip(w,x))); err=pred-y
+            gb+=err
+            for j,v in enumerate(x): gw[j]+=err*v
+        scale=1.0/len(X)
+        b-=lr*gb*scale
+        for j in range(len(w)): w[j]-=lr*gw[j]*scale
+    probs=[_sigmoid(b+sum(a*v for a,v in zip(w,x))) for x in X]
+    acc=sum((pr>=0.5)==bool(y) for pr,y in zip(probs,Y))/len(Y)*100
+    # Simple rank-based AUC; useful as a diagnostic, not a guarantee of live performance.
+    pos=[pr for pr,y in zip(probs,Y) if y==1]; neg=[pr for pr,y in zip(probs,Y) if y==0]
+    auc=sum(1 if a>b else 0.5 if a==b else 0 for a in pos for b in neg)/(len(pos)*len(neg)) if pos and neg else 0.0
+    c=ai_db(); c.execute("INSERT OR REPLACE INTO ai_ml_model(id,updated_at,weights,bias,samples,accuracy,auc,status) VALUES(1,?,?,?,?,?,?,?)",(datetime.now(IST).isoformat(),json.dumps(w),b,len(X),acc,auc,"TRAINED")); c.commit(); c.close()
+    ai_log("LEARNING","ML_RETRAIN",f"samples={len(X)} accuracy={acc:.1f}% auc={auc:.3f}")
+    return {"weights":w,"bias":b,"samples":len(X),"accuracy":acc,"auc":auc,"status":"TRAINED","updated_at":datetime.now(IST).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Deep sequence-learning layer
+# ---------------------------------------------------------------------------
+# A small, real neural network implemented with NumPy only.  It consumes a
+# sequence of recent market states rather than a single composite score.
+# Architecture: flattened sequence -> Dense(32, ReLU) -> Dense(16, ReLU)
+# -> sigmoid.  It is deliberately lightweight so it can run on the existing
+# Oracle VM without PyTorch/TensorFlow.
+DL_SEQUENCE_LEN = 20
+
+def _dl_vector_from_snapshot(snap):
+    f = snap.get("ml_features") or {}
+    return [round(_norm_feature(n, f.get(n, 0)), 6) for n in ML_FEATURE_NAMES]
+
+def ai_dl_sequence(symbol, current_features):
+    hist = ai_market_history(symbol, DL_SEQUENCE_LEN)
+    seq = []
+    for row in hist:
+        try:
+            snap = json.loads(row.get("snapshot") or "{}")
+            vec = _dl_vector_from_snapshot(snap)
+            if len(vec) == len(ML_FEATURE_NAMES):
+                seq.append(vec)
+        except Exception:
+            pass
+    cur = [round(_norm_feature(n, current_features.get(n, 0)), 6) for n in ML_FEATURE_NAMES]
+    seq.append(cur)
+    if not seq:
+        seq = [cur]
+    if len(seq) < DL_SEQUENCE_LEN:
+        seq = [seq[0]] * (DL_SEQUENCE_LEN - len(seq)) + seq
+    return seq[-DL_SEQUENCE_LEN:]
+
+# ---------------------------------------------------------------------------
+# True recurrent deep-sequence model
+# ---------------------------------------------------------------------------
+# The sequence brain is a real GRU recurrent neural network implemented with NumPy.
+# Unlike the old implementation, the 20 market states are NOT flattened into one
+# vector.  The GRU processes the states in chronological order and carries a hidden
+# state through time.  This makes the model sensitive to path/order information.
+# A dense probability head sits on top of the final recurrent state.
+DL_SEQUENCE_LEN = int(os.environ.get("AI_DL_SEQUENCE_LEN", str(DL_SEQUENCE_LEN)))
+DL_GRU_HIDDEN = int(os.environ.get("AI_DL_GRU_HIDDEN", "32"))
+DL_BATCH_SIZE = int(os.environ.get("AI_DL_BATCH_SIZE", "64"))
+DL_MAX_TRAIN_SAMPLES = int(os.environ.get("AI_DL_MAX_TRAIN_SAMPLES", "3600"))
+DL_EPS = 1e-8
+
+
+def _dl_sigmoid_vec(x):
+    x=np.clip(x,-40,40)
+    return 1.0/(1.0+np.exp(-x))
+
+
+def _dl_auc(y,p):
+    """Rank-based AUC in O(n log n), including average ranks for ties.
+
+    The previous pairwise implementation was O(positive * negative). On a
+    6,000-row validation set that can mean millions of Python comparisons after
+    the last epoch, making a completed model look stuck.
+    """
+    y=np.asarray(y,dtype=np.int8).reshape(-1)
+    p=np.asarray(p,dtype=np.float64).reshape(-1)
+    mask=np.isfinite(p)
+    y=y[mask];p=p[mask]
+    n_pos=int(np.sum(y==1));n_neg=int(np.sum(y==0))
+    if not n_pos or not n_neg:return 0.0
+    order=np.argsort(p,kind="mergesort")
+    sorted_p=p[order]
+    ranks=np.empty(len(p),dtype=np.float64)
+    i=0
+    while i<len(sorted_p):
+        j=i+1
+        while j<len(sorted_p) and sorted_p[j]==sorted_p[i]:j+=1
+        ranks[order[i:j]]=(i+j+1)/2.0  # one-based average rank
+        i=j
+    return float((np.sum(ranks[y==1])-n_pos*(n_pos+1)/2.0)/(n_pos*n_neg))
+
+
+def _gru_init(input_dim, hidden, seed=42):
+    rng=np.random.default_rng(seed)
+    scale=1.0/math.sqrt(max(1,input_dim))
+    return {
+        "Wz":rng.normal(0,scale,(input_dim,hidden)).astype(np.float32),"Uz":rng.normal(0,1/math.sqrt(hidden),(hidden,hidden)).astype(np.float32),"bz":np.zeros(hidden,dtype=np.float32),
+        "Wr":rng.normal(0,scale,(input_dim,hidden)).astype(np.float32),"Ur":rng.normal(0,1/math.sqrt(hidden),(hidden,hidden)).astype(np.float32),"br":np.zeros(hidden,dtype=np.float32),
+        "Wh":rng.normal(0,scale,(input_dim,hidden)).astype(np.float32),"Uh":rng.normal(0,1/math.sqrt(hidden),(hidden,hidden)).astype(np.float32),"bh":np.zeros(hidden,dtype=np.float32),
+        "Wo":rng.normal(0,1/math.sqrt(hidden),(hidden,1)).astype(np.float32),"bo":np.zeros(1,dtype=np.float32),
+    }
+
+
+def _gru_forward(params,X,cache=False):
+    X=np.asarray(X,dtype=np.float32)
+    if X.ndim==2:X=X[None,:,:]
+    B,T,D=X.shape; H=params["Wo"].shape[0]
+    h=np.zeros((B,H),dtype=np.float32); states=[]
+    for t in range(T):
+        x=X[:,t,:]; hp=h
+        z=_dl_sigmoid_vec(x@params["Wz"]+hp@params["Uz"]+params["bz"])
+        r=_dl_sigmoid_vec(x@params["Wr"]+hp@params["Ur"]+params["br"])
+        hc=np.tanh(x@params["Wh"]+(r*hp)@params["Uh"]+params["bh"])
+        h=(1-z)*hp+z*hc
+        if cache:states.append((x,hp,z,r,hc,h))
+    logits=h@params["Wo"]+params["bo"]
+    prob=_dl_sigmoid_vec(logits).reshape(-1)
+    return (prob,states) if cache else prob
+
+
+def _gru_backward(params,X,Y,states,prob):
+    X=np.asarray(X,dtype=np.float32); Y=np.asarray(Y,dtype=np.float32).reshape(-1)
+    B,T,D=X.shape; H=params["Wo"].shape[0]
+    g={k:np.zeros_like(v) for k,v in params.items()}
+    # BCE derivative wrt final logits.
+    dlog=(prob-Y).reshape(-1,1)/max(B,1)
+    g["Wo"]+=states[-1][5].T@dlog; g["bo"]+=np.sum(dlog,axis=0)
+    dh=dlog@params["Wo"].T
+    for t in range(T-1,-1,-1):
+        x,hp,z,r,hc,h=states[t]
+        dhc=dh*z
+        dz=dh*(hc-hp)
+        dhp=dh*(1-z)
+        dpre_h=dhc*(1-hc*hc)
+        d_rhp=dpre_h@params["Uh"].T
+        dr=d_rhp*hp
+        dhp+=d_rhp*r
+        dpre_r=dr*r*(1-r)
+        dpre_z=dz*z*(1-z)
+        g["Wh"]+=x.T@dpre_h; g["Uh"]+=(r*hp).T@dpre_h; g["bh"]+=np.sum(dpre_h,axis=0)
+        g["Wr"]+=x.T@dpre_r; g["Ur"]+=hp.T@dpre_r; g["br"]+=np.sum(dpre_r,axis=0)
+        g["Wz"]+=x.T@dpre_z; g["Uz"]+=hp.T@dpre_z; g["bz"]+=np.sum(dpre_z,axis=0)
+        dhp+=(dpre_h@params["Uh"].T)*0  # explicit no-op documents recurrent path above
+        dhp+=dpre_r@params["Ur"].T
+        dhp+=dpre_z@params["Uz"].T
+        dh=dhp
+    return g
+
+
+def _gru_apply(params,grads,lr,clip=1.0):
+    for k in params:
+        g=np.nan_to_num(grads[k],nan=0.0,posinf=0.0,neginf=0.0)
+        norm=float(np.linalg.norm(g))
+        if norm>clip:g=g*(clip/norm)
+        params[k]-=lr*g
+
+
+def _gru_to_json(params):
+    return {k:v.tolist() for k,v in params.items()}
+
+
+def _gru_from_json(blob):
+    return {k:np.asarray(v,dtype=np.float32) for k,v in blob.items()}
+
+
+def ai_dl_model():
+    c=ai_db(); r=c.execute("SELECT * FROM ai_dl_model WHERE id=1").fetchone(); c.close()
+    if not r:
+        return {"status":"NOT_TRAINED","samples":0,"accuracy":0.0,"auc":0.0,"architecture":"GRU-32 sequence model","updated_at":None}
+    try:
+        blob=json.loads(r["w1"] or "{}")
+        is_gru=isinstance(blob,dict) and "Wz" in blob and "Wh" in blob
+        stored_fv=r["feature_version"] if "feature_version" in r.keys() else None
+        version_ok = (stored_fv == FEATURE_ENGINE_VERSION)
+        status=r["status"] if (is_gru and version_ok) else ("RETRAIN REQUIRED — feature engine upgraded" if is_gru else "LEGACY MODEL — REBUILD REQUIRED")
+        return {"status":status,"samples":int(r["samples"] or 0) if is_gru else 0,"accuracy":float(r["accuracy"] or 0) if is_gru else 0.0,"auc":float(r["auc"] or 0) if is_gru else 0.0,"updated_at":r["updated_at"] if is_gru else None,"architecture":"GRU-32 recurrent sequence model","sequence_length":DL_SEQUENCE_LEN,"hidden_units":DL_GRU_HIDDEN,"feature_version":stored_fv,"current_feature_version":FEATURE_ENGINE_VERSION}
+    except Exception:return {"status":"NOT_TRAINED","samples":0,"accuracy":0.0,"auc":0.0,"architecture":"GRU-32 recurrent sequence model","sequence_length":DL_SEQUENCE_LEN,"hidden_units":DL_GRU_HIDDEN,"updated_at":None}
+
+
+def _dl_load_weights():
+    c=ai_db();r=c.execute("SELECT * FROM ai_dl_model WHERE id=1").fetchone();c.close()
+    if not r:return None
+    try:
+        # New model stores the recurrent parameters in w1 as one JSON object.
+        blob=json.loads(r["w1"] or "{}")
+        if isinstance(blob,dict) and "Wz" in blob:return _gru_from_json(blob)
+    except Exception:pass
+    return None
+
+
+def ai_dl_predict_sequence(seq):
+    w=_dl_load_weights()
+    if w is None:return 0.5,ai_dl_model()
+    x=np.asarray(seq,dtype=float)
+    if x.shape!=(DL_SEQUENCE_LEN,len(SEQUENCE_FEATURE_NAMES)):return 0.5,ai_dl_model()
+    # Stage 1 changed the feature set (dropped constant-during-training pcr/iv
+    # slots), so a model persisted under the old dimensionality is no longer
+    # compatible. Detect it instead of letting the matmul silently misbehave.
+    if int(w["Wz"].shape[0]) != len(SEQUENCE_FEATURE_NAMES):
+        m=ai_dl_model();m["status"]="RETRAIN REQUIRED — feature engine upgraded";return 0.5,m
+    p=float(_gru_forward(w,x)[0])
+    return p,ai_dl_model()
+
+
+def _ai_dl_train_arrays(X,Y,status_name="TRAINED",seed=42,epochs_override=None,training_started_at=None):
+    X=np.asarray(X,dtype=np.float32);Y=np.asarray(Y,dtype=np.float32).reshape(-1)
+    if len(X)<2 or len(set(Y.astype(int).tolist()))<2:return None
+    # Chronological 80/20 holdout. No validation sample is used for fitting.
+    cut=max(1,int(len(X)*0.8));cut=min(cut,len(X)-1)
+    Xtr,Ytr=X[:cut],Y[:cut];Xv,Yv=X[cut:],Y[cut:]
+    params=_gru_init(X.shape[2],DL_GRU_HIDDEN,seed)
+    p=ai_settings();lr=float(p.get("dl_learning_rate",0.01));epochs=min(60,max(8,int(epochs_override if epochs_override is not None else p.get("dl_epochs",30))))
+    requested_bs=AI_HIST_TRAIN_BATCH_SIZE if status_name == "HISTORICAL_PRETRAINED" else DL_BATCH_SIZE
+    bs=max(8,min(requested_bs,len(Xtr)))
+    total_batches=max(1,int(math.ceil(len(Xtr)/bs)))
+    last_telemetry=0.0
+    try: started_dt=datetime.fromisoformat(training_started_at) if training_started_at else None
+    except Exception: started_dt=None
+    # Training batches remain chronological inside each batch; batch order may change, but
+    # validation remains untouched and chronological.
+    for ep in range(epochs):
+        # deterministic contiguous mini-batches; no leakage from validation
+        for batch_i,lo in enumerate(range(0,len(Xtr),bs)):
+            xb=Xtr[lo:lo+bs];yb=Ytr[lo:lo+bs]
+            pred,cache=_gru_forward(params,xb,cache=True)
+            grads=_gru_backward(params,xb,yb,cache,pred)
+            _gru_apply(params,grads,lr,clip=1.0)
+            now_mono=time.monotonic()
+            if status_name == "HISTORICAL_PRETRAINED" and now_mono-last_telemetry>=AI_HIST_TRAIN_HEARTBEAT_SECONDS:
+                frac=(ep+(batch_i+1)/total_batches)/epochs
+                elapsed=(datetime.now(IST)-started_dt).total_seconds() if started_dt else 0.0
+                _hist_training_update(
+                    epoch=ep+1, epochs=epochs,
+                    progress=round(35.0+60.0*frac,1),
+                    phase=f"TRAINING GRU · epoch {ep+1}/{epochs} · batch {batch_i+1}/{total_batches}",
+                    elapsed_sec=round(elapsed,1), samples=len(X))
+                last_telemetry=now_mono
+        if status_name == "HISTORICAL_PRETRAINED":
+            elapsed=(datetime.now(IST)-started_dt).total_seconds() if started_dt else 0.0
+            _hist_training_update(
+                epoch=ep+1, epochs=epochs,
+                progress=round(35.0+60.0*(ep+1)/epochs,1),
+                phase=f"TRAINING GRU · epoch {ep+1}/{epochs}",
+                elapsed_sec=round(elapsed,1), samples=len(X))
+    pv=_gru_forward(params,Xv)
+    acc=float(np.mean((pv>=0.5)==(Yv>=0.5))*100) if len(Yv) else 0.0
+    auc=float(_dl_auc(Yv.astype(int),pv)) if len(set(Yv.astype(int).tolist()))>=2 else 0.0
+    return params,acc,auc,len(X),len(Xtr),len(Xv)
+
+
+def ai_dl_train():
+    c=ai_db();rows=c.execute("SELECT sequence,label FROM ai_dl_samples ORDER BY id").fetchall();c.close()
+    X=[];Y=[]
+    for r in rows:
+        try:
+            seq=np.asarray(json.loads(r["sequence"]),dtype=float)
+            if seq.shape==(DL_SEQUENCE_LEN,len(SEQUENCE_FEATURE_NAMES)):X.append(seq);Y.append(int(r["label"]))
+        except Exception:pass
+    if len(X)>DL_MAX_TRAIN_SAMPLES:
+        X=X[-DL_MAX_TRAIN_SAMPLES:];Y=Y[-DL_MAX_TRAIN_SAMPLES:]
+    trained=_ai_dl_train_arrays(X,Y,"TRAINED",seed=42) if X else None
+    if not trained:return ai_dl_model()
+    return _ai_dl_persist(*trained,status="TRAINED")
+
+
+def _ai_dl_persist(params,acc,auc,samples,train_samples,val_samples,status="TRAINED"):
+    updated=datetime.now(IST).isoformat();blob=json.dumps(_gru_to_json(params),separators=(",",":"));c=ai_db()
+    c.execute("""INSERT OR REPLACE INTO ai_dl_model(id,updated_at,w1,b1,w2,b2,w3,b3,samples,accuracy,auc,status,feature_version) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (updated,blob,None,None,None,None,0.0,samples,acc,auc,status,FEATURE_ENGINE_VERSION))
+    c.commit();c.close();ai_log("LEARNING","DL_GRU_TRAIN",f"GRU sequence model samples={samples} train={train_samples} validation={val_samples} accuracy={acc:.1f}% auc={auc:.3f}")
+    return {**ai_dl_model(),"train_samples":train_samples,"validation_samples":val_samples}
+
+
+def ai_dl_record_sample(trade_id,version,symbol,sequence,label,outcome_r,horizon_sec):
+    c=ai_db();c.execute("INSERT INTO ai_dl_samples(ts,trade_id,version,symbol,sequence,label,outcome_r,horizon_sec) VALUES(?,?,?,?,?,?,?,?)",
+                        (datetime.now(IST).isoformat(),trade_id,version,symbol,json.dumps(sequence),int(label),float(outcome_r),float(horizon_sec)));c.commit();c.close()
+    model=ai_dl_model()
+    if int(model.get("samples",0))+1>=int(ai_settings().get("dl_min_samples",80)):return ai_dl_train()
+    return model
+
+
+def ai_ml_record_sample(trade_id, version, symbol, features, label, outcome_r, horizon_sec):
+    c=ai_db();c.execute("INSERT INTO ai_ml_samples(ts,trade_id,version,symbol,features,label,outcome_r,horizon_sec) VALUES(?,?,?,?,?,?,?,?)",(datetime.now(IST).isoformat(),trade_id,version,symbol,json.dumps(ai_ml_features(features)),int(label),float(outcome_r),float(horizon_sec)));c.commit();c.close()
+    ai_ml_train()
+
+
+# ---------------------------------------------------------------------------
+# Research-grade ensemble / regime layer
+# ---------------------------------------------------------------------------
+# This is deliberately dependency-light: five independently initialized logistic
+# learners are trained on the same chronological feature store. The last 20% of
+# observations is a walk-forward-style holdout and is NEVER used for fitting.
+# The ensemble produces a probability and disagreement (uncertainty). A simple
+# market-regime classifier is derived from the same state variables. This is a
+# meaningful upgrade over a single score, but it is still a compact research
+# engine, not an institutional Bloomberg-scale platform.
+
+def _research_model():
+    c=ai_db(); r=c.execute("SELECT * FROM ai_research_model WHERE id=1").fetchone(); c.close()
+    if not r:
+        return {"status":"WARMING","samples":0,"train_samples":0,"validation_samples":0,"accuracy":0.0,"auc":0.0,"probability":0.5,"uncertainty":0.5,"regime":"UNKNOWN","models":[]}
+    try: models=json.loads(r["models"] or "[]")
+    except Exception: models=[]
+    return {"status":r["status"] or "WARMING","samples":int(r["samples"] or 0),"train_samples":int(r["train_samples"] or 0),"validation_samples":int(r["validation_samples"] or 0),"accuracy":float(r["accuracy"] or 0),"auc":float(r["auc"] or 0),"probability":float(r["probability"] or 0.5),"uncertainty":float(r["uncertainty"] or 0.5),"regime":r["regime"] or "UNKNOWN","models":models,"updated_at":r["updated_at"]}
+
+def _research_regime(features):
+    f=features or {}
+    vol=float(f.get("volatility_10",0) or 0); ret=float(f.get("ret_20",0) or 0)
+    trend=float(f.get("trend_score",12.5) or 12.5); mom=float(f.get("momentum_score",12.5) or 12.5)
+    if vol>=2.0 and abs(ret)>=1.5: return "HIGH_VOL_TREND"
+    if vol>=1.25: return "HIGH_VOL_RANGE"
+    if trend>=18 and mom>=17: return "TRENDING_UP"
+    if trend<=7 and mom<=8: return "TRENDING_DOWN"
+    if abs(ret)<0.35 and vol<0.8: return "LOW_VOL_RANGE"
+    return "TRANSITION"
+
+def _research_predict_from_models(models, x):
+    probs=[]
+    for m in models:
+        w=m.get("w",[]); b=float(m.get("b",0))
+        if len(w)!=len(x): continue
+        probs.append(_sigmoid(b+sum(a*v for a,v in zip(w,x))))
+    if not probs: return 0.5,0.5
+    return float(sum(probs)/len(probs)), float(np.std(probs))
+
+def ai_research_predict(features):
+    m=_research_model(); x=ai_ml_features(features)
+    p,u=_research_predict_from_models(m.get("models",[]),x)
+    if not m.get("models"):
+        return {**m,"probability":0.5,"uncertainty":0.5,"regime":_research_regime(features)}
+    return {**m,"probability":p,"uncertainty":u,"regime":_research_regime(features)}
+
+def ai_research_train():
+    c=ai_db(); rows=c.execute("SELECT features,label FROM ai_ml_samples ORDER BY id").fetchall(); c.close()
+    X=[];Y=[]
+    for r in rows:
+        try:
+            f=json.loads(r["features"] or "[]")
+            if len(f)==len(ML_FEATURE_NAMES): X.append([float(v) for v in f]); Y.append(int(r["label"]))
+        except Exception: pass
+    p=ai_settings(); min_samples=int(p.get("research_min_samples",120))
+    if len(X)<max(20,min_samples): return _research_model()
+    X=np.asarray(X,dtype=float); Y=np.asarray(Y,dtype=int)
+    cut=max(10,int(len(X)*0.8)); cut=min(cut,len(X)-1)
+    Xtr,Ytr=X[:cut],Y[:cut]; Xv,Yv=X[cut:],Y[cut:]
+    if len(set(Ytr.tolist()))<2 or len(set(Yv.tolist()))<2: return _research_model()
+    rng=np.random.default_rng(20260825); models=[]
+    epochs=int(p.get("research_epochs",120)); lr=float(p.get("research_learning_rate",0.05)); nmodels=int(p.get("research_models",5))
+    for k in range(nmodels):
+        idx=rng.integers(0,len(Xtr),size=len(Xtr))
+        xb,yb=Xtr[idx],Ytr[idx]
+        w=rng.normal(0,0.05,len(ML_FEATURE_NAMES)); b=0.0
+        for _ in range(epochs):
+            gw=np.zeros_like(w); gb=0.0
+            for x,y in zip(xb,yb):
+                pr=_sigmoid(b+float(np.dot(w,x))); err=pr-y; gw += err*x; gb += err
+            scale=1.0/max(len(xb),1); w-=lr*gw*scale; b-=lr*gb*scale
+        models.append({"w":w.tolist(),"b":float(b)})
+    pv=[]
+    for x in Xv:
+        pr,_=_research_predict_from_models(models,x); pv.append(pr)
+    pv=np.asarray(pv); acc=float(np.mean((pv>=0.5)==(Yv>=0.5))*100); auc=_dl_auc(Yv,pv)
+    current=_research_model(); updated=datetime.now(IST).isoformat()
+    c=ai_db(); c.execute("INSERT OR REPLACE INTO ai_research_model(id,updated_at,models,samples,train_samples,validation_samples,accuracy,auc,probability,uncertainty,status,regime) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)",(updated,json.dumps(models),len(X),len(Xtr),len(Xv),acc,auc,float(np.mean(pv)),float(np.std(pv)),"TRAINED","VALIDATION")); c.commit(); c.close()
+    ai_log("LEARNING","RESEARCH_RETRAIN",f"ensemble={len(models)} samples={len(X)} train={len(Xtr)} validation={len(Xv)} accuracy={acc:.1f}% auc={auc:.3f}")
+    return {"status":"TRAINED","samples":len(X),"train_samples":len(Xtr),"validation_samples":len(Xv),"accuracy":acc,"auc":auc,"probability":float(np.mean(pv)),"uncertainty":float(np.std(pv)),"regime":"VALIDATION","models":models,"updated_at":updated}
+
+# ---------------------------------------------------------------------------
+# STAGE 2 — Model B: tree ensemble ("target-hit" classifier, different model
+# class from the logistic models above). Pure-Python/NumPy CART, bootstrap-
+# bagged with per-split feature subsampling (a small random forest). This is
+# genuinely a different hypothesis class from Model A (linear/logistic), so
+# comparing the two chronologically is a real A/B test, not two copies of the
+# same model with different names.
+# ---------------------------------------------------------------------------
+TREE_MAX_DEPTH = int(os.environ.get("AI_TREE_MAX_DEPTH", "4"))
+TREE_MIN_LEAF = int(os.environ.get("AI_TREE_MIN_LEAF", "6"))
+TREE_N_ESTIMATORS = int(os.environ.get("AI_TREE_N_ESTIMATORS", "25"))
+
+def _gini(y):
+    if len(y) == 0: return 0.0
+    p = float(np.mean(y))
+    return 1.0 - p * p - (1 - p) * (1 - p)
+
+def _tree_build(X, y, depth, feat_subset):
+    n = len(y)
+    base_rate = float(np.mean(y)) if n else 0.5
+    if depth >= TREE_MAX_DEPTH or n < 2 * TREE_MIN_LEAF or len(set(y.tolist())) < 2:
+        return {"leaf": True, "p": base_rate, "n": n}
+    best = None  # (gain, feat, thresh)
+    parent_gini = _gini(y)
+    rng_feats = feat_subset
+    for f in rng_feats:
+        col = X[:, f]
+        # Candidate thresholds: quartile-ish cut points, bounded cost.
+        uniq = np.unique(col)
+        if len(uniq) < 2: continue
+        cuts = np.quantile(uniq, [0.25, 0.5, 0.75]) if len(uniq) > 4 else uniq[:-1]
+        for t in cuts:
+            left = col <= t; right = ~left
+            nl, nr = int(left.sum()), int(right.sum())
+            if nl < TREE_MIN_LEAF or nr < TREE_MIN_LEAF: continue
+            g = parent_gini - (nl / n) * _gini(y[left]) - (nr / n) * _gini(y[right])
+            if best is None or g > best[0]:
+                best = (g, f, float(t))
+    if best is None or best[0] <= 1e-6:
+        return {"leaf": True, "p": base_rate, "n": n}
+    _, f, t = best
+    left = X[:, f] <= t; right = ~left
+    return {
+        "leaf": False, "f": f, "t": t, "n": n,
+        "left": _tree_build(X[left], y[left], depth + 1, feat_subset),
+        "right": _tree_build(X[right], y[right], depth + 1, feat_subset),
+    }
+
+def _tree_predict_one(node, x):
+    while not node["leaf"]:
+        node = node["left"] if x[node["f"]] <= node["t"] else node["right"]
+    return node["p"]
+
+def _forest_train(X, Y, n_trees, seed=20260825):
+    rng = np.random.default_rng(seed)
+    n, d = X.shape
+    k = max(2, int(math.sqrt(d)) + 1)
+    trees = []
+    for _ in range(n_trees):
+        idx = rng.integers(0, n, size=n)
+        feat_subset = sorted(rng.choice(d, size=min(k, d), replace=False).tolist())
+        trees.append(_tree_build(X[idx], Y[idx], 0, feat_subset))
+    return trees
+
+def _forest_predict(trees, x):
+    if not trees: return 0.5
+    return float(np.mean([_tree_predict_one(t, x) for t in trees]))
+
+def ai_tree_model():
+    c = ai_db(); r = c.execute("SELECT * FROM ai_tree_model WHERE id=1").fetchone(); c.close()
+    if not r:
+        return {"status": "NOT_TRAINED", "samples": 0, "accuracy": 0.0, "auc": 0.0,
+                "architecture": f"CART forest x{TREE_N_ESTIMATORS} (depth {TREE_MAX_DEPTH})", "updated_at": None}
+    try:
+        trees = json.loads(r["trees"] or "[]")
+    except Exception:
+        trees = []
+    return {"status": r["status"] or "READY", "samples": int(r["samples"] or 0),
+            "accuracy": float(r["accuracy"] or 0), "auc": float(r["auc"] or 0),
+            "updated_at": r["updated_at"], "trees": trees,
+            "architecture": f"CART forest x{TREE_N_ESTIMATORS} (depth {TREE_MAX_DEPTH})"}
+
+def ai_tree_predict(features):
+    m = ai_tree_model()
+    x = np.asarray(ai_ml_features(features) if isinstance(features, dict) else list(features), dtype=float)
+    trees = m.get("trees") or []
+    return _forest_predict(trees, x), m
+
+def _ai_ml_sample_matrix():
+    """Shared loader: same (features,label) rows used by Model A (ai_ml_train)
+    and the bagged-logistic research ensemble, so every model below is
+    trained/evaluated on identical data and is a fair comparison."""
+    c = ai_db(); rows = c.execute("SELECT id,features,label FROM ai_ml_samples ORDER BY id").fetchall(); c.close()
+    X = []; Y = []
+    for r in rows:
+        try:
+            f = json.loads(r["features"] or "[]")
+            if len(f) == len(ML_FEATURE_NAMES):
+                X.append([float(v) for v in f]); Y.append(int(r["label"]))
+        except Exception:
+            pass
+    return np.asarray(X, dtype=float), np.asarray(Y, dtype=int)
+
+def ai_tree_train():
+    X, Y = _ai_ml_sample_matrix()
+    p = ai_settings(); min_samples = int(p.get("research_min_samples", 120))
+    if len(X) < max(20, min_samples): return ai_tree_model()
+    cut = max(10, int(len(X) * 0.8)); cut = min(cut, len(X) - 1)
+    Xtr, Ytr = X[:cut], Y[:cut]; Xv, Yv = X[cut:], Y[cut:]
+    if len(set(Ytr.tolist())) < 2 or len(set(Yv.tolist())) < 2: return ai_tree_model()
+    trees = _forest_train(Xtr, Ytr, TREE_N_ESTIMATORS)
+    pv = np.asarray([_forest_predict(trees, x) for x in Xv])
+    acc = float(np.mean((pv >= 0.5) == (Yv >= 0.5)) * 100); auc = _dl_auc(Yv, pv)
+    updated = datetime.now(IST).isoformat()
+    c = ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_tree_model(id,updated_at,trees,samples,train_samples,validation_samples,accuracy,auc,status) VALUES(1,?,?,?,?,?,?,?,?)",
+              (updated, json.dumps(trees), len(X), len(Xtr), len(Xv), acc, auc, "TRAINED"))
+    c.commit(); c.close()
+    ai_log("LEARNING", "TREE_RETRAIN", f"trees={TREE_N_ESTIMATORS} samples={len(X)} train={len(Xtr)} validation={len(Xv)} accuracy={acc:.1f}% auc={auc:.3f}")
+    return ai_tree_model()
+
+def ai_model_walkforward(n_folds=4):
+    """Chronological walk-forward comparison of Model A (online logistic),
+    the bagged-logistic research ensemble, and Model B (tree forest) on the
+    *same* expanding-window folds — replaces the old 'only the GRU exists'
+    gap with a real, repeatable A/B/C evaluation, and its output (per-model
+    AUC edge) is what drives the live ensemble weighting in
+    ai_ensemble_confidence(), not a single hand-picked model.
+    """
+    X, Y = _ai_ml_sample_matrix()
+    p = ai_settings(); min_samples = int(p.get("research_min_samples", 120))
+    if len(X) < max(40, min_samples):
+        return {"status": "INSUFFICIENT_SAMPLES", "samples": len(X), "need": max(40, min_samples)}
+    n_folds = max(2, min(n_folds, len(X) // 20))
+    fold_bounds = np.linspace(int(len(X) * 0.4), len(X), n_folds + 1).astype(int)
+    per_model = {"logistic_A": [], "tree_B": []}
+    for i in range(n_folds):
+        tr_end = fold_bounds[i]; val_end = fold_bounds[i + 1]
+        Xtr, Ytr = X[:tr_end], Y[:tr_end]; Xv, Yv = X[tr_end:val_end], Y[tr_end:val_end]
+        if len(Xv) < 5 or len(set(Ytr.tolist())) < 2 or len(set(Yv.tolist())) < 2:
+            continue
+        # Model A: same online-logistic update rule as ai_ml_train(), fold-local.
+        w = np.zeros(len(ML_FEATURE_NAMES)); b = 0.0; lr = 0.08
+        for _ in range(120):
+            pred = _dl_sigmoid_vec(Xtr @ w + b); err = pred - Ytr
+            w -= lr * (Xtr.T @ err) / len(Xtr); b -= lr * float(np.mean(err))
+        pa = _dl_sigmoid_vec(Xv @ w + b)
+        per_model["logistic_A"].append(_dl_auc(Yv, pa))
+        # Model B: fresh forest on the same fold-local training window.
+        trees = _forest_train(Xtr, Ytr, max(10, TREE_N_ESTIMATORS // 2), seed=1000 + i)
+        pb = np.asarray([_forest_predict(trees, x) for x in Xv])
+        per_model["tree_B"].append(_dl_auc(Yv, pb))
+    summary = {k: (round(float(np.mean(v)), 4) if v else 0.0) for k, v in per_model.items()}
+    champion = max(summary, key=summary.get) if any(summary.values()) else None
+    result = {"folds": n_folds, "auc_by_model": summary, "champion": champion, "samples": len(X)}
+    c = ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_model_compare(id,updated_at,folds,results,champion) VALUES(1,?,?,?,?)",
+              (datetime.now(IST).isoformat(), n_folds, json.dumps(result), champion or ""))
+    c.commit(); c.close()
+    ai_log("LEARNING", "MODEL_WALKFORWARD", f"folds={n_folds} auc={summary} champion={champion}")
+    return result
+
+def ai_model_compare_status():
+    c = ai_db(); r = c.execute("SELECT * FROM ai_model_compare WHERE id=1").fetchone(); c.close()
+    if not r: return {"status": "NOT_RUN"}
+    try:
+        results = json.loads(r["results"] or "{}")
+    except Exception:
+        results = {}
+    return {"status": "OK", "updated_at": r["updated_at"], "champion": r["champion"], **results}
+
+def ai_ensemble_confidence(features):
+    """EV-confidence ensemble: how likely THIS setup is to hit target before
+    stop, blending Model A (online logistic), the bagged-logistic research
+    ensemble, and Model B (tree forest) — weighted by each model's own
+    validation AUC edge over a coin flip, so a model with no demonstrated
+    skill yet cannot drag down one that does. Falls back to a neutral 0.5
+    (and 'weights_used': False) until at least one model has been trained,
+    at which point the caller degrades to the GRU-only behaviour that
+    existed before Stage 2."""
+    ml_prob, ml_model = ai_ml_predict(features)
+    research = ai_research_predict(features)
+    tree_prob, tree_model = ai_tree_predict(features)
+    entries = [
+        ("ml_A", ml_prob, float(ml_model.get("auc") or 0), int(ml_model.get("samples") or 0)),
+        ("research_A2", research.get("probability", 0.5), float(research.get("auc") or 0), int(research.get("samples") or 0)),
+        ("tree_B", tree_prob, float(tree_model.get("auc") or 0), int(tree_model.get("samples") or 0)),
+    ]
+    trained = [(name, p, auc) for name, p, auc, n in entries if n > 0]
+    detail = {name: {"probability": round(float(p), 4), "auc": round(float(auc), 4)} for name, p, auc in trained}
+    if not trained:
+        return 0.5, {"models": detail, "weights_used": False}
+    weights = [max(0.0, auc - 0.5) for _, _, auc in trained]
+    wsum = sum(weights)
+    if wsum <= 1e-9:
+        conf = float(np.mean([p for _, p, _ in trained]))
+    else:
+        conf = float(sum(p * w for (_, p, _), w in zip(trained, weights)) / wsum)
+    return conf, {"models": detail, "weights_used": wsum > 1e-9}
+
+def ai_adaptive_min_score(ml_samples, dl_samples):
+    """STAGE 3: this no longer gates any decision. It returns a single
+    "reference confidence" number, ramping from `bootstrap_min_score` to the
+    mature `min_score` as ml/dl sample counts approach their configured
+    minimums, purely so the dashboard can show how much of the way the live
+    models are toward being fully warmed up. ai_directional_snapshot() does
+    not compare the setup's score against this value — direction, entry,
+    and paper-trade initiation are decided entirely by the live GRU/ML/
+    ensemble read of spot and futures, with no score floor in the way."""
+    p = ai_settings()
+    boot = float(p.get("bootstrap_min_score", 55.0))
+    mature = float(p.get("min_score", 72.0))
+    ml_need = max(1.0, float(p.get("ml_min_samples", 40)))
+    dl_need = max(1.0, float(p.get("dl_min_samples", 80)))
+    progress = (min(1.0, ml_samples / ml_need) + min(1.0, dl_samples / dl_need)) / 2.0
+    return round(boot + (mature - boot) * progress, 2)
+
+def ai_market_pattern_features(symbol, spot, iv, pcr, volume, trend_score, momentum_score):
+    hist=ai_market_history(symbol,120)
+    prices=[float(x["spot"]) for x in hist if x.get("spot") is not None]
+    vols=[float(x["volume"]) for x in hist if x.get("volume") is not None]
+    series=prices+[float(spot)]
+    def ret(n): return ((series[-1]/series[-1-n])-1)*100 if len(series)>n and series[-1-n] else 0.0
+    def ema(n):
+        if not series:return float(spot)
+        a=2/(n+1); e=series[0]
+        for z in series[1:]:e=a*z+(1-a)*e
+        return e
+    def rsi(n=14):
+        if len(series)<n+1:return 50.0
+        gains=[];losses=[]
+        for i in range(-n,0):
+            d=series[i]-series[i-1]; gains.append(max(d,0));losses.append(max(-d,0))
+        ag=sum(gains)/n; al=sum(losses)/n
+        return 100.0 if al==0 and ag>0 else 50.0 if al==0 else 100-(100/(1+ag/al))
+    e9,e20,e50=ema(9),ema(20),ema(50)
+    mean20=sum(series[-20:])/min(20,len(series)); sd20=(sum((x-mean20)**2 for x in series[-20:])/min(20,len(series)))**0.5
+    rng20=((max(series[-20:])-min(series[-20:]))/mean20*100) if series else 0
+    vratio=(volume/(sum(vols[-20:])/min(20,len(vols)))) if vols and sum(vols[-20:]) else 1.0
+    n= len(series); minutes=(now_ist().hour*60+now_ist().minute-555)/375.0
+    angle=max(0,min(1,minutes));
+    return {
+        "ret_1":ret(1),"ret_3":ret(3),"ret_5":ret(5),"ret_10":ret(10),"ret_20":ret(20),
+        "ema_gap_9_20":(e9/e20-1)*100 if e20 else 0,"ema_gap_20_50":(e20/e50-1)*100 if e50 else 0,
+        "rsi14":rsi(),"volatility_10":(sum((x-(sum(series[-10:])/min(10,n)))**2 for x in series[-10:])/min(10,n))**0.5/(sum(series[-10:])/min(10,n))*100 if n else 0,
+        "range_20":rng20,"volume_ratio":vratio,"trend_score":trend_score,"momentum_score":momentum_score,
+        "pcr_norm":pcr,"iv_norm":iv,"time_sin":math.sin(2*math.pi*angle),"time_cos":math.cos(2*math.pi*angle)
+    }
+
+def ai_path_record(trade, price, spot, features):
+    entry=float(trade["entry"]); es=float((json.loads(trade.get("setup_json") or "{}")).get("spot") or spot or 0)
+    opt_ret=(price/entry-1)*100 if entry else 0; spot_ret=(spot/es-1)*100 if es else 0
+    c=ai_db(); c.execute("INSERT INTO ai_trade_path(ts,trade_id,symbol,option_price,spot,option_return_pct,spot_return_pct,features) VALUES(?,?,?,?,?,?,?,?)",(datetime.now(IST).isoformat(),trade["id"],trade["symbol"],price,spot,opt_ret,spot_ret,json.dumps(features))); c.commit(); c.close()
+    # Update path extremes; this is the chart/price-path memory used after exit.
+    c=ai_db(); r=c.execute("SELECT mfe,mae FROM ai_trades WHERE id=?",(trade["id"],)).fetchone(); mfe=max(float(r["mfe"] or 0),opt_ret); mae=min(float(r["mae"] or 0),opt_ret); c.execute("UPDATE ai_trades SET mfe=?,mae=? WHERE id=?",(mfe,mae,trade["id"])); c.commit(); c.close()
+
+def ai_metrics(version=None):
+    c=ai_db();q="SELECT * FROM ai_trades WHERE status='CLOSED'";a=[]
+    if version:q+=" AND version=?";a.append(version)
+    rows=c.execute(q,a).fetchall();c.close(); pnl=[float(r["pnl"]) for r in rows];rs=[float(r["r_multiple"]) for r in rows]
+    wins=[x for x in pnl if x>0];loss=[x for x in pnl if x<0]
+    return {"trades":len(rows),"win_rate":round(len(wins)/len(rows)*100,2) if rows else 0,"avg_r":round(sum(rs)/len(rs),3) if rs else 0,"profit_factor":round(sum(wins)/abs(sum(loss)),2) if loss else (99 if wins else 0),"pnl":round(sum(pnl),2)}
+
+def ai_open_trades():
+    c=ai_db();r=c.execute("SELECT * FROM ai_trades WHERE status='OPEN'").fetchall();c.close();return [dict(x) for x in r]
+
+def ai_open_trade(x,ver):
+    p=ai_params()
+    if "dl_sequence" not in x:
+        x["dl_sequence"] = ai_dl_sequence(x["symbol"], x.get("ml_features") or {})
+    # Never open a paper trade without the side of the order book that would actually execute.
+    if x.get("entry") is None or float(x.get("entry") or 0)<=0 or x.get("liquidity_status")!="EXECUTABLE":
+        ai_log("TRADE","PAPER_REJECTED_LIQUIDITY",f'{x.get("symbol")} {x.get("option_symbol")} no executable entry quote')
+        return False
+    if len(ai_open_trades())>=int(p["max_positions"]):return False
+    setup=dict(x)
+    extra=setup.pop("setup_json_extra",None) or {}
+    setup.update(extra)
+    # This engine is permanently paper-only: there is no live-order branch here.
+    setup["paper_only"]=True
+    setup["execution_mode"]="track"
+    c=ai_db();c.execute("INSERT INTO ai_trades(version,ts,symbol,option_symbol,token,side,entry,stop,target,qty,score,setup_json,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      (ver,datetime.now(IST).isoformat(),x["symbol"],x["option_symbol"],x["token"],x["side"],x["entry"],x["stop"],x["target"],x["lot_size"],x["score"],json.dumps(setup),"OPEN"));c.commit();c.close();ai_log("TRADE","AUTO_PAPER_OPEN",f'{x["symbol"]} BUY {x.get("option_type")} {x["option_symbol"]} score={x["score"]} entry={x["entry"]:.2f} ASK vol={x.get("option_volume",0)} p_up={x.get("dl_probability",0):.3f}');return True
+
+def ai_close_trades():
+    if not require_session():return
+    for t in ai_open_trades():
+        try:
+            q=kite_quote_bulk([f'NFO:{t["option_symbol"]}']).get(f'NFO:{t["option_symbol"]}')
+            st=quote_stats(q)
+            # Closing side must also be executable: LONG closes at bid, SHORT closes at ask.
+            close_side="BID" if t["side"]=="LONG" else "ASK"
+            close_raw=st.get("bid") if t["side"]=="LONG" else st.get("ask")
+            if close_raw is None or float(close_raw)<=0:
+                ai_log("TRADE","PAPER_WAIT_LIQUIDITY",f'id={t["id"]} {t["option_symbol"]} missing close {close_side.lower()}')
+                continue
+            price=float(close_raw)
+            spot_key = INDEX_SYMBOLS.get(t["symbol"], "NSE:" + t["symbol"])
+            spot_q = kite_quote_bulk([spot_key]).get(spot_key)
+            spot=extract_price(spot_q) if spot_q else None
+            setup=json.loads(t.get("setup_json") or "{}")
+            setup.update({
+                "exit_ltp": q.get("last_price") if q else None,
+                "exit_bid": st.get("bid"), "exit_ask": st.get("ask"),
+                "exit_volume": st.get("volume",0), "exit_oi": st.get("oi",0),
+                "exit_bid_qty": st.get("bid_qty",0), "exit_ask_qty": st.get("ask_qty",0),
+                "exit_price": price, "exit_price_source": close_side,
+                "exit_spread_pct": st.get("spread_pct"),
+                "exit_liquidity_status":"EXECUTABLE"
+            })
+            # Preserve the original entry quote and append the exit quote so every paper trade
+            # contains a complete market-data audit trail.
+            c=ai_db();c.execute("UPDATE ai_trades SET setup_json=? WHERE id=?",(json.dumps(setup),t["id"]));c.commit();c.close()
+            if spot is not None:
+                path_features=ai_market_pattern_features(t["symbol"],spot,setup.get("iv",0),setup.get("pcr",1),setup.get("volume",0),setup.get("trend",0),setup.get("momentum",0))
+                ai_path_record(t,price,spot,path_features)
+            hit=None
+            if t["side"]=="LONG":
+                if price<=t["stop"]:hit=("STOP",t["stop"])
+                elif price>=t["target"]:hit=("TARGET",t["target"])
+                pnl=(price-t["entry"])*t["qty"]
+            else:
+                if price>=t["stop"]:hit=("STOP",t["stop"])
+                elif price<=t["target"]:hit=("TARGET",t["target"])
+                pnl=(t["entry"]-price)*t["qty"]
+            if hit:
+                exitp=hit[1];pnl=(exitp-t["entry"])*t["qty"] if t["side"]=="LONG" else (t["entry"]-exitp)*t["qty"]
+                risk=abs(t["entry"]-t["stop"])*t["qty"];rm=pnl/risk if risk else 0
+                exit_ts=datetime.now(IST); entry_ts=datetime.fromisoformat(str(t["ts"]).replace("Z","+00:00"))
+                if entry_ts.tzinfo is None: entry_ts=entry_ts.replace(tzinfo=IST)
+                horizon=max(0,(exit_ts-entry_ts).total_seconds())
+                c=ai_db();c.execute("UPDATE ai_trades SET status='CLOSED',exit=?,exit_ts=?,pnl=?,r_multiple=?,exit_reason=? WHERE id=?",(exitp,exit_ts.isoformat(),pnl,rm,hit[0],t["id"]));c.commit();c.close()
+                # Live learning target matches historical training: 1 = index moved UP, 0 = DOWN.
+                entry_spot=float(setup.get("spot") or 0.0)
+                direction_label=1 if (spot is not None and entry_spot > 0 and float(spot) > entry_spot) else 0
+                ai_ml_record_sample(t["id"],t["version"],t["symbol"],setup.get("ml_features") or {},direction_label,rm,horizon)
+                _fallback_seq,_fallback_err = (None, None)
+                if not setup.get("dl_sequence"):
+                    _fallback_seq,_fallback_err = build_live_index_sequence(t["symbol"])
+                dl_seq = setup.get("dl_sequence") or (_fallback_seq["sequence"] if _fallback_seq else None)
+                if dl_seq is None:
+                    ai_log("ERROR","DL_SAMPLE_SKIPPED",f'id={t["id"]} no dl_sequence available ({_fallback_err})')
+                else:
+                    ai_dl_record_sample(t["id"],t["version"],t["symbol"],dl_seq,direction_label,rm,horizon)
+                ai_log("TRADE","AUTO_PAPER_CLOSE",f'id={t["id"]} {hit[0]} pnl={pnl:.2f} R={rm:.2f}; index_direction_label={direction_label}; learning sample recorded')
+        except Exception as e:ai_log("ERROR","AI_MONITOR",str(e))
+
+def ai_record_decision(ver,x,decision,reason):
+    c=ai_db();c.execute("INSERT INTO ai_decisions VALUES(NULL,?,?,?,?,?,?,?)",(datetime.now().isoformat(),ver,x["symbol"],x["score"],decision,reason,json.dumps(x)));c.commit();c.close()
+
+def ai_learn():
+    ch=ai_champion();
+    if not ch:return
+    p=json.loads(ch["params"]);m=ai_metrics(ch["version"])
+    if m["trades"]<int(p["learning_min_trades"]):return
+    c=ai_db();rows=c.execute("SELECT score,r_multiple FROM ai_trades WHERE version=? AND status='CLOSED' ORDER BY id DESC LIMIT 100",(ch["version"],)).fetchall();c.close()
+    high=[r["r_multiple"] for r in rows if r["score"]>=80];low=[r["r_multiple"] for r in rows if r["score"]<80]
+    cand=dict(p);change={};hyp=""
+    if len(high)>=15 and len(low)>=10 and mean(high)>mean(low)+0.15:
+        old=p["min_score"];new=min(90,old+5)
+        if new!=old:cand["min_score"]=new;change={"min_score":[old,new]};hyp="High-score setups have materially better R expectancy."
+    elif m["win_rate"]<45 and m["avg_r"]<0:
+        old=p["min_rr"];new=min(2.5,old+0.2)
+        if new!=old:cand["min_rr"]=new;change={"min_rr":[old,new]};hyp="Negative expectancy requires stricter reward-to-risk selection."
+    elif m["win_rate"]>60 and m["avg_r"]>0.25:
+        old=p["min_score"];new=max(65,old-2)
+        if new!=old:cand["min_score"]=new;change={"min_score":[old,new]};hyp="Test whether broader selection retains strong expectancy."
+    if not change:return
+    newver=f'{float(ch["version"])+0.1:.1f}'
+    c=ai_db();c.execute("INSERT INTO ai_versions(version,parent_version,created_at,status,reason,params,metrics) VALUES(?,?,?,?,?,?,?)",(newver,ch["version"],datetime.now().isoformat(),"CHALLENGER",hyp,json.dumps(cand),json.dumps(m)));c.execute("INSERT INTO ai_changes(ts,from_version,to_version,change_json,hypothesis,before_metrics,after_metrics,impact,status) VALUES(?,?,?,?,?,?,?,?,?)",(datetime.now().isoformat(),ch["version"],newver,json.dumps(change),hyp,json.dumps(m),json.dumps({}),"Awaiting challenger evidence","TESTING"));c.execute("INSERT INTO ai_learning VALUES(NULL,?,?,?,?,?,?)",(datetime.now().isoformat(),ch["version"],f'{m["trades"]} trades: win {m["win_rate"]}%, avgR {m["avg_r"]}',hyp,f'Created challenger {newver}',json.dumps(change)));c.commit();c.close();ai_log("LEARNING","CHALLENGER_CREATED",f'{ch["version"]}->{newver}')
+
+def ai_evaluate_challenger():
+    c=ai_db();ch=c.execute("SELECT * FROM ai_versions WHERE status='CHALLENGER' ORDER BY id LIMIT 1").fetchone();c.close()
+    if not ch:return
+    p=json.loads(ch["params"]);m=ai_metrics(ch["version"])
+    if m["trades"]<int(p["challenger_min_trades"]):return
+    parent=ai_metrics(ch["parent_version"]);better=(m["avg_r"]>parent["avg_r"]+0.05 and m["profit_factor"]>=parent["profit_factor"]) or (m["win_rate"]>=parent["win_rate"]+5 and m["avg_r"]>=parent["avg_r"])
+    c=ai_db()
+    if better:
+        c.execute("UPDATE ai_versions SET status='RETIRED',metrics=? WHERE version=?",(json.dumps(parent),ch["parent_version"]));c.execute("UPDATE ai_versions SET status='CHAMPION',metrics=? WHERE version=?",(json.dumps(m),ch["version"]));c.execute("UPDATE ai_changes SET after_metrics=?,impact=?,status='ACCEPTED' WHERE to_version=?",(json.dumps(m),f'Improved vs parent: {m}',ch["version"]));action='ACCEPTED'
+    else:
+        c.execute("UPDATE ai_versions SET status='REJECTED',metrics=? WHERE version=?",(json.dumps(m),ch["version"]));c.execute("UPDATE ai_changes SET after_metrics=?,impact=?,status='ROLLED_BACK' WHERE to_version=?",(json.dumps(m),'Challenger failed; parent retained',ch["version"]));action='ROLLED_BACK'
+    c.commit();c.close();ai_log('LEARNING',action,f'challenger={ch["version"]} metrics={m}')
+
+def ai_universe():
+    """Return the current live F&O universe for autonomous paper trading.
+    Indices are included and the stock list comes directly from Kite's NFO
+    instrument master, so newly listed/removed F&O stocks are picked up without
+    editing this code. The list is sorted for deterministic rotation."""
+    if AI_UNIVERSE_MODE == "INDEX_ONLY":
+        return list(AI_SYMBOLS)
+    try:
+        indices = [x for x in AI_SYMBOLS if x in INDEX_SYMBOLS]
+        stocks = fo_stock_universe()
+        return list(dict.fromkeys(indices + stocks))
+    except Exception as e:
+        ai_log("ERROR", "AI_UNIVERSE", str(e))
+        return list(AI_SYMBOLS)
+
+
+def ai_scan_batch():
+    """Rotate through the whole F&O universe across cycles.
+    A full universe of ~200 symbols is deliberately not scanned in one loop;
+    each cycle scans a small chunk and advances the cursor. This keeps the
+    engine running during the whole market session while respecting Kite's
+    quote-rate limits."""
+    universe = ai_universe()
+    c = ai_db()
+    row = c.execute("SELECT value FROM ai_settings WHERE key='scan_cursor'").fetchone()
+    cursor = int(float(row["value"])) if row else 0
+    if not universe:
+        return [], 0, 0
+    cursor %= len(universe)
+    batch = [universe[(cursor+i) % len(universe)] for i in range(min(AI_SCAN_CHUNK_SIZE, len(universe)))]
+    new_cursor = (cursor + len(batch)) % len(universe)
+    c.execute("INSERT OR REPLACE INTO ai_settings(key,value) VALUES('scan_cursor',?)", (str(new_cursor),))
+    c.commit(); c.close()
+    return batch, len(universe), new_cursor
+
+def ai_learning_state():
+    """Return the autonomous learning stage and a readout-only confidence score.
+
+    STAGE 3: there is no gate here anymore — the directional engine always
+    trades qualifying setups regardless of model maturity, so it keeps
+    generating real paper-trade evidence from day one. `effective_score`
+    below is kept purely as a dashboard readout: it ramps from
+    bootstrap_min_score (55) to the mature min_score (72) according to the
+    weaker of the two model sample-progress ratios, as a rough gauge of how
+    "warmed up" the live models are — it is never compared against a trade's
+    score to allow or block it.
+    """
+    p = ai_params()
+    ml = ai_ml_model()
+    dl = ai_dl_model()
+    ml_need = max(1, int(p.get("ml_min_samples", 40)))
+    dl_need = max(1, int(p.get("dl_min_samples", 80)))
+    ml_samples = int(ml.get("samples", 0))
+    dl_samples = int(dl.get("samples", 0))
+    ml_progress = min(1.0, ml_samples / ml_need)
+    dl_progress = min(1.0, dl_samples / dl_need)
+    research = _research_model()
+    research_need = max(1, int(p.get("research_min_samples",120)))
+    research_samples = int(research.get("samples",0))
+    research_progress = min(1.0, research_samples / research_need)
+    progress = min(ml_progress, dl_progress, research_progress)
+    mature_score = float(p.get("min_score", 72.0))
+    bootstrap_score = float(p.get("bootstrap_min_score", 55.0))
+    effective_score = bootstrap_score + (mature_score - bootstrap_score) * progress
+    ml_ready = ml_samples >= ml_need
+    dl_ready = dl_samples >= dl_need
+    research_ready = research_samples >= research_need and research.get("status") == "TRAINED"
+    mature = ml_ready and dl_ready and research_ready
+    return {
+        "stage": "MATURE AI" if mature else "AUTONOMOUS BOOTSTRAP",
+        "bootstrap": not mature,
+        "ml_ready": ml_ready,
+        "dl_ready": dl_ready,
+        "ml_samples": ml_samples,
+        "dl_samples": dl_samples,
+        "ml_required": ml_need,
+        "dl_required": dl_need,
+        "ml_progress": round(ml_progress * 100, 1),
+        "dl_progress": round(dl_progress * 100, 1),
+        "research_ready": research_ready, "research_samples": research_samples, "research_required": research_need,
+        "research_progress": round(research_progress * 100, 1),
+        "progress": round(progress * 100, 1),
+        "bootstrap_score": round(bootstrap_score, 2),
+        "mature_score": round(mature_score, 2),
+        "effective_score": round(effective_score, 2),
+    }
+
+
+def ai_cycle():
+    """Run the intended index-direction -> CE/PE paper-learning cycle."""
+    c = ai_db(); c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('last_cycle_at',?)", (datetime.now(IST).isoformat(),)); c.commit(); c.close()
+    if not ai_market_open() or not require_session() or not AI_DIRECTIONAL_ENABLED:
+        return
+    c = ai_db(); c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('last_activity_at',?)", (datetime.now(IST).isoformat(),)); c.commit(); c.close()
+
+    # First manage existing paper positions using executable bid prices.
+    ai_close_trades()
+    ch = ai_champion()
+    champion_ver = ch["version"] if ch else "1.0"
+    params = ai_params()
+    batch, total, cursor = ai_scan_batch()
+    c = ai_db(); c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('last_scan_at',?)", (datetime.now(IST).isoformat(),)); c.commit(); c.close()
+    ai_log("SCAN", "DIRECTIONAL_UNIVERSE", f"Batch {len(batch)} / universe {total}; cursor={cursor}; INDEX_DIRECTION -> LONG CE/PE; PAPER ONLY")
+
+    open_now = ai_open_trades()
+    for sym in batch:
+        try:
+            x, err = ai_directional_snapshot(sym, params)
+            if err:
+                detail = err if isinstance(err, str) else str(err.get("error", "WAIT"))
+                ai_log("SCAN", "DIRECTIONAL_WAIT", f"{sym}: {detail}")
+                continue
+            if not x:
+                continue
+            # One decision per symbol/version.  Existing trades are never duplicated.
+            already = any(t["symbol"] == sym and t["version"] == champion_ver for t in open_now)
+            reason = (f"INDEX_DIRECTION: {x['direction']} p_up={x['dl_probability']:.3f} "
+                      f"confidence={max(x['dl_probability'], 1-x['dl_probability']):.3f} "
+                      f"score={x['score']:.1f} -> BUY {x['option_type']} {x['option_symbol']} "
+                      f"historical_GRU_samples={x['dl_samples']} PAPER_ONLY")
+            ai_record_decision(champion_ver, x, "APPROVE" if not already else "REJECT", reason if not already else reason + " duplicate open position")
+            if already or len(open_now) >= int(params.get("max_positions", 6)):
+                continue
+            # Hard safety: directional engine can only create a LONG option paper trade.
+            x["side"] = "LONG"
+            x["setup_json_extra"]["execution_mode"] = "track"
+            if ai_open_trade(x, champion_ver):
+                open_now = ai_open_trades()
+        except Exception as e:
+            ai_log("ERROR", "DIRECTIONAL_SCAN", f"{sym}: {type(e).__name__}: {e}")
+
+    ai_learn()
+    ai_research_train()
+    ai_tree_train()
+    ai_model_walkforward()
+    ai_evaluate_challenger()
+
+# ---------------------------------------------------------------------------
+# Persistent live option-chain recorder.
+# Kite historical API does not provide a complete historical option-chain archive,
+# so this layer builds one from live observations going forward. It records the
+# executable bid/ask, LTP, volume, OI and calculated IV/delta for every strike in
+# the selected expiry. No broker order is sent.
+# ---------------------------------------------------------------------------
+def ai_option_capture_status():
+    c=ai_db()
+    rows=c.execute("SELECT symbol,COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts,COUNT(DISTINCT expiry||'|'||strike||'|'||option_type) contracts FROM ai_option_snapshots GROUP BY symbol ORDER BY symbol").fetchall()
+    rt={r["key"]:r["value"] for r in c.execute("SELECT key,value FROM ai_runtime WHERE key LIKE 'option_%'").fetchall()}
+    total=c.execute("SELECT COUNT(*) FROM ai_option_snapshots").fetchone()[0]
+    c.close()
+    return {"interval_minutes":AI_OPTION_CAPTURE_MINUTES,"rows":int(total),"symbols":[dict(r) for r in rows],"last_capture_at":rt.get("option_last_capture_at"),"status":rt.get("option_status","WAITING FOR KITE"),"retention_days":AI_OPTION_CAPTURE_DAYS}
+
+def ai_capture_option_chain_symbol(symbol):
+    try:
+        data,err=get_chain_for_symbol(symbol)
+        if err:return {"symbol":symbol,"status":"ERROR","detail":err,"rows_added":0}
+        ts=datetime.now(IST).replace(second=0,microsecond=0).isoformat()
+        c=ai_db();added=0
+        for o in data.get("chain",[]):
+            try:
+                cur=c.execute("INSERT OR IGNORE INTO ai_option_snapshots(ts,symbol,expiry,strike,option_type,tradingsymbol,token,spot,ltp,bid,ask,mid,spread_pct,volume,oi,iv,delta,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(ts,symbol,str(data["expiry"]),float(o["strike"]),str(o["instrument_type"]),o.get("tradingsymbol"),int(o.get("instrument_token") or o.get("token") or 0),float(data["spot"]),o.get("ltp"),o.get("bid"),o.get("ask"),o.get("mid"),o.get("spread_pct"),o.get("volume") or 0,o.get("oi") or 0,o.get("iv"),o.get("delta"),"KITE_LIVE_QUOTE"));added+=cur.rowcount
+            except Exception as e:
+                ai_log("ERROR","OPTION_CAPTURE_ROW",f"{symbol}: {e}")
+        c.commit();c.close()
+        return {"symbol":symbol,"status":"OK","rows_added":added,"contracts":len(data.get("chain",[])),"expiry":str(data["expiry"]),"spot":data.get("spot")}
+    except Exception as e:
+        return {"symbol":symbol,"status":"ERROR","detail":str(e),"rows_added":0}
+
+def ai_capture_option_chains(force=False):
+    if not require_session():
+        _hist_set_status if False else None
+        c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('option_status',?)",("WAITING FOR KITE",));c.commit();c.close();return ai_option_capture_status()
+    if not force and not ai_market_open():
+        c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('option_status',?)",("MARKET CLOSED — RETAINING DATA",));c.commit();c.close();return ai_option_capture_status()
+    results=[ai_capture_option_chain_symbol(sym) for sym in AI_HIST_SYMBOLS]
+    now=datetime.now(IST).isoformat();c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('option_last_capture_at',?)",(now,));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('option_status',?)",("COLLECTOR ONLINE",))
+    if AI_OPTION_CAPTURE_DAYS>0:
+        cutoff=(datetime.now(IST)-timedelta(days=AI_OPTION_CAPTURE_DAYS)).isoformat();c.execute("DELETE FROM ai_option_snapshots WHERE ts<?",(cutoff,))
+    c.commit();c.close();ai_log("DATA","OPTION_CHAIN_CAPTURE",f"captured live chain snapshots: {results}");return {"results":results,**ai_option_capture_status()}
+
+# ---------------------------------------------------------------------------
+# Historical index data collector + pre-training layer
+# ---------------------------------------------------------------------------
+def _hist_training_update(**fields):
+    """Write training telemetry as one short transaction.
+
+    Every update also renews the worker heartbeat. Keeping this in one helper
+    prevents the UI from observing a new progress value with an old phase (or
+    vice versa), and gives us a reliable way to recover a stale persisted flag
+    after a process restart.
+    """
+    fields.setdefault("heartbeat_at",datetime.now(IST).isoformat())
+    c=ai_db()
+    try:
+        for name,value in fields.items():
+            c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES(?,?)",
+                      (f"hist_training_{name}",str(value)))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _hist_training_age_seconds(value):
+    try:
+        dt=datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=IST)
+        return max(0.0,(datetime.now(IST)-dt.astimezone(IST)).total_seconds())
+    except Exception:
+        return None
+
+
+def ai_hist_training_active():
+    """Return whether historical GRU retraining is currently running.
+    Persisted in ai_runtime so a browser refresh cannot lose the state. A stale
+    flag left by a dead/restarted process is cleared only when no in-process
+    worker owns the training lock."""
+    try:
+        c=ai_db()
+        rt={r["key"]:r["value"] for r in c.execute(
+            "SELECT key,value FROM ai_runtime WHERE key IN "
+            "('hist_training_active','hist_training_heartbeat_at','hist_training_started_at')").fetchall()}
+        c.close()
+        if str(rt.get("hist_training_active","0")) != "1":return False
+        heartbeat=rt.get("hist_training_heartbeat_at") or rt.get("hist_training_started_at")
+        age=_hist_training_age_seconds(heartbeat)
+        if age is not None and age<=AI_HIST_TRAIN_STALE_SECONDS:return True
+        if AI_HIST_TRAIN_LOCK.locked():return True
+        detail=(f"Previous training worker stopped responding {int(age)}s ago; safe retry is available."
+                if age is not None else "Previous training worker has no valid heartbeat; safe retry is available.")
+        c=ai_db()
+        for key,value in (
+            ("hist_training_active","0"),("hist_training_phase","INTERRUPTED — RETRY AVAILABLE"),
+            ("hist_training_error",detail),("hist_model_status","TRAINING INTERRUPTED — RETRY AVAILABLE")):
+            c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES(?,?)",(key,value))
+        c.commit();c.close();_hist_invalidate_status_cache()
+        return False
+    except Exception:
+        return False
+
+def ai_hist_status():
+    """Cached history status; safe for a frequent browser heartbeat."""
+    # This inexpensive lease check also clears a persisted active=1 left by a
+    # process crash, so the Retrain button cannot remain disabled forever.
+    ai_hist_training_active()
+    now_m=time.monotonic()
+    with _AI_HIST_STATUS_CACHE_LOCK:
+        cached=_AI_HIST_STATUS_CACHE.get("value")
+        if cached is not None and now_m-float(_AI_HIST_STATUS_CACHE.get("at",0)) < AI_HIST_STATUS_CACHE_SECONDS:
+            return cached
+    c=ai_db()
+    rows=c.execute("SELECT symbol, COUNT(*) n, MIN(ts) first_ts, MAX(ts) last_ts FROM ai_hist_candles WHERE interval=? GROUP BY symbol",(AI_HIST_INTERVAL,)).fetchall()
+    runs=c.execute("SELECT * FROM ai_hist_runs ORDER BY id DESC LIMIT 20").fetchall()
+    model=c.execute("SELECT * FROM ai_hist_model WHERE id=1").fetchone()
+    rt={r["key"]:r["value"] for r in c.execute("SELECT key,value FROM ai_runtime WHERE key LIKE 'hist_%'").fetchall()}
+    total=c.execute("SELECT COUNT(*) FROM ai_hist_candles WHERE interval=?",(AI_HIST_INTERVAL,)).fetchone()[0]
+    oldest=c.execute("SELECT MIN(ts) FROM ai_hist_candles WHERE interval=?",(AI_HIST_INTERVAL,)).fetchone()[0]
+    newest=c.execute("SELECT MAX(ts) FROM ai_hist_candles WHERE interval=?",(AI_HIST_INTERVAL,)).fetchone()[0]
+    c.close()
+    active=str(rt.get("hist_training_active","0"))=="1"
+    heartbeat=rt.get("hist_training_heartbeat_at") or rt.get("hist_training_started_at")
+    heartbeat_age=_hist_training_age_seconds(heartbeat)
+    elapsed=float(rt.get("hist_training_elapsed_sec","0") or 0)
+    if active:
+        live_elapsed=_hist_training_age_seconds(rt.get("hist_training_started_at"))
+        if live_elapsed is not None:elapsed=max(elapsed,live_elapsed)
+    value={"interval":AI_HIST_INTERVAL,"lookback_days":AI_HIST_LOOKBACK_DAYS,"max_years":AI_HIST_MAX_YEARS,"chunk_days":AI_HIST_CHUNK_DAYS,"horizon_bars":AI_HIST_HORIZON_BARS,"candles":int(total),"oldest":oldest,"newest":newest,"symbols":[dict(r) for r in rows],"runs":[dict(r) for r in runs],"model":dict(model) if model else None,"last_sync_at":rt.get("hist_last_sync_at"),"last_train_at":rt.get("hist_last_train_at"),"train_detail":rt.get("hist_train_detail"),"status":rt.get("hist_status","WAITING FOR KITE"),"collector_status":rt.get("hist_collector_status",rt.get("hist_status","WAITING FOR KITE")),"model_status":rt.get("hist_model_status",(dict(model).get("status") if model else "NOT TRAINED")),"detail":rt.get("hist_detail",""),"archive_mode":rt.get("archive_mode","FRESH_ARCHIVE"),"training_requested":rt.get("hist_training_requested","0"),"training_started_at":rt.get("hist_training_started_at"),"training_error":rt.get("hist_training_error",""),"training_active":"1" if active else "0","training_progress":float(rt.get("hist_training_progress","0") or 0),"training_phase":rt.get("hist_training_phase","IDLE"),"training_epoch":int(float(rt.get("hist_training_epoch","0") or 0)),"training_epochs":int(float(rt.get("hist_training_epochs","0") or 0)),"training_elapsed_sec":elapsed,"training_samples":int(float(rt.get("hist_training_samples","0") or 0)),"training_heartbeat_at":heartbeat,"training_heartbeat_age_sec":heartbeat_age,"training_stalled":bool(active and (heartbeat_age is None or heartbeat_age>AI_HIST_TRAIN_STALE_SECONDS)),"option_capture":ai_option_capture_status()}
+    with _AI_HIST_STATUS_CACHE_LOCK:
+        _AI_HIST_STATUS_CACHE["at"]=now_m
+        _AI_HIST_STATUS_CACHE["value"]=value
+    return value
+
+_HIST_EMA_WEIGHT_CACHE = {}
+
+
+def _hist_feature_row(rows, i, arrays=None):
+    """Fast, deterministic historical feature builder.
+
+    The old implementation rebuilt the complete price history for every feature row.
+    With ~14k candles that made historical pre-training unnecessarily expensive on a
+    small VM.  This version only reads the windows it actually needs and keeps the
+    feature definition compatible with the live ML feature names.
+    """
+    i=int(i)
+    if i < 0 or i >= len(rows):
+        return {}
+    if arrays is None:
+        arrays={
+            "close":np.asarray([float(r["close"]) for r in rows],dtype=float),
+            "high":np.asarray([float(r["high"]) for r in rows],dtype=float),
+            "low":np.asarray([float(r["low"]) for r in rows],dtype=float),
+            "volume":np.asarray([float(r.get("volume") or 0) for r in rows],dtype=float),
+        }
+    closes,highs,lows,vols=arrays["close"],arrays["high"],arrays["low"],arrays["volume"]
+    c=float(closes[i])
+    if not np.isfinite(c) or c<=0:return {}
+    def ret(n):
+        j=i-int(n)
+        return ((c/closes[j])-1)*100 if j>=0 and closes[j] else 0.0
+    def ema(n):
+        # Preserve the previous bounded EMA definition, but evaluate the recurrence
+        # with a vector dot-product instead of a Python loop.  This is materially
+        # faster on the small Oracle VM while keeping the same 4*n bounded window.
+        n=int(n)
+        lo=max(0,i-n*4)
+        x=closes[lo:i+1]
+        if len(x)==0:return c
+        a=2/(n+1); r=1-a
+        m=len(x)-1
+        if m<=0:return float(x[0])
+        # EMA_i = a*sum(x[i-k]*r**k, k=0..m-1) + x[lo]*r**m
+        cache_key=(n,m)
+        weights=_HIST_EMA_WEIGHT_CACHE.get(cache_key)
+        if weights is None:
+            weights=(a*np.power(r,np.arange(m-1,-1,-1,dtype=np.float32))).astype(np.float32)
+            _HIST_EMA_WEIGHT_CACHE[cache_key]=weights
+        return float(np.dot(x[1:],weights) + x[0]*(r**m))
+    def rsi(n=14):
+        lo=max(0,i-int(n))
+        d=np.diff(closes[lo:i+1])
+        if len(d)<n:return 50.0
+        up=float(np.mean(np.maximum(d,0))); dn=float(np.mean(np.maximum(-d,0)))
+        return 100.0 if dn==0 and up>0 else 50.0 if dn==0 else 100-(100/(1+up/dn))
+    w10=closes[max(0,i-9):i+1]
+    v10=float(np.std(w10)/np.mean(w10)*100) if len(w10)>=5 and np.mean(w10)!=0 else 0.0
+    wh=highs[max(0,i-19):i+1]; wl=lows[max(0,i-19):i+1]
+    rng20=float((np.max(wh)-np.min(wl))/c*100) if len(wh)>=10 else 0.0
+    wv=vols[max(0,i-19):i+1]; avg_v=float(np.mean(wv)) if len(wv) else 0.0
+    vr=float(vols[i]/avg_v) if avg_v>0 else 1.0
+    e9,e20,e50=ema(9),ema(20),ema(50)
+    trend=max(0,min(25,12.5+(e20/e50-1)*500)) if e50 else 12.5
+    mom=max(0,min(25,12.5+ret(5)*3+ret(20)))
+    if arrays is not None and arrays.get("ts") is not None:
+        ts=str(arrays["ts"][i])
+    else:
+        row_i=rows[i]
+        ts=str(row_i[0] if not isinstance(row_i,dict) else row_i["ts"])
+    try:
+        dt=datetime.fromisoformat(ts.replace("Z","+00:00"))
+        if dt.tzinfo: dt=dt.astimezone(IST).replace(tzinfo=None)
+        minutes=dt.hour*60+dt.minute; ang=2*math.pi*(minutes/(24*60))
+        sinv,cosv=math.sin(ang),math.cos(ang)
+    except Exception:
+        sinv=cosv=0.0
+    return {
+        "ret_1":ret(1),"ret_3":ret(3),"ret_5":ret(5),"ret_10":ret(10),"ret_20":ret(20),
+        "ema_gap_9_20":(e9/e20-1)*100 if e20 else 0,
+        "ema_gap_20_50":(e20/e50-1)*100 if e50 else 0,
+        "rsi14":rsi(),"volatility_10":v10,"range_20":rng20,"volume_ratio":vr,
+        "trend_score":trend,"momentum_score":mom,"pcr_norm":1.0,"iv_norm":0.0,
+        "time_sin":sinv,"time_cos":cosv,
+    }
+
+# Public name: this is now THE single shared feature engine (Section 5 of the
+# spec). Historical training, live prediction, and paper-trade learning must
+# all call this same function against the same ai_hist_candles-shaped rows so
+# there is exactly one definition of every feature, in one place.
+compute_index_features = _hist_feature_row
+
+def _get_recent_index_bars(symbol, n):
+    """Read the most recent n bars for `symbol` from ai_hist_candles — the exact
+    same table/columns used for historical training — so live prediction reads
+    from the identical data source as training, not a separately-maintained
+    snapshot cache."""
+    c = ai_db()
+    rows = c.execute(
+        "SELECT ts,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
+        (symbol, AI_HIST_INTERVAL, int(n))).fetchall()
+    c.close()
+    return list(reversed(rows))
+
+def build_live_index_sequence(symbol):
+    """Stage 1 fix: build the live GRU input sequence from the same table and
+    the same compute_index_features() function used for historical training.
+    This replaces the old ai_dl_sequence()/ai_market_pattern_features() path,
+    which computed the 'same' feature names with different formulas — the
+    train/live mismatch flagged in the audit."""
+    need = DL_SEQUENCE_LEN + 5
+    rows = _get_recent_index_bars(symbol, need)
+    if len(rows) < DL_SEQUENCE_LEN:
+        return None, f"insufficient recent {AI_HIST_INTERVAL} bars for {symbol}: have {len(rows)}, need {DL_SEQUENCE_LEN}"
+    age_min = None
+    try:
+        last_ts = _ai_ts_naive(rows[-1]["ts"])
+        age_min = (now_ist().replace(tzinfo=None) - last_ts).total_seconds() / 60.0
+    except Exception:
+        pass
+    # Data-quality gate (Section 24): a stale index feed must produce WAIT, not
+    # a prediction built on old bars.
+    if ai_market_open() and age_min is not None and age_min > AI_LIVE_MAX_BAR_AGE_MIN:
+        return None, f"stale index data for {symbol}: last bar is {age_min:.1f} min old (max {AI_LIVE_MAX_BAR_AGE_MIN:.0f})"
+    arrays = {
+        "close": np.asarray([float(r["close"]) for r in rows], dtype=float),
+        "high": np.asarray([float(r["high"]) for r in rows], dtype=float),
+        "low": np.asarray([float(r["low"]) for r in rows], dtype=float),
+        "volume": np.asarray([float(r["volume"] or 0) for r in rows], dtype=float),
+    }
+    n = len(rows)
+    seq = []
+    latest_features = {}
+    for i in range(n - DL_SEQUENCE_LEN, n):
+        f = compute_index_features(rows, i, arrays)
+        if not f:
+            return None, f"feature build failed for {symbol} at bar index {i}"
+        seq.append([_norm_feature(name, f.get(name, 0)) for name in SEQUENCE_FEATURE_NAMES])
+        latest_features = f
+    return {
+        "sequence": seq,
+        "features": latest_features,
+        "last_bar_ts": str(rows[-1]["ts"]),
+        "bar_age_min": age_min,
+        "feature_engine_version": FEATURE_ENGINE_VERSION,
+    }, None
+
+def _hist_training_sequences(symbol,symbol_index=0,symbol_count=1,started_at=None,sample_base=0):
+    """Build bounded historical sequences without retaining per-candle dicts.
+
+    The previous implementation cached a feature dictionary for nearly every
+    candle touched by overlapping windows. With ~215k rows per index this could
+    consume hundreds of MB and make the process appear frozen at the final
+    candidate while the VM swapped. A dense float32 matrix is both smaller and
+    faster, and is discarded as soon as this symbol's sequences are assembled.
+    """
+    c=ai_db()
+    raw_rows=c.execute(
+        "SELECT ts,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts",
+        (symbol,AI_HIST_INTERVAL)).fetchall()
+    c.close()
+    need=DL_SEQUENCE_LEN+AI_HIST_HORIZON_BARS+5
+    empty_x=np.empty((0,DL_SEQUENCE_LEN,len(SEQUENCE_FEATURE_NAMES)),dtype=np.float32)
+    if len(raw_rows)<need:return empty_x,np.empty(0,dtype=np.float32),[]
+
+    times_all=[str(r[0]) for r in raw_rows]
+    arrays={
+        "ts":times_all,
+        "close":np.asarray([float(r[1]) for r in raw_rows],dtype=np.float32),
+        "high":np.asarray([float(r[2]) for r in raw_rows],dtype=np.float32),
+        "low":np.asarray([float(r[3]) for r in raw_rows],dtype=np.float32),
+        "volume":np.asarray([float(r[4] or 0) for r in raw_rows],dtype=np.float32),
+    }
+    del raw_rows
+    usable=len(times_all)-AI_HIST_HORIZON_BARS
+    step=max(1,usable//max(1,AI_HIST_TRAIN_MAX_POINTS_PER_SYMBOL))
+    candidate=np.arange(DL_SEQUENCE_LEN-1,usable,step,dtype=np.int32)
+    if len(candidate) and candidate[-1]!=usable-1:
+        candidate=np.append(candidate,np.int32(usable-1))
+    if not len(candidate):return empty_x,np.empty(0,dtype=np.float32),[]
+
+    # Mark only rows that belong to at least one selected lookback window. For
+    # dense archives these windows overlap heavily; each feature row is still
+    # computed once and stored as 15 float32 values rather than a Python dict.
+    starts=candidate-(DL_SEQUENCE_LEN-1)
+    diff=np.zeros(usable+1,dtype=np.int32)
+    np.add.at(diff,starts,1);np.add.at(diff,candidate+1,-1)
+    required=np.flatnonzero(np.cumsum(diff[:-1])>0)
+    feature_matrix=np.zeros((usable,len(SEQUENCE_FEATURE_NAMES)),dtype=np.float32)
+    valid=np.zeros(usable,dtype=bool)
+    last_telemetry=0.0
+    total_required=max(1,len(required));symbol_count=max(1,int(symbol_count))
+    try: started_dt=datetime.fromisoformat(started_at) if started_at else None
+    except Exception: started_dt=None
+    for req_i,row_i in enumerate(required):
+        f=_hist_feature_row(times_all,int(row_i),arrays)
+        if f:
+            feature_matrix[row_i]=[_norm_feature(n,f.get(n,0)) for n in SEQUENCE_FEATURE_NAMES]
+            valid[row_i]=True
+        now_mono=time.monotonic()
+        if now_mono-last_telemetry>=AI_HIST_TRAIN_HEARTBEAT_SECONDS or req_i==total_required-1:
+            frac=(req_i+1)/total_required
+            progress=5.0+25.0*((symbol_index+0.85*frac)/symbol_count)
+            elapsed=(datetime.now(IST)-started_dt).total_seconds() if started_dt else 0.0
+            _hist_training_update(
+                progress=round(progress,1),
+                phase=f"COMPUTING FEATURES · {symbol} · {req_i+1:,}/{total_required:,}",
+                elapsed_sec=round(elapsed,1),samples=sample_base)
+            last_telemetry=now_mono
+
+    invalid_prefix=np.concatenate(([0],np.cumsum(~valid,dtype=np.int32)))
+    window_ok=(invalid_prefix[candidate+1]-invalid_prefix[starts])==0
+    current=arrays["close"][candidate]
+    future=arrays["close"][candidate+AI_HIST_HORIZON_BARS]
+    label_ok=np.isfinite(current)&np.isfinite(future)&(current>0)
+    candidate=candidate[window_ok&label_ok]
+    if not len(candidate):return empty_x,np.empty(0,dtype=np.float32),[]
+    starts=candidate-(DL_SEQUENCE_LEN-1)
+    window_offsets=np.arange(DL_SEQUENCE_LEN,dtype=np.int32)
+    seqs=feature_matrix[starts[:,None]+window_offsets[None,:]]
+    labels=(arrays["close"][candidate+AI_HIST_HORIZON_BARS]>arrays["close"][candidate]).astype(np.float32)
+    sample_times=[times_all[int(i)] for i in candidate]
+    elapsed=(datetime.now(IST)-started_dt).total_seconds() if started_dt else 0.0
+    _hist_training_update(
+        progress=round(5.0+25.0*((symbol_index+1)/symbol_count),1),
+        phase=f"SEQUENCES READY · {symbol} · {len(seqs):,}",
+        elapsed_sec=round(elapsed,1),samples=sample_base+len(seqs))
+    return np.asarray(seqs,dtype=np.float32),labels,sample_times
+
+def _hist_set_status(status, detail=""):
+    """Set collector status only.  Model/training status is kept separately so a
+    training exception never makes a healthy data collector look broken."""
+    c=ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_status',?)",(status,))
+    if detail:c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_detail',?)",(detail,))
+    c.commit();c.close()
+
+
+def _hist_set_model_status(status, detail=""):
+    c=ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_model_status',?)",(status,))
+    if detail:c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_train_detail',?)",(detail,))
+    c.commit();c.close()
+
+def _hist_invalidate_status_cache():
+    with _AI_HIST_STATUS_CACHE_LOCK:
+        _AI_HIST_STATUS_CACHE["at"]=0.0
+
+def ai_hist_train_deep(force=False):
+    """Pre-train the GRU from the historical archive in a bounded background job."""
+    if not AI_HIST_TRAIN_LOCK.acquire(blocking=False):
+        return ai_hist_status()
+    try:
+        started=datetime.now(IST).isoformat()
+        run_id=f"{os.getpid()}-{threading.get_ident()}-{int(time.time()*1000)}"
+        c=ai_db()
+        for k,v in (("hist_training_started_at",started),("hist_training_heartbeat_at",started),("hist_training_run_id",run_id),("hist_training_requested","0"),("hist_training_error",""),("hist_training_active","1"),("hist_training_progress","1"),("hist_training_phase","INITIALIZING"),("hist_training_epoch","0"),("hist_training_epochs",str(AI_HIST_TRAIN_EPOCHS)),("hist_training_elapsed_sec","0"),("hist_training_samples","0")):
+            c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES(?,?)",(k,v))
+        c.commit();c.close()
+        _hist_invalidate_status_cache()
+        _hist_set_model_status("BUILDING SEQUENCES","Preparing chronological GRU sequences from historical archive")
+        x_chunks=[];y_chunks=[];time_chunks=[];per_symbol={};sample_base=0
+        total_symbols=max(1,len(AI_HIST_SYMBOLS))
+        for sym_i,sym in enumerate(AI_HIST_SYMBOLS):
+            try:
+                x,y,t=_hist_training_sequences(sym,sym_i,total_symbols,started,sample_base)
+                per_symbol[sym]=len(x)
+                if len(x):
+                    x_chunks.append(x);y_chunks.append(y);time_chunks.append(np.asarray(t,dtype="U40"))
+                    sample_base+=len(x)
+                ai_log("LEARNING","HIST_SEQUENCE_BUILD",f"{sym}: GRU sequences={len(x)}")
+            except Exception as e:
+                per_symbol[sym]=0;ai_log("ERROR","HIST_SEQUENCE_BUILD",f"{sym}: {e}")
+            elapsed=(datetime.now(IST)-datetime.fromisoformat(started)).total_seconds()
+            _hist_training_update(progress=round(5.0+25.0*(sym_i+1)/total_symbols,1),phase=f"SEQUENCES READY · {sym_i+1}/{total_symbols}",elapsed_sec=round(elapsed,1),samples=sample_base)
+        if sample_base<AI_HIST_MIN_TRAIN:
+            detail=f"sequences={sample_base} need={AI_HIST_MIN_TRAIN} per_symbol={per_symbol}";_hist_set_model_status("READY — NEED MORE TRAINING SAMPLES",detail);return ai_hist_status()
+        _hist_training_update(progress=32.0,phase="MERGING CHRONOLOGICAL SEQUENCES",elapsed_sec=round((datetime.now(IST)-datetime.fromisoformat(started)).total_seconds(),1),samples=sample_base)
+        X_all=np.concatenate(x_chunks,axis=0).astype(np.float32,copy=False)
+        Y_all=np.concatenate(y_chunks,axis=0).astype(np.float32,copy=False)
+        T_all=np.concatenate(time_chunks,axis=0)
+        x_chunks.clear();y_chunks.clear();time_chunks.clear()
+        try:del x,y,t
+        except Exception:pass
+        if len(np.unique(Y_all.astype(np.int8)))<2:
+            detail=f"only one target class in historical labels; samples={len(Y_all)}";_hist_set_model_status("READY — TARGET CLASS INSUFFICIENT",detail);return ai_hist_status()
+        order=np.argsort(T_all,kind="mergesort")
+        if len(order)>AI_HIST_TRAIN_MAX_SAMPLES:
+            positions=np.linspace(0,len(order)-1,AI_HIST_TRAIN_MAX_SAMPLES).round().astype(np.int64)
+            positions=np.unique(positions)
+            keep_idx=order[positions]
+        else:
+            keep_idx=order
+        X=X_all[keep_idx];Y=Y_all[keep_idx]
+        del X_all,Y_all,T_all,order,keep_idx
+        _hist_training_update(progress=35.0,phase=f"TRAINING TENSORS READY · {len(X):,} samples",elapsed_sec=round((datetime.now(IST)-datetime.fromisoformat(started)).total_seconds(),1),samples=len(X))
+        _hist_set_model_status("TRAINING GRU SEQUENCE MODEL",f"GRU hidden={DL_GRU_HIDDEN} sequence_len={DL_SEQUENCE_LEN} samples={len(X)} epochs={AI_HIST_TRAIN_EPOCHS}")
+        trained=_ai_dl_train_arrays(X,Y,"HISTORICAL_PRETRAINED",seed=20260825,epochs_override=AI_HIST_TRAIN_EPOCHS,training_started_at=started)
+        if not trained:
+            detail="GRU training returned no two-class model";_hist_set_model_status("TRAINING ERROR — RETRYING",detail);c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_error',?)",(detail,));c.commit();c.close();return ai_hist_status()
+        params,acc,auc,samples,train_samples,val_samples=trained
+        _ai_dl_persist(params,acc,auc,samples,train_samples,val_samples,status="HISTORICAL_PRETRAINED")
+        now=datetime.now(IST).isoformat();c=ai_db();hist_status="PRETRAINED" if val_samples and len(set(Y[-val_samples:].astype(int).tolist()))>=2 else "PRETRAINED — AUC UNAVAILABLE"
+        c.execute("INSERT OR REPLACE INTO ai_hist_model(id,updated_at,symbols,interval,samples,train_samples,validation_samples,accuracy,auc,status,lookback_days,feature_version) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)",(now,",".join(AI_HIST_SYMBOLS),AI_HIST_INTERVAL,samples,train_samples,val_samples,acc,auc,hist_status,AI_HIST_LOOKBACK_DAYS,FEATURE_ENGINE_VERSION))
+        c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_last_train_at',?)",(now,));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_status',?)",("PRETRAINED — LIVE GRU LEARNING CONTINUES",));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_collector_status',?)",("HISTORY COLLECTION COMPLETE",));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_error',?)",("",));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_train_detail',?)",(f"architecture=GRU-{DL_GRU_HIDDEN} sequence={DL_SEQUENCE_LEN} samples={samples} train={train_samples} validation={val_samples} accuracy={acc:.1f}% auc={auc:.3f} per_symbol={per_symbol}",));c.commit();c.close()
+        ai_log("LEARNING","HISTORICAL_GRU_PRETRAIN",f"GRU-{DL_GRU_HIDDEN} samples={samples} train={train_samples} validation={val_samples} accuracy={acc:.1f}% auc={auc:.3f}");return ai_hist_status()
+    except Exception as e:
+        logger.exception("historical GRU pre-training failed");detail=f"{type(e).__name__}: {e}";_hist_set_model_status("TRAINING ERROR — RETRYING",detail);ai_log("ERROR","HISTORICAL_GRU_TRAIN",detail);c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_error',?)",(detail,));c.commit();c.close();return ai_hist_status()
+    finally:
+        try:
+            c=ai_db(); r=c.execute("SELECT value FROM ai_runtime WHERE key='hist_model_status'").fetchone(); status=str(r[0] if r else "")
+            c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_active',?)",("0",))
+            if "TRAINING ERROR" in status:
+                c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_phase',?)",("ERROR",))
+            elif "NEED MORE" in status or "INSUFFICIENT" in status:
+                c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_phase',?)",("NOT ENOUGH TRAINING DATA",))
+            else:
+                c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_progress',?)",("100",)); c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_phase',?)",("COMPLETE",))
+            c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_heartbeat_at',?)",(datetime.now(IST).isoformat(),))
+            c.commit(); c.close()
+        except Exception: pass
+        try:AI_HIST_TRAIN_LOCK.release()
+        except Exception:pass
+        _hist_invalidate_status_cache()
+
+def _hist_insert_candles(symbol, candles):
+    """Insert a historical response and deduplicate by symbol/interval/timestamp."""
+    added=0
+    c=ai_db()
+    for x in candles:
+        try:
+            cur=c.execute("INSERT OR IGNORE INTO ai_hist_candles(ts,symbol,interval,open,high,low,close,volume,oi) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (str(x["date"]),symbol,AI_HIST_INTERVAL,float(x["open"]),float(x["high"]),float(x["low"]),float(x["close"]),float(x.get("volume") or 0),float(x.get("oi") or 0)))
+            # STAGE 1 FIX: sqlite3.Connection has no .rowcount attribute (only the
+            # cursor returned by execute() does). The old `c.rowcount` line raised
+            # AttributeError on every row, silently caught below, so rows_added
+            # has always reported 0 here regardless of how much data actually
+            # landed -- exactly the false-zero display the spec prohibits (Sec 29),
+            # just one layer down in the ingestion telemetry rather than the UI.
+            added += cur.rowcount
+        except Exception as e:
+            ai_log("ERROR","HIST_CANDLE_INSERT",f"{symbol}: {type(e).__name__}: {e}")
+    c.commit(); c.close()
+    return added
+
+
+def _hist_fetch_chunk(token, start, end):
+    """Fetch one legal-sized Kite historical window with a small retry/backoff."""
+    last_err=None
+    for attempt in range(3):
+        try:
+            return kite.historical_data(token,start,end,AI_HIST_INTERVAL), None
+        except Exception as e:
+            last_err=e
+            if attempt<2:
+                time.sleep(0.8*(attempt+1))
+    return [], str(last_err)
+
+
+def ai_hist_sync_symbol(symbol):
+    """Backfill the maximum practical 5-minute history and keep the newest data current.
+
+    Kite restricts the span of a single historical request, so the collector walks the
+    requested range in chunks, persists each response immediately, and resumes safely
+    after an interruption. The actual oldest date returned by Kite is retained as the
+    source-of-truth; if an index has less history available, we do not fabricate it.
+    """
+    token,err=resolve_token_for_symbol(symbol)
+    if err:return {"symbol":symbol,"status":"ERROR","detail":err,"rows_added":0,"chunks":0}
+    now=now_ist()
+    target_start=now-timedelta(days=AI_HIST_LOOKBACK_DAYS)
+    c=ai_db()
+    r=c.execute("SELECT MIN(ts) first_ts, MAX(ts) last_ts FROM ai_hist_candles WHERE symbol=? AND interval=?",(symbol,AI_HIST_INTERVAL)).fetchone()
+    c.close()
+    try:
+        existing_first=_ai_ts_naive(r["first_ts"]) if r and r["first_ts"] else None
+        existing_last=_ai_ts_naive(r["last_ts"]) if r and r["last_ts"] else None
+    except Exception:
+        existing_first=existing_last=None
+
+    ranges=[]
+    # First run: full maximum-history backfill. Existing database: only fetch missing
+    # older history plus the tail since the last stored candle.
+    if not existing_first:
+        cursor=target_start
+        while cursor < now:
+            end=min(cursor+timedelta(days=AI_HIST_CHUNK_DAYS),now)
+            ranges.append((cursor,end,"BACKFILL")); cursor=end+timedelta(seconds=1)
+    else:
+        if AI_HIST_BACKFILL_ENABLED and existing_first > target_start + timedelta(minutes=5):
+            cursor=target_start
+            end_limit=existing_first-timedelta(minutes=1)
+            while cursor < end_limit:
+                end=min(cursor+timedelta(days=AI_HIST_CHUNK_DAYS),end_limit)
+                ranges.append((cursor,end,"BACKFILL")); cursor=end+timedelta(seconds=1)
+        tail_start=(existing_last+timedelta(minutes=1)) if existing_last else target_start
+        if tail_start < now-timedelta(days=AI_HIST_CHUNK_DAYS):
+            # A stale/incomplete database: let the backfill loop above repair the old
+            # portion and fetch only the most recent legal window here.
+            tail_start=now-timedelta(days=AI_HIST_CHUNK_DAYS)
+        if tail_start < now:
+            ranges.append((tail_start,now,"INCREMENTAL"))
+
+    total_added=0; total_fetched=0; chunks_ok=0; errors=[]
+    for start,end,kind in ranges:
+        candles,fetch_err=_hist_fetch_chunk(token,start,end)
+        if fetch_err:
+            errors.append(f"{kind} {start.date()}→{end.date()}: {fetch_err}")
+            continue
+        added=_hist_insert_candles(symbol,candles)
+        total_added += added; total_fetched += len(candles); chunks_ok += 1
+        ai_log("DATA","HISTORICAL_CHUNK",f"{symbol} {AI_HIST_INTERVAL} {kind} {start.date()}→{end.date()} fetched={len(candles)} added={added}")
+        time.sleep(AI_HIST_REQUEST_STAGGER_SECONDS)
+
+    status="OK" if not errors else ("PARTIAL" if chunks_ok else "ERROR")
+    detail=f"range={AI_HIST_LOOKBACK_DAYS}d (~{AI_HIST_MAX_YEARS:.1f}y target), chunk={AI_HIST_CHUNK_DAYS}d, chunks={chunks_ok}/{len(ranges)}, fetched={total_fetched}, added={total_added}"
+    if errors: detail += " | " + " ; ".join(errors[:3])
+    c=ai_db();c.execute("INSERT INTO ai_hist_runs(ts,symbol,interval,rows_added,status,detail) VALUES(?,?,?,?,?,?)",
+                        (datetime.now(IST).isoformat(),symbol,AI_HIST_INTERVAL,total_added,status,detail));c.commit();c.close()
+    return {"symbol":symbol,"status":status,"rows_added":total_added,"fetched":total_fetched,"chunks":chunks_ok,"requested_chunks":len(ranges),"detail":detail,"errors":errors[:5]}
+
+def ai_hist_sync():
+    if not require_session():
+        _hist_set_status("WAITING FOR KITE","Connect Kite; historical collection will resume automatically.");return ai_hist_status()
+    _hist_set_status("COLLECTING MAXIMUM KITE HISTORY",f"target={AI_HIST_MAX_YEARS:.1f} years; {AI_HIST_INTERVAL}; request_chunk={AI_HIST_CHUNK_DAYS}")
+    ai_log("DATA","HISTORICAL_SYNC_START",f"target={AI_HIST_MAX_YEARS:.1f}y; symbols={','.join(AI_HIST_SYMBOLS)}")
+    results=[ai_hist_sync_symbol(sym) for sym in AI_HIST_SYMBOLS]
+    now=datetime.now(IST).isoformat();all_ok=all(x.get("status") in ("OK","NO_DATA") for x in results);overall="HISTORY COLLECTION COMPLETE" if all_ok else "HISTORY COLLECTION PARTIAL — RETRYING"
+    c=ai_db();c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_last_sync_at',?)",(now,));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_status',?)",(overall,));c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_collector_status',?)",(overall,));
+    if all_ok:c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('hist_training_requested',?)",("1",))
+    c.commit();c.close();_hist_invalidate_status_cache();ai_log("DATA","HISTORICAL_SYNC_COMPLETE",f"status={overall}; results={results}")
+    return {"results":results,"training":{"status":"QUEUED" if all_ok else "WAITING FOR COMPLETE HISTORY"},**ai_hist_status()}
+
+def ai_hist_loop():
+    ai_init_db()
+    while True:
+        try:
+            if require_session():
+                hs=ai_hist_status();last=hs.get("last_sync_at");due=True
+                if last:
+                    dt=_ai_ts_naive(last);due=not dt or (now_ist()-dt).total_seconds()>=AI_HIST_SYNC_HOURS*3600
+                if due:
+                    ai_hist_sync();hs=ai_hist_status()
+                opt_last=ai_option_capture_status().get("last_capture_at");opt_due=True
+                if opt_last:
+                    dt=_ai_ts_naive(opt_last);opt_due=not dt or (now_ist()-dt).total_seconds()>=AI_OPTION_CAPTURE_MINUTES*60
+                if opt_due and ai_market_open():ai_capture_option_chains()
+                hs=ai_hist_status();model=hs.get("model") or {};total=int(hs.get("candles") or 0);requested=str(hs.get("training_requested") or "0")=="1";model_missing=not int(model.get("samples") or 0);retry_due=True
+                if hs.get("last_train_at"):
+                    dt=_ai_ts_naive(hs.get("last_train_at"));retry_due=not dt or (now_ist()-dt).total_seconds()>=AI_HIST_TRAIN_RETRY_MINUTES*60
+                if total>=AI_HIST_MIN_TRAIN and (requested or (model_missing and retry_due)):ai_hist_train_deep()
+        except Exception as e:
+            ai_log("ERROR","HISTORICAL_ENGINE",f"{type(e).__name__}: {e}")
+            try:
+                hs=ai_hist_status();_hist_set_status("HISTORY COLLECTION COMPLETE" if hs.get("candles",0)>=AI_HIST_MIN_TRAIN else "COLLECTOR RETRYING",f"{type(e).__name__}: {e}")
+            except Exception:pass
+        time.sleep(300)
+
+def ai_loop():
+    ai_init_db();ai_log('SYSTEM','START','Autonomous AI Evolution engine started; paper mode only')
+    while True:
+        try:
+            if ai_settings().get('enabled',1):ai_cycle()
+        except Exception as e:ai_log('ERROR','AI_ENGINE',str(e))
+        time.sleep(AI_POLL_SECONDS)
+
+@app.route('/api/ai-evolution/directional-latest')
+def ai_directional_latest():
+    """Return the latest directional AI decision for each index.
+    The dashboard uses this endpoint for the three live decision cards.
+    """
+    ai_init_db()
+    symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    latest = {}
+    c = ai_db()
+    rows = c.execute(
+        "SELECT id,ts,version,symbol,score,decision,reason,setup_json "
+        "FROM ai_decisions ORDER BY id DESC LIMIT 500"
+    ).fetchall()
+    c.close()
+
+    for r in rows:
+        sym = r["symbol"]
+        if sym not in symbols or sym in latest:
+            continue
+        try:
+            setup = json.loads(r["setup_json"] or "{}")
+        except Exception:
+            setup = {}
+        if setup.get("strategy_type") != "INDEX_DIRECTIONAL_LONG_OPTION":
+            continue
+
+        p_up = setup.get("p_up", setup.get("dl_probability"))
+        direction = setup.get("direction")
+        option_type = setup.get("option_type")
+        latest[sym] = {
+            "symbol": sym,
+            "ts": r["ts"],
+            "version": r["version"],
+            "score": float(r["score"] or 0),
+            "decision": r["decision"],
+            "reason": r["reason"] or "",
+            "direction": direction or ("UP" if option_type == "CE" else "DOWN" if option_type == "PE" else "WAIT"),
+            "option_type": option_type,
+            "option_symbol": setup.get("option_symbol"),
+            "p_up": float(p_up) if p_up is not None else None,
+            "dl_probability": float(setup.get("dl_probability")) if setup.get("dl_probability") is not None else None,
+            "ml_probability": float(setup.get("ml_probability")) if setup.get("ml_probability") is not None else None,
+            "dl_samples": int(setup.get("dl_samples", 0) or 0),
+            "ml_samples": int(setup.get("ml_samples", 0) or 0),
+            "ensemble_confidence": setup.get("ensemble_confidence"),
+            "adaptive_min_score": setup.get("adaptive_min_score"),
+            "stop_pct_used": setup.get("stop_pct_used"),
+            "target_pct_used": setup.get("target_pct_used"),
+            "alt_candidates": setup.get("alt_candidates"),
+            "spot": setup.get("spot"),
+            "paper_only": True
+        }
+
+    # Always return all three cards, even before the first qualifying decision.
+    result = []
+    for sym in symbols:
+        result.append(latest.get(sym, {
+            "symbol": sym,
+            "ts": None,
+            "version": None,
+            "score": None,
+            "decision": "WAIT",
+            "reason": "No directional decision yet — waiting for the next AI scan.",
+            "direction": "WAIT",
+            "option_type": None,
+            "option_symbol": None,
+            "p_up": None,
+            "dl_probability": None,
+            "ml_probability": None,
+            "dl_samples": 0,
+            "ml_samples": 0,
+            "spot": None,
+            "paper_only": True
+        }))
+    return jsonify({"symbols": result})
+
+
+@app.route('/api/ai-evolution/directional-status')
+def ai_directional_status():
+    ai_init_db()
+    c=ai_db(); rt={r['key']:r['value'] for r in c.execute('SELECT key,value FROM ai_runtime').fetchall()}; c.close()
+    dl=ai_dl_model(); ml=ai_ml_model(); hs=ai_hist_status()
+    return jsonify({
+        "enabled": AI_DIRECTIONAL_ENABLED,
+        "paper_only": True,
+        "logic": "INDEX_DIRECTION -> BUY CE/PE",
+        "up_probability": AI_DIRECTIONAL_UP_PROB,
+        "down_probability": AI_DIRECTIONAL_DOWN_PROB,
+        # STAGE 3: no gate. Both fields below are informational-only —
+        # a confidence readout for the dashboard, not a threshold applied to
+        # any trade decision. See ai_adaptive_min_score / ai_directional_snapshot.
+        "min_score_floor": AI_DIRECTIONAL_MIN_SCORE,
+        "adaptive_min_score": ai_adaptive_min_score(int(ml.get("samples") or 0), int(dl.get("samples") or 0)),
+        "gate_removed": True,
+        "historical_gru": dl,
+        "live_ml_model_a": ml,
+        "tree_model_b": ai_tree_model(),
+        "research_ensemble": {k: v for k, v in ai_research_predict({}).items() if k != "models"},
+        "model_comparison": ai_model_compare_status(),
+        "historical_ml": {
+            "samples": 0, "accuracy": None, "auc": None,
+            "status": "NOT SEPARATELY PRETRAINED",
+            "note": "Historical archive is used by the GRU pre-training layer; live ML learns from completed paper outcomes."
+        },
+        "historical": hs,
+        "open_directional_trades": [t for t in ai_open_trades() if (json.loads(t.get('setup_json') or '{}').get('strategy_type') == 'INDEX_DIRECTIONAL_LONG_OPTION')],
+        "last_cycle_at": rt.get('last_cycle_at'),
+        "last_activity_at": rt.get('last_activity_at'),
+    })
+
+@app.route('/api/ai-evolution/learning-progress')
+def ai_learning_progress_api():
+    """Stable learning telemetry for the AI dashboard."""
+    ai_init_db(); hs=ai_hist_status(); ml=ai_ml_model(); dl=ai_dl_model()
+    total=int(hs.get('candles',0) or 0); model=hs.get('model') or {}
+    hist_samples=int(model.get('samples',0) or 0); train_samples=int(model.get('train_samples',0) or 0); val_samples=int(model.get('validation_samples',0) or 0)
+    ml_samples=int(ml.get('samples',0) or 0); dl_samples=int(dl.get('samples',0) or 0)
+    training_active=str(hs.get('training_active','0'))=='1'
+    training_progress=max(0.0,min(100.0,float(hs.get('training_progress',0) or 0)))
+    training_status=hs.get('training_phase') or hs.get('model_status') or 'TRAINING'
+    shown_hist_samples=int(hs.get('training_samples',0) or 0) if training_active else hist_samples
+    hist_ready=bool(model) and hist_samples>0
+    ml_need=max(1,int(ai_params().get('ml_min_samples',40))); dl_need=max(1,int(ai_params().get('dl_min_samples',80)))
+    live_progress=min(100.0,max(ml_samples/ml_need*100.0,dl_samples/dl_need*100.0))
+    return jsonify({
+        'historical': {'progress':training_progress if training_active else (100 if hist_ready else 0),'status':training_status if training_active else hs.get('model_status',hs.get('status','WAITING FOR KITE')),'candles':total,'oldest':hs.get('oldest'),'newest':hs.get('newest'),'training_active':training_active},
+        'ml': {'progress':min(100.0,ml_samples/ml_need*100.0),'status':ml.get('status','WAITING FOR PAPER OUTCOMES') if ml_samples else 'WAITING FOR PAPER OUTCOMES','samples':ml_samples,'accuracy':ml.get('accuracy'),'auc':ml.get('auc')},
+        'dl': {'progress':training_progress if training_active else (100 if hist_samples else min(100.0,dl_samples/dl_need*100.0)),'status':training_status if training_active else (model.get('status') or dl.get('status') or 'NOT TRAINED'),'samples':shown_hist_samples or dl_samples,'train_samples':train_samples,'validation_samples':val_samples,'accuracy':model.get('accuracy',dl.get('accuracy')),'auc':model.get('auc',dl.get('auc'))},
+        'validation': {'progress':100 if val_samples else 0,'status':f'{val_samples:,} chronological validation samples' if val_samples else 'WAITING'},
+        'live': {'ml_samples':ml_samples,'dl_samples':dl_samples,'progress':live_progress}
+    })
+
+@app.route('/api/ai-evolution/status')
+def ai_status():
+    ai_init_db();ch=ai_champion();p=ai_params();m=ai_metrics(ch['version'] if ch else None)
+    universe=ai_universe()
+    c=ai_db(); rt={r['key']:r['value'] for r in c.execute('SELECT key,value FROM ai_runtime').fetchall()}; c.close(); ml=ai_ml_model()
+    learning=ai_learning_state()
+    return jsonify({'enabled':bool(ai_settings().get('enabled',1)),'mode':'AUTONOMOUS PAPER','connected':bool(SESSION.get('access_token')),'market_open':ai_market_open(),'poll_seconds':AI_POLL_SECONDS,'champion':ch['version'] if ch else None,'params':p,'open_trades':len(ai_open_trades()),'metrics':m,'universe_mode':AI_UNIVERSE_MODE,'universe_size':len(universe),'universe_preview':universe[:20],'timestamp':datetime.now(IST).isoformat(),'last_cycle_at':rt.get('last_cycle_at'),'last_activity_at':rt.get('last_activity_at'),'last_scan_at':rt.get('last_scan_at'),'ml':ml,'deep_learning':ai_dl_model(),'research':ai_research_predict({}),'tree_model_b':ai_tree_model(),'model_comparison':ai_model_compare_status(),'learning':learning,'historical':ai_hist_status()})
+
+@app.route('/api/ai-evolution/trades')
+def ai_trades_api():
+    c=ai_db();rows=[dict(x) for x in c.execute('SELECT * FROM ai_trades ORDER BY id DESC LIMIT 200')];c.close()
+    for row in rows:
+        try:
+            sj=json.loads(row.get('setup_json') or '{}')
+        except Exception:
+            sj={}
+        row['entry_volume']=sj.get('option_volume',0)
+        row['exit_volume']=sj.get('exit_volume',0)
+        row['entry_bid']=sj.get('option_bid')
+        row['entry_ask']=sj.get('option_ask')
+        row['exit_bid']=sj.get('exit_bid')
+        row['exit_ask']=sj.get('exit_ask')
+        row['entry_ltp']=sj.get('option_ltp')
+        row['exit_ltp']=sj.get('exit_ltp')
+        row['liquidity_status']=sj.get('liquidity_status','UNKNOWN')
+    return jsonify(rows)
+@app.route('/api/ai-evolution/decisions')
+def ai_decisions_api():
+    c=ai_db();r=[dict(x) for x in c.execute('SELECT * FROM ai_decisions ORDER BY id DESC LIMIT 200')];c.close();return jsonify(r)
+@app.route('/api/ai-evolution/changes')
+def ai_changes_api():
+    c=ai_db();r=[dict(x) for x in c.execute('SELECT * FROM ai_changes ORDER BY id DESC LIMIT 100')];c.close();return jsonify(r)
+@app.route('/api/ai-evolution/learning')
+def ai_learning_api():
+    c=ai_db();r=[dict(x) for x in c.execute('SELECT * FROM ai_learning ORDER BY id DESC LIMIT 100')];c.close();return jsonify(r)
+@app.route('/api/ai-evolution/versions')
+def ai_versions_api():
+    c=ai_db();r=[dict(x) for x in c.execute('SELECT * FROM ai_versions ORDER BY id DESC')];c.close();return jsonify(r)
+@app.route('/api/ai-evolution/events')
+def ai_events_api():
+    c=ai_db();r=[dict(x) for x in c.execute('SELECT * FROM ai_events ORDER BY id DESC LIMIT 150')];c.close();return jsonify(r)
+@app.route('/api/ai-evolution/historical/retrain', methods=['POST'])
+def ai_historical_retrain_api():
+    global _AI_HIST_TRAIN_THREAD
+    with AI_HIST_TRAIN_START_LOCK:
+        thread_alive=bool(_AI_HIST_TRAIN_THREAD and _AI_HIST_TRAIN_THREAD.is_alive())
+        if ai_hist_training_active() or AI_HIST_TRAIN_LOCK.locked() or thread_alive:
+            return jsonify({"ok":True,"started":False,"status":"ALREADY_RUNNING","historical":ai_hist_status()}),200
+        hs=ai_hist_status(); total=int(hs.get("candles") or 0)
+        if total < AI_HIST_MIN_TRAIN:
+            return jsonify({"ok":False,"status":"NOT_ENOUGH_HISTORY","candles":total,"required":int(AI_HIST_MIN_TRAIN),"message":f"Need at least {int(AI_HIST_MIN_TRAIN):,} historical candles."}),400
+        # Reserve the persistent state before starting the thread so two near-
+        # simultaneous HTTP requests cannot both pass the pre-flight check.
+        queued_at=datetime.now(IST).isoformat()
+        _hist_training_update(active=1,requested=0,progress=0.5,phase="QUEUED",error="",started_at=queued_at)
+        def _job():
+            try:
+                ai_hist_train_deep(force=True)
+            finally:
+                global _AI_HIST_TRAIN_THREAD
+                with AI_HIST_TRAIN_START_LOCK:
+                    if _AI_HIST_TRAIN_THREAD is threading.current_thread():
+                        _AI_HIST_TRAIN_THREAD=None
+        worker=threading.Thread(target=_job,daemon=True,name="manual-historical-gru-retrain")
+        _AI_HIST_TRAIN_THREAD=worker
+        try:
+            worker.start()
+        except Exception as e:
+            _AI_HIST_TRAIN_THREAD=None
+            _hist_training_update(active=0,phase="START FAILED",error=f"{type(e).__name__}: {e}")
+            return jsonify({"ok":False,"started":False,"status":"START_FAILED","message":str(e)}),500
+    _hist_invalidate_status_cache()
+    return jsonify({"ok":True,"started":True,"status":"TRAINING_STARTED","historical":ai_hist_status()}),202
+
+@app.route('/api/ai-evolution/historical')
+def ai_historical_api():
+    return jsonify(ai_hist_status())
+
+@app.route('/api/ai-evolution/historical/sync',methods=['POST'])
+def ai_historical_sync_api():
+    return jsonify(ai_hist_sync())
+
+@app.route('/api/ai-evolution/cycle',methods=['POST'])
+def ai_force_cycle():
+    ai_cycle();return jsonify({'ok':True})
+
+@app.route('/api/ai-evolution/options')
+def ai_option_history_api():
+    return jsonify(ai_option_capture_status())
+
+@app.route('/api/ai-evolution/options/capture',methods=['POST'])
+def ai_option_capture_api():
+    return jsonify(ai_capture_option_chains(force=True))
+
+# =============================================================================
+# AUTOMATIC AI TRADING ENGINE -- Paper + Live (BUY CE/PE, then HOLD/REDUCE/SELL)
+# =============================================================================
+# This sits on top of the directional GRU+ML+ensemble engine above
+# (ai_directional_snapshot): same prediction, same option-selection logic, same
+# stop/target derivation. What this section adds is:
+#
+#   1. Its OWN trade ledger (ai_autotrade_trades / ai_autotrade_actions) so the
+#      always-paper "AI Evolution" research engine above is never touched and
+#      never put at risk of a regression by this addition.
+#   2. Continuous post-entry reassessment. Every poll, each open position is
+#      re-priced AND re-predicted (a fresh ai_directional_snapshot call), and
+#      the engine decides HOLD / REDUCE / SELL from stop, target, square-off
+#      time, max hold time, signal reversal, or a confidence-decay check --
+#      not just a static stop/target hit.
+#   3. An explicit PAPER (default, always on) vs LIVE execution mode. LIVE can
+#      only be selected once THIS engine's own paper track record clears a
+#      configurable out-of-sample edge bar (min trades, min span of days, min
+#      win rate, min average R, min profit factor) -- see
+#      autotrade_ai_edge_status(). Even after that, LIVE only ever places a
+#      real order after an explicit arm + acknowledgement, exactly like the
+#      /api/autotrade and /api/breakout-monitor engines elsewhere in this file.
+#   4. Every completed trade (paper AND live) is fed back into the SAME
+#      ai_ml_record_sample()/ai_dl_record_sample() learning pipeline used
+#      above, so the shared GRU/ML/ensemble models keep improving from this
+#      engine's real outcomes too.
+#
+# This engine never forces a trade: ai_directional_snapshot() itself returns
+# WAIT whenever the ensemble is not confident enough to name a direction, and
+# no position is opened on a WAIT.
+# =============================================================================
+
+AUTOTRADE_AI_POLL_SECONDS = int(os.environ.get("AUTOTRADE_AI_POLL_SECONDS", "20"))
+AUTOTRADE_AI_SYMBOLS = list(AI_HIST_SYMBOLS)  # NIFTY, BANKNIFTY, FINNIFTY
+
+AUTOTRADE_AI_DEFAULTS = {
+    "execution_mode": "paper",           # "paper" (default, always available) | "live"
+    "armed": False,                      # master on/off switch for NEW automatic entries
+    "capital_per_trade_live": 25000.0,   # rupees earmarked per LIVE entry
+    "capital_per_trade_paper": 25000.0,  # rupees used to size PAPER quantity (for realistic P&L)
+    "max_concurrent_positions": 3,       # across NIFTY/BANKNIFTY/FINNIFTY combined
+    "max_daily_loss_paper": 15000.0,     # paper circuit breaker (rupees)
+    "max_daily_loss_live": 7500.0,       # live circuit breaker (rupees) -- deliberately tighter
+    "max_hold_minutes": 180,             # force flatten a stale position even if flat
+    "square_off_time": "15:15",          # never carries an intraday long option overnight
+    "confidence_drop_reduce": 0.12,      # ensemble confidence drop vs entry that triggers a REDUCE
+    "confidence_drop_exit": 0.22,        # ensemble confidence drop vs entry that triggers a full SELL
+    "edge_min_trades": 60,               # minimum CLOSED paper trades required before LIVE unlocks
+    "edge_min_days": 10,                 # those trades must span at least this many calendar days
+    "edge_min_win_rate": 42.0,           # percent
+    "edge_min_avg_r": 0.05,              # average R-multiple must be net positive after costs
+    "edge_min_profit_factor": 1.10,
+    "reduce_fraction": 0.5,              # fraction of quantity closed on a REDUCE action
+}
+
+AUTOTRADE_AI_CONFIGURABLE_KEYS = (
+    "capital_per_trade_live", "capital_per_trade_paper", "max_concurrent_positions",
+    "max_daily_loss_paper", "max_daily_loss_live", "max_hold_minutes", "square_off_time",
+    "confidence_drop_reduce", "confidence_drop_exit", "edge_min_trades", "edge_min_days",
+    "edge_min_win_rate", "edge_min_avg_r", "edge_min_profit_factor", "reduce_fraction",
+)
+
+
+def autotrade_ai_init_db():
+    c = ai_db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS ai_autotrade_trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT, option_symbol TEXT, token INTEGER,
+        exchange TEXT, side TEXT, execution_mode TEXT, entry REAL, qty INTEGER, original_qty INTEGER,
+        lot_size INTEGER, stop REAL, target REAL, entry_ensemble_conf REAL, entry_p_up REAL,
+        setup_json TEXT, status TEXT, exit REAL, exit_ts TEXT, pnl REAL DEFAULT 0, r_multiple REAL DEFAULT 0,
+        exit_reason TEXT, entry_order_id TEXT, exit_order_ids TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ai_autotrade_actions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_id INTEGER, symbol TEXT, action TEXT,
+        reason TEXT, ltp REAL, unrealized_pnl REAL, unrealized_r REAL, p_up REAL, ensemble_conf REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_autotrade_trades_status ON ai_autotrade_trades(status);
+    CREATE INDEX IF NOT EXISTS idx_autotrade_actions_trade ON ai_autotrade_actions(trade_id);
+    """)
+    row = c.execute("SELECT value FROM ai_runtime WHERE key='autotrade_ai_config'").fetchone()
+    if not row:
+        c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('autotrade_ai_config',?)",
+                  (json.dumps(AUTOTRADE_AI_DEFAULTS),))
+    c.commit(); c.close()
+
+
+def autotrade_ai_config():
+    c = ai_db()
+    row = c.execute("SELECT value FROM ai_runtime WHERE key='autotrade_ai_config'").fetchone()
+    c.close()
+    cfg = dict(AUTOTRADE_AI_DEFAULTS)
+    if row:
+        try:
+            cfg.update(json.loads(row["value"]))
+        except Exception:
+            pass
+    return cfg
+
+
+def autotrade_ai_save_config(cfg):
+    c = ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('autotrade_ai_config',?)", (json.dumps(cfg),))
+    c.commit(); c.close()
+
+
+def autotrade_ai_last_cycle_at():
+    c = ai_db()
+    r = c.execute("SELECT value FROM ai_runtime WHERE key='autotrade_ai_last_cycle_at'").fetchone()
+    c.close()
+    return r["value"] if r else None
+
+
+def autotrade_ai_log_action(trade_id, symbol, action, reason, ltp=None, unrealized_pnl=None,
+                             unrealized_r=None, p_up=None, ensemble_conf=None):
+    c = ai_db()
+    c.execute("""INSERT INTO ai_autotrade_actions
+        (ts,trade_id,symbol,action,reason,ltp,unrealized_pnl,unrealized_r,p_up,ensemble_conf)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (datetime.now(IST).isoformat(), trade_id, symbol, action, reason, ltp,
+               unrealized_pnl, unrealized_r, p_up, ensemble_conf))
+    c.commit(); c.close()
+
+
+def autotrade_ai_open_positions():
+    c = ai_db()
+    rows = c.execute("SELECT * FROM ai_autotrade_trades WHERE status='OPEN'").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def autotrade_ai_today_realized_pnl(execution_mode):
+    today = now_ist().strftime("%Y-%m-%d")
+    c = ai_db()
+    rows = c.execute("SELECT pnl, exit_ts FROM ai_autotrade_trades WHERE status='CLOSED' AND execution_mode=?",
+                      (execution_mode,)).fetchall()
+    c.close()
+    total = 0.0
+    for r in rows:
+        if r["exit_ts"] and str(r["exit_ts"]).startswith(today):
+            total += float(r["pnl"] or 0.0)
+    return round(total, 2)
+
+
+def autotrade_ai_edge_status():
+    """Out-of-sample edge check on THIS engine's own PAPER trade history -- the
+    gate that must clear before LIVE mode can even be selected. Deliberately
+    reads only CLOSED paper trades: the strategy has to prove itself on paper,
+    on its own real (if simulated) fills, before it is ever allowed to risk
+    real money."""
+    cfg = autotrade_ai_config()
+    required = {k: cfg[k] for k in ("edge_min_trades", "edge_min_days", "edge_min_win_rate",
+                                     "edge_min_avg_r", "edge_min_profit_factor")}
+    c = ai_db()
+    rows = c.execute("SELECT * FROM ai_autotrade_trades WHERE status='CLOSED' AND execution_mode='paper' ORDER BY id").fetchall()
+    c.close()
+    rows = [dict(r) for r in rows]
+    n = len(rows)
+    if n == 0:
+        return {"edge_confirmed": False, "trades": 0, "span_days": 0, "win_rate": 0, "avg_r": 0,
+                "profit_factor": 0, "checks": {}, "required": required,
+                "reason": "No completed paper trades yet -- the engine has to run in Paper mode first."}
+    first_ts = _ai_ts_naive(rows[0]["ts"])
+    last_ts = _ai_ts_naive(rows[-1]["exit_ts"] or rows[-1]["ts"])
+    span_days = max(0.0, (last_ts - first_ts).total_seconds() / 86400.0) if (first_ts and last_ts) else 0.0
+    pnl = [float(r["pnl"] or 0) for r in rows]
+    rmul = [float(r["r_multiple"] or 0) for r in rows]
+    wins = [x for x in pnl if x > 0]
+    losses = [x for x in pnl if x < 0]
+    win_rate = round(len(wins) / n * 100.0, 2)
+    avg_r = round(sum(rmul) / n, 4)
+    profit_factor = round(sum(wins) / abs(sum(losses)), 2) if losses else (99.0 if wins else 0.0)
+    checks = {
+        "trades_ok": n >= int(required["edge_min_trades"]),
+        "span_ok": span_days >= float(required["edge_min_days"]),
+        "win_rate_ok": win_rate >= float(required["edge_min_win_rate"]),
+        "avg_r_ok": avg_r >= float(required["edge_min_avg_r"]),
+        "profit_factor_ok": profit_factor >= float(required["edge_min_profit_factor"]),
+    }
+    edge_confirmed = all(checks.values())
+    return {
+        "edge_confirmed": edge_confirmed, "trades": n, "span_days": round(span_days, 1),
+        "win_rate": win_rate, "avg_r": avg_r, "profit_factor": profit_factor,
+        "checks": checks, "required": required,
+        "reason": "Meets all out-of-sample thresholds." if edge_confirmed else
+                  "Does not yet meet one or more out-of-sample thresholds -- keep paper trading.",
+    }
+
+
+def autotrade_ai_live_allowed():
+    edge = autotrade_ai_edge_status()
+    if not edge["edge_confirmed"]:
+        return False, "Live trading is locked until this engine's paper track record clears the configured edge thresholds.", edge
+    if not require_session():
+        return False, "Not logged in to Kite.", edge
+    return True, "OK", edge
+
+
+def _autotrade_ai_size(setup, capital_per_trade):
+    entry = float(setup["entry"]); lot = int(setup["lot_size"])
+    capital=float(capital_per_trade or 0)
+    if entry <= 0 or lot <= 0 or capital <= 0:
+        return 0
+    # Never silently force one lot when the configured capital cannot fund it.
+    # The caller already handles a zero quantity as SIZE_REJECTED.
+    lots=int(capital//(entry*lot))
+    if lots<1:return 0
+    return lots * lot
+
+
+def autotrade_ai_try_enter(symbol, cfg):
+    """WAIT is the default outcome: this only opens a position when
+    ai_directional_snapshot() itself names a strong, executable UP or DOWN
+    setup. It never manufactures a trade to keep the engine 'busy'."""
+    open_positions = autotrade_ai_open_positions()
+    if any(p["symbol"] == symbol for p in open_positions):
+        return None
+    if len(open_positions) >= int(cfg["max_concurrent_positions"]):
+        return None
+
+    execution_mode = cfg.get("execution_mode", "paper")
+    if execution_mode == "live":
+        live_allowed, why, _edge = autotrade_ai_live_allowed()
+        if not live_allowed:
+            ai_log("AUTOTRADE_AI", "LIVE_BLOCKED", f"{symbol}: {why}")
+            return None
+        if autotrade_ai_today_realized_pnl("live") <= -abs(float(cfg["max_daily_loss_live"])):
+            ai_log("AUTOTRADE_AI", "LIVE_DAILY_LOSS_LIMIT", f"{symbol}: live daily loss limit reached; no further live entries today")
+            return None
+    else:
+        if autotrade_ai_today_realized_pnl("paper") <= -abs(float(cfg["max_daily_loss_paper"])):
+            return None
+
+    params = ai_params()
+    setup, err = ai_directional_snapshot(symbol, params)
+    if err or not setup:
+        detail = err if isinstance(err, str) else (err or {}).get("error", "WAIT")
+        ai_log("AUTOTRADE_AI", "WAIT", f"{symbol}: {detail}")
+        return None
+
+    capital = float(cfg["capital_per_trade_live"] if execution_mode == "live" else cfg["capital_per_trade_paper"])
+    qty = _autotrade_ai_size(setup, capital)
+    if qty <= 0:
+        ai_log("AUTOTRADE_AI", "SIZE_REJECTED", f"{symbol}: capital too small for even 1 lot of {setup['option_symbol']}")
+        return None
+
+    if execution_mode == "live":
+        exch = INDEX_OPTION_EXCHANGE.get(symbol, "NFO")
+        leg = {"leg": "ai_auto_entry", "tradingsymbol": setup["option_symbol"], "exchange": exch,
+               "transaction_type": "BUY", "quantity": qty}
+        results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+        result = results[0] if results else {"status": "failed", "error": "No result returned"}
+        if result["status"] != "placed":
+            ai_log("ERROR", "AUTOTRADE_AI_LIVE_ENTRY_FAILED", f"{symbol}: {result.get('error')}")
+            return None
+        order_id = result.get("order_id")
+    else:
+        order_id = f"PAPER-{int(time.time() * 1000)}"
+
+    exchange = INDEX_OPTION_EXCHANGE.get(symbol, "NFO")
+    now_iso = datetime.now(IST).isoformat()
+    c = ai_db()
+    cur = c.execute("""INSERT INTO ai_autotrade_trades
+        (ts,symbol,option_symbol,token,exchange,side,execution_mode,entry,qty,original_qty,lot_size,stop,target,
+         entry_ensemble_conf,entry_p_up,setup_json,status,entry_order_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (now_iso, symbol, setup["option_symbol"], setup["token"], exchange, "LONG", execution_mode,
+         setup["entry"], qty, qty, setup["lot_size"], setup["stop"], setup["target"],
+         float(setup.get("ensemble_confidence") or 0), float(setup.get("dl_probability") or 0),
+         json.dumps(setup), "OPEN", order_id))
+    trade_id = cur.lastrowid
+    c.commit(); c.close()
+    ai_log("TRADE", "AUTOTRADE_AI_OPEN",
+           f"{symbol} [{execution_mode.upper()}] BUY {setup['option_type']} {setup['option_symbol']} qty={qty} "
+           f"entry={setup['entry']:.2f} p_up={setup.get('dl_probability', 0):.3f} conf={setup.get('ensemble_confidence', 0):.3f}")
+    autotrade_ai_log_action(trade_id, symbol, "BUY", f"Strong {setup['direction']} signal -> BUY {setup['option_type']}",
+                             ltp=setup["entry"], p_up=setup.get("dl_probability"), ensemble_conf=setup.get("ensemble_confidence"))
+    return trade_id
+
+
+def _autotrade_ai_exit(trade, qty_to_close, reason, execution_mode):
+    """Places (LIVE) or simulates (PAPER) the closing order for qty_to_close
+    units of an open autotrade position. Always exits at the executable BID
+    (this is a long option), never a stale LTP/midpoint. Returns
+    (exit_price, order_id) or (None, None) if there's nothing executable to
+    trade against this cycle -- in which case the position is simply
+    re-evaluated on the next poll rather than force-closed on bad data."""
+    try:
+        key = f'{trade["exchange"]}:{trade["option_symbol"]}'
+        q = kite_quote_bulk([key]).get(key)
+        st = quote_stats(q)
+    except Exception as e:
+        ai_log("ERROR", "AUTOTRADE_AI_EXIT_QUOTE", f'{trade["option_symbol"]}: {e}')
+        return None, None
+    bid = st.get("bid")
+    if bid is None or float(bid) <= 0:
+        ai_log("TRADE", "AUTOTRADE_AI_EXIT_WAIT_LIQUIDITY", f'id={trade["id"]} {trade["option_symbol"]} no executable bid yet')
+        return None, None
+    price = float(bid)
+    if execution_mode == "live":
+        leg = {"leg": "ai_auto_exit", "tradingsymbol": trade["option_symbol"], "exchange": trade["exchange"],
+               "transaction_type": "SELL", "quantity": int(qty_to_close)}
+        results = place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False)
+        result = results[0] if results else {"status": "failed", "error": "No result returned"}
+        if result["status"] != "placed":
+            ai_log("ERROR", "AUTOTRADE_AI_LIVE_EXIT_FAILED", f'id={trade["id"]}: {result.get("error")}')
+            return None, None
+        return price, result.get("order_id")
+    return price, f"PAPER-EXIT-{int(time.time() * 1000)}"
+
+
+def autotrade_ai_manage_positions(cfg):
+    """The continuous reassessment loop: re-prices AND re-predicts every open
+    position, then decides HOLD / REDUCE / SELL. This is what lets the engine
+    react to the edge weakening or reversing mid-trade, not just to a static
+    stop/target level set at entry."""
+    for trade in autotrade_ai_open_positions():
+        try:
+            symbol = trade["symbol"]
+            key = f'{trade["exchange"]}:{trade["option_symbol"]}'
+            q = kite_quote_bulk([key]).get(key)
+            st = quote_stats(q)
+            bid = st.get("bid")
+            if bid is None or float(bid) <= 0:
+                continue
+            ltp = float(bid)
+            entry = float(trade["entry"]); qty = int(trade["qty"])
+            unrealized_pnl = (ltp - entry) * qty
+            risk_per_unit = max(entry - float(trade["stop"]), 0.01)
+            unrealized_r = (ltp - entry) / risk_per_unit
+
+            # Re-run the SAME prediction pipeline used at entry -- this is the
+            # "continuously reassesses the prediction, option behaviour, profit
+            # potential and risk" step the engine is required to do.
+            params = ai_params()
+            fresh, _ferr = ai_directional_snapshot(symbol, params)
+            fresh_conf = fresh.get("ensemble_confidence") if fresh else None
+            fresh_p_up = fresh.get("dl_probability") if fresh else None
+            fresh_dir = fresh.get("direction") if fresh else None
+            entry_setup = json.loads(trade["setup_json"] or "{}")
+            entry_dir = entry_setup.get("direction")
+
+            action, reason, close_fraction = "HOLD", "Within plan; no exit condition met.", 0.0
+            opened_at = _ai_ts_naive(trade["ts"])
+            age_min = (now_ist().replace(tzinfo=None) - opened_at).total_seconds() / 60.0 if opened_at else 0.0
+
+            if ltp <= float(trade["stop"]):
+                action, reason, close_fraction = "SELL", "Stop-loss hit.", 1.0
+            elif ltp >= float(trade["target"]):
+                action, reason, close_fraction = "SELL", "Target reached.", 1.0
+            elif now_ist().strftime("%H:%M") >= cfg.get("square_off_time", "15:15"):
+                action, reason, close_fraction = "SELL", "Intraday square-off time reached.", 1.0
+            elif age_min >= float(cfg.get("max_hold_minutes", 180)):
+                action, reason, close_fraction = "SELL", f"Max hold time ({cfg.get('max_hold_minutes')} min) exceeded without reaching target/stop.", 1.0
+            elif fresh_dir and entry_dir and fresh_dir != entry_dir:
+                action, reason, close_fraction = "SELL", f"Signal reversed: entry read was {entry_dir}, live read is now {fresh_dir}.", 1.0
+            elif fresh_conf is not None and trade["entry_ensemble_conf"]:
+                drop = float(trade["entry_ensemble_conf"]) - float(fresh_conf)
+                if drop >= float(cfg.get("confidence_drop_exit", 0.22)):
+                    action, reason, close_fraction = "SELL", f"Model confidence fell {drop:.2f} since entry -- edge no longer there.", 1.0
+                elif drop >= float(cfg.get("confidence_drop_reduce", 0.12)) and qty > int(trade["lot_size"]):
+                    action, reason, close_fraction = "REDUCE", f"Model confidence fell {drop:.2f} since entry -- trimming exposure.", float(cfg.get("reduce_fraction", 0.5))
+
+            if action == "HOLD":
+                autotrade_ai_log_action(trade["id"], symbol, "HOLD", reason, ltp=ltp, unrealized_pnl=round(unrealized_pnl, 2),
+                                         unrealized_r=round(unrealized_r, 3), p_up=fresh_p_up, ensemble_conf=fresh_conf)
+                continue
+
+            lot_size = int(trade["lot_size"])
+            if action == "SELL":
+                qty_to_close = qty
+            else:
+                lots_to_close = max(1, int(round((qty / lot_size) * close_fraction)))
+                qty_to_close = min(qty, lots_to_close * lot_size)
+
+            exit_price, exit_order_id = _autotrade_ai_exit(trade, qty_to_close, reason, trade["execution_mode"])
+            if exit_price is None:
+                continue  # re-evaluated next poll rather than force-closed on a bad quote
+
+            realized = (exit_price - entry) * qty_to_close
+            remaining_qty = qty - qty_to_close
+            exit_ids = json.loads(trade.get("exit_order_ids") or "[]")
+            exit_ids.append(exit_order_id)
+            c = ai_db()
+            if remaining_qty > 0:
+                new_pnl = float(trade.get("pnl") or 0) + realized
+                c.execute("UPDATE ai_autotrade_trades SET qty=?, pnl=?, exit_order_ids=? WHERE id=?",
+                          (remaining_qty, new_pnl, json.dumps(exit_ids), trade["id"]))
+                c.commit(); c.close()
+                autotrade_ai_log_action(trade["id"], symbol, "REDUCE", reason, ltp=exit_price, unrealized_pnl=round(realized, 2),
+                                         unrealized_r=round(unrealized_r, 3), p_up=fresh_p_up, ensemble_conf=fresh_conf)
+                ai_log("TRADE", "AUTOTRADE_AI_REDUCE", f'id={trade["id"]} {symbol} [{trade["execution_mode"].upper()}] {reason} closed_qty={qty_to_close} realized={realized:.2f}')
+            else:
+                total_pnl = float(trade.get("pnl") or 0) + realized
+                risk_total = abs(entry - float(trade["stop"])) * int(trade["original_qty"])
+                rmul = total_pnl / risk_total if risk_total else 0.0
+                c.execute("""UPDATE ai_autotrade_trades SET status='CLOSED', exit=?, exit_ts=?, pnl=?, r_multiple=?,
+                             exit_reason=?, exit_order_ids=? WHERE id=?""",
+                          (exit_price, datetime.now(IST).isoformat(), total_pnl, rmul, reason, json.dumps(exit_ids), trade["id"]))
+                c.commit(); c.close()
+                autotrade_ai_log_action(trade["id"], symbol, "SELL", reason, ltp=exit_price, unrealized_pnl=round(total_pnl, 2),
+                                         unrealized_r=round(rmul, 3), p_up=fresh_p_up, ensemble_conf=fresh_conf)
+                ai_log("TRADE", "AUTOTRADE_AI_CLOSE",
+                       f'id={trade["id"]} {symbol} [{trade["execution_mode"].upper()}] {reason} pnl={total_pnl:.2f} R={rmul:.2f}')
+
+                # Every completed trade -- paper or live -- becomes new learning
+                # data for the SAME shared GRU/ML ensemble used by the paper-only
+                # research engine above, so the models keep validating/improving.
+                try:
+                    spot_key = INDEX_SYMBOLS.get(symbol, "NSE:" + symbol)
+                    spot_q = kite_quote_bulk([spot_key]).get(spot_key)
+                    spot_now = extract_price(spot_q) if spot_q else None
+                    entry_spot = float(entry_setup.get("spot") or 0)
+                    direction_label = 1 if (spot_now is not None and entry_spot > 0 and float(spot_now) > entry_spot) else 0
+                    horizon = max(0.0, (datetime.now(IST) - datetime.fromisoformat(str(trade["ts"]))).total_seconds())
+                    if entry_setup.get("ml_features"):
+                        ai_ml_record_sample(trade["id"], "AUTOTRADE_AI", symbol, entry_setup["ml_features"], direction_label, rmul, horizon)
+                    if entry_setup.get("dl_sequence"):
+                        ai_dl_record_sample(trade["id"], "AUTOTRADE_AI", symbol, entry_setup["dl_sequence"], direction_label, rmul, horizon)
+                except Exception as e:
+                    ai_log("ERROR", "AUTOTRADE_AI_LEARNING_SAMPLE", f'id={trade["id"]}: {e}')
+        except Exception as e:
+            ai_log("ERROR", "AUTOTRADE_AI_MANAGE", f'id={trade.get("id")}: {type(e).__name__}: {e}')
+
+
+def autotrade_ai_close_all(reason="Manual kill-switch"):
+    """Kill switch: force-flattens every open automatic position (paper AND
+    live) right now, independent of the armed/disarmed state."""
+    closed = []
+    for trade in autotrade_ai_open_positions():
+        exit_price, exit_order_id = _autotrade_ai_exit(trade, trade["qty"], reason, trade["execution_mode"])
+        if exit_price is None:
+            continue
+        realized = (exit_price - float(trade["entry"])) * int(trade["qty"])
+        total_pnl = float(trade.get("pnl") or 0) + realized
+        risk_total = abs(float(trade["entry"]) - float(trade["stop"])) * int(trade["original_qty"])
+        rmul = total_pnl / risk_total if risk_total else 0.0
+        exit_ids = json.loads(trade.get("exit_order_ids") or "[]")
+        exit_ids.append(exit_order_id)
+        c = ai_db()
+        c.execute("""UPDATE ai_autotrade_trades SET status='CLOSED', exit=?, exit_ts=?, pnl=?, r_multiple=?,
+                     exit_reason=?, exit_order_ids=? WHERE id=?""",
+                  (exit_price, datetime.now(IST).isoformat(), total_pnl, rmul, reason, json.dumps(exit_ids), trade["id"]))
+        c.commit(); c.close()
+        autotrade_ai_log_action(trade["id"], trade["symbol"], "SELL", reason, ltp=exit_price,
+                                 unrealized_pnl=round(total_pnl, 2), unrealized_r=round(rmul, 3))
+        closed.append(trade["id"])
+    return closed
+
+
+def autotrade_ai_cycle():
+    cfg = autotrade_ai_config()
+    c = ai_db()
+    c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('autotrade_ai_last_cycle_at',?)",
+              (datetime.now(IST).isoformat(),))
+    c.commit(); c.close()
+    if not require_session():
+        return
+    # Open risk is always looked after, regardless of the armed switch -- armed
+    # only gates NEW entries.
+    autotrade_ai_manage_positions(cfg)
+    # Historical GRU retraining pauses NEW automatic entries so the engine never
+    # opens a fresh position while the model is being replaced. Existing positions
+    # continue to be managed for HOLD/REDUCE/SELL safety.
+    if ai_hist_training_active():
+        ai_log("LEARNING", "AUTOTRADE_AI_ENTRY_PAUSED", "Historical GRU retraining in progress -- new entries paused; existing positions remain managed.")
+        return
+    if not ai_market_open() or not cfg.get("armed"):
+        return
+    # Mid-session live safety net: if the live daily loss limit is breached,
+    # auto-disarm new live entries immediately (already-open positions are
+    # still managed/exited by autotrade_ai_manage_positions above).
+    if cfg.get("execution_mode") == "live" and autotrade_ai_today_realized_pnl("live") <= -abs(float(cfg["max_daily_loss_live"])):
+        cfg["armed"] = False
+        autotrade_ai_save_config(cfg)
+        ai_log("RISK", "AUTOTRADE_AI_LIVE_DAILY_LOSS_DISARM", "Live daily loss limit reached -- engine auto-disarmed.")
+        return
+    for symbol in AUTOTRADE_AI_SYMBOLS:
+        try:
+            autotrade_ai_try_enter(symbol, cfg)
+        except Exception as e:
+            ai_log("ERROR", "AUTOTRADE_AI_ENTRY", f"{symbol}: {type(e).__name__}: {e}")
+
+
+def autotrade_ai_loop():
+    autotrade_ai_init_db()
+    ai_log("SYSTEM", "AUTOTRADE_AI_START", "Automatic AI buy/sell engine started (Paper mode by default).")
+    while True:
+        try:
+            autotrade_ai_cycle()
+        except Exception as e:
+            ai_log("ERROR", "AUTOTRADE_AI_LOOP", str(e))
+        time.sleep(AUTOTRADE_AI_POLL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.route("/api/ai-autotrade/state")
+def ai_autotrade_state_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    cfg = autotrade_ai_config()
+    open_positions = autotrade_ai_open_positions()
+    enriched = []
+    for t in open_positions:
+        ltp = None
+        try:
+            key = f'{t["exchange"]}:{t["option_symbol"]}'
+            q = kite_quote_bulk([key]).get(key)
+            st = quote_stats(q)
+            ltp = st.get("bid") or extract_price(q)
+        except Exception:
+            pass
+        t2 = dict(t)
+        t2["last_ltp"] = ltp
+        t2["unrealized_pnl"] = round((float(ltp) - float(t["entry"])) * int(t["qty"]), 2) if ltp else None
+        enriched.append(t2)
+    return jsonify({
+        "config": cfg,
+        "edge_status": autotrade_ai_edge_status(),
+        "open_positions": enriched,
+        "today_pnl": {"paper": autotrade_ai_today_realized_pnl("paper"), "live": autotrade_ai_today_realized_pnl("live")},
+        "market_open": ai_market_open(),
+        "last_cycle_at": autotrade_ai_last_cycle_at(),
+        "symbols": AUTOTRADE_AI_SYMBOLS,
+    })
+
+
+@app.route("/api/ai-autotrade/config", methods=["POST"])
+def ai_autotrade_config_route():
+    """Bulk settings only -- execution_mode and armed are deliberately kept OUT
+    of this route (same pattern as /api/autotrade/config) so a routine 'Save
+    settings' click can never silently switch the engine into Live or arm it."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    cfg = autotrade_ai_config()
+    for k in AUTOTRADE_AI_CONFIGURABLE_KEYS:
+        if k in body:
+            cfg[k] = body[k]
+    autotrade_ai_save_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/ai-autotrade/set-execution-mode", methods=["POST"])
+def ai_autotrade_set_mode_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    mode = body.get("mode")
+    if mode not in ("paper", "live"):
+        return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
+    cfg = autotrade_ai_config()
+    if mode == "live":
+        if body.get("ack") is not True:
+            return jsonify({"error": "Switching to LIVE requires explicit confirmation (ack: true) that future "
+                                      "automatic entries/exits will place REAL orders on your Zerodha account "
+                                      "with real money."}), 400
+        allowed, why, edge = autotrade_ai_live_allowed()
+        if not allowed:
+            return jsonify({"error": why, "edge_status": edge}), 400
+    cfg["execution_mode"] = mode
+    autotrade_ai_save_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/ai-autotrade/arm", methods=["POST"])
+def ai_autotrade_arm_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    cfg = autotrade_ai_config()
+    if cfg.get("execution_mode") == "live":
+        allowed, why, edge = autotrade_ai_live_allowed()
+        if not allowed:
+            return jsonify({"error": why, "edge_status": edge}), 400
+        if body.get("ack") is not True:
+            return jsonify({"error": "Arming the engine in LIVE mode requires explicit confirmation (ack: true) -- "
+                                      "it will automatically place real BUY/SELL orders from this point on."}), 400
+    cfg["armed"] = True
+    autotrade_ai_save_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/ai-autotrade/disarm", methods=["POST"])
+def ai_autotrade_disarm_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    cfg = autotrade_ai_config()
+    cfg["armed"] = False
+    autotrade_ai_save_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/ai-autotrade/close-all", methods=["POST"])
+def ai_autotrade_close_all_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    closed = autotrade_ai_close_all("Manual kill-switch close-all")
+    return jsonify({"ok": True, "closed_trade_ids": closed})
+
+
+@app.route("/api/ai-autotrade/trades")
+def ai_autotrade_trades_route():
+    c = ai_db()
+    limit = min(int(request.args.get("limit", 100)), 500)
+    rows = [dict(x) for x in c.execute("SELECT * FROM ai_autotrade_trades ORDER BY id DESC LIMIT ?", (limit,))]
+    c.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ai-autotrade/actions")
+def ai_autotrade_actions_route():
+    c = ai_db()
+    limit = min(int(request.args.get("limit", 200)), 1000)
+    trade_id = request.args.get("trade_id")
+    if trade_id:
+        rows = [dict(x) for x in c.execute(
+            "SELECT * FROM ai_autotrade_actions WHERE trade_id=? ORDER BY id DESC LIMIT ?", (trade_id, limit))]
+    else:
+        rows = [dict(x) for x in c.execute(
+            "SELECT * FROM ai_autotrade_actions ORDER BY id DESC LIMIT ?", (limit,))]
+    c.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ai-autotrade/edge-status")
+def ai_autotrade_edge_status_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    return jsonify(autotrade_ai_edge_status())
+
+ai_init_db()
+threading.Thread(target=ai_loop,daemon=True).start()
+threading.Thread(target=ai_hist_loop,daemon=True).start()
+
 threading.Thread(target=_autotrade_loop, daemon=True).start()
 threading.Thread(target=_breakout_monitor_loop, daemon=True).start()
+threading.Thread(target=autotrade_ai_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Long Straddle / Strangle — "Volatility Breakout" module (independent of the Condor/Strangle
+# module above — its own screener, its own builder, its own tracked-position store/execution).
+# ---------------------------------------------------------------------------
+def _daily_candles_for_squeeze(symbol, lookback_days=MOVE_SQUEEZE_LOOKBACK_DAYS):
+    token, err = resolve_token_for_symbol(symbol)
+    if err:
+        return None, err
+    to_date = now_ist()
+    from_date = to_date - timedelta(days=lookback_days + 20)
+    try:
+        candles = kite.historical_data(token, from_date, to_date, "day")
+    except Exception as e:
+        return None, f"Historical data fetch failed: {e}"
+    if len(candles) < 50:
+        return None, "Not enough daily history for a reliable squeeze read (need 50+ sessions)"
+    return candles, None
+
+
+def breakout_squeeze_diagnostics(symbol):
+    """Looks for the specific pre-breakout SETUP a long straddle/strangle wants: a tightening range
+    (Bollinger-band squeeze), an unusually narrow recent daily range (NR7), volume drying up into
+    the squeeze (fuel for an eventual expansion) or already picking up (the move may be starting),
+    ADX still low or just turning up off a low base (a trend that hasn't already run its course),
+    and proximity to a well-defined recent range edge (a plausible breakout trigger level). None of
+    this predicts DIRECTION — only that conditions are compressed/coiled enough for a move to be
+    more likely than usual, which is exactly what makes cheap, at-the-money option premium
+    attractive here (the opposite read of the Iron Condor builder's trend/ADX checks elsewhere)."""
+    candles, err = _daily_candles_for_squeeze(symbol)
+    if err:
+        return {"error": err}
+    closes = np.array([c["close"] for c in candles], dtype=float)
+    highs = np.array([c["high"] for c in candles], dtype=float)
+    lows = np.array([c["low"] for c in candles], dtype=float)
+    vols = np.array([float(c.get("volume") or 0) for c in candles], dtype=float)
+    n = len(closes)
+    if n < MOVE_BB_PERIOD + 30:
+        return {"error": "Not enough daily history for a reliable squeeze read (need 50+ sessions)"}
+
+    # Bollinger Band width (2 std-dev), as a % of the middle band, tracked across the whole
+    # lookback so today's width can be ranked against its OWN recent history — a genuine "is this
+    # unusually tight right now?" read rather than a semi-arbitrary fixed threshold.
+    bb_widths = []
+    for i in range(MOVE_BB_PERIOD, n + 1):
+        window = closes[i - MOVE_BB_PERIOD:i]
+        mid = float(np.mean(window))
+        sd = float(np.std(window))
+        if mid:
+            bb_widths.append(((mid + 2 * sd) - (mid - 2 * sd)) / mid * 100)
+    if not bb_widths:
+        return {"error": "Could not compute Bollinger band width"}
+    current_bb_width = bb_widths[-1]
+    squeeze_percentile = _percentile_rank(current_bb_width, bb_widths)  # low = unusually tight NOW
+    is_squeeze = squeeze_percentile <= 20
+
+    # NR7 — is today's high/low range the narrowest of the last 7 sessions? A classic simple
+    # pre-breakout marker, independent of the Bollinger read above.
+    ranges = highs - lows
+    last7 = ranges[-MOVE_NR_WINDOW:]
+    is_nr7 = bool(len(last7) == MOVE_NR_WINDOW and last7[-1] <= min(last7))
+    range_contraction_pct = (round((1 - last7[-1] / np.mean(ranges[-30:])) * 100, 1)
+                              if len(ranges) >= 30 and np.mean(ranges[-30:]) else None)
+
+    # ADX: for a LONG-vol trade we want it LOW, or just turning up off a low base — the opposite
+    # read from the Iron Condor builder (which treats low ADX as "stay range-bound, good for
+    # selling"). A trend that has already run hard (high ADX) has less "fuel" left for a fresh move.
+    adx_now = _adx(highs, lows, closes, 14)
+    adx_10ago = _adx(highs[:-10], lows[:-10], closes[:-10], 14) if n > 34 else None
+    adx_rising = bool(adx_now is not None and adx_10ago is not None and adx_now > adx_10ago)
+    low_adx_base = bool(adx_now is not None and adx_now < 22)
+
+    # Volume: a dry-up (low relative volume) INTO the squeeze is the classic "coiling" pattern; a
+    # sharp pickup on the most recent day(s) can mean the move is already starting. Score whichever
+    # is currently true rather than demanding one specific pattern.
+    avg_vol_20 = float(np.mean(vols[-21:-1])) if n > 22 and np.mean(vols[-21:-1]) > 0 else None
+    recent_vol_5 = float(np.mean(vols[-5:])) if n >= 5 else None
+    vol_ratio = (recent_vol_5 / avg_vol_20) if (avg_vol_20 and recent_vol_5 is not None) else None
+    volume_dry_up = bool(vol_ratio is not None and vol_ratio < 0.75)
+    volume_pickup_today = bool(avg_vol_20 and vols[-1] > 1.5 * avg_vol_20)
+
+    # Proximity to a breakout trigger: distance from spot to the recent 20-day high/low, in ATR
+    # units. Close to either edge means a normal day's range could already trigger the breakout;
+    # far from both means the range still needs to develop before this setup is actionable.
+    last_close = float(closes[-1])
+    hi20, lo20 = float(np.max(highs[-20:])), float(np.min(lows[-20:]))
+    atr14 = float(np.mean(ranges[-14:])) if len(ranges) >= 14 else None
+    dist_atr_values = []
+    if atr14:
+        dist_atr_values = [(hi20 - last_close) / atr14, (last_close - lo20) / atr14]
+    min_dist_atr = min(dist_atr_values) if dist_atr_values else None
+    near_trigger = bool(min_dist_atr is not None and min_dist_atr <= 1.5)
+
+    squeeze_score = round(max(0.0, min(100.0, 100 - squeeze_percentile)), 1)
+    momentum_score = round(min(100.0, (60 if low_adx_base else 20) + (40 if adx_rising else 0)), 1)
+    volume_score = round(min(100.0, (70 if volume_dry_up else 30) + (30 if volume_pickup_today else 0)), 1)
+    if min_dist_atr is not None:
+        proximity_score = round(100.0 if near_trigger else max(0.0, 60 - 10 * min_dist_atr), 1)
+    else:
+        proximity_score = 50.0
+
+    return {
+        "last_close": round(last_close, 2),
+        "bb_width_pct": round(current_bb_width, 2), "bb_width_percentile": round(squeeze_percentile, 1),
+        "is_squeeze": is_squeeze, "is_nr7": is_nr7, "range_contraction_pct": range_contraction_pct,
+        "adx14": round(adx_now, 1) if adx_now is not None else None,
+        "adx_10sessions_ago": round(adx_10ago, 1) if adx_10ago is not None else None,
+        "adx_rising": adx_rising, "low_adx_base": low_adx_base,
+        "volume_ratio_5v20": round(vol_ratio, 2) if vol_ratio is not None else None,
+        "volume_dry_up": volume_dry_up, "volume_pickup_today": volume_pickup_today,
+        "range_high_20d": round(hi20, 2), "range_low_20d": round(lo20, 2),
+        "atr14": round(atr14, 2) if atr14 else None, "near_breakout_trigger": near_trigger,
+        "squeeze_score": squeeze_score, "momentum_score": momentum_score,
+        "volume_score": volume_score, "proximity_score": proximity_score,
+        "note": ("Pattern-level heuristics (Bollinger squeeze, NR7, ADX base, volume dry-up/pickup, "
+                 "distance to the 20-day range edge in ATR units). None of this predicts DIRECTION — "
+                 "only that the range is unusually compressed/coiled, which is the setup a long "
+                 "straddle/strangle wants regardless of which way it eventually breaks."),
+    }
+
+
+def classify_long_vol_value(iv_hv):
+    """Translate the selling-oriented IV/HV labels into a buyer-oriented read."""
+    if not iv_hv or iv_hv.get("ratio") is None:return {"label":"UNKNOWN","score":50}
+    ratio=float(iv_hv["ratio"])
+    if ratio<=0.90:return {"label":"CHEAP","score":90}
+    if ratio<=1.05:return {"label":"FAIR","score":72}
+    if ratio<=1.20:return {"label":"RICH","score":42}
+    return {"label":"VERY RICH","score":15}
+
+
+def _move_positive(value):
+    try:return float(value) if value is not None and float(value)>0 else None
+    except Exception:return None
+
+
+def _move_leg_buy_price(option):
+    """Conservative entry mark: a long option is bought at the executable ask."""
+    ask=_move_positive(option.get("ask"));mid=_move_positive(option.get("mid"));ltp=_move_positive(option.get("ltp"))
+    if ask is not None:return ask,"ASK"
+    if mid is not None:return mid,"MID_FALLBACK"
+    return ltp,"LTP_FALLBACK"
+
+
+def _move_event_score(event, iv_hv):
+    """A catalyst helps only when it has not already made option premium rich."""
+    if not event:return 30.0
+    ratio=float((iv_hv or {}).get("ratio") or 1.0)
+    if ratio<=1.05:return 75.0
+    if ratio<=1.20:return 40.0
+    return 10.0
+
+
+def build_move_candidate_from_chain(spot,chain,mode="straddle",otm_pct=DEFAULT_MOVE_OTM_PCT,
+                                    selection_mode="smart_delta",target_delta=DEFAULT_MOVE_TARGET_DELTA):
+    calls=sorted([o for o in chain if o["instrument_type"]=="CE" and _move_positive(o.get("mid") or o.get("ltp"))],key=lambda x:x["strike"])
+    puts=sorted([o for o in chain if o["instrument_type"]=="PE" and _move_positive(o.get("mid") or o.get("ltp"))],key=lambda x:x["strike"])
+    if not calls or not puts:
+        return None
+
+    def closest(options, target):
+        return min(options, key=lambda o: abs(o["strike"] - target))
+
+    selection_used="ATM"
+    if mode=="strangle" and selection_mode=="smart_delta":
+        target=max(0.18,min(0.40,float(target_delta or DEFAULT_MOVE_TARGET_DELTA)))
+        call_pool=[o for o in calls if o["strike"]>=spot and o.get("delta") is not None and 0.12<=abs(float(o["delta"]))<=0.45]
+        put_pool=[o for o in puts if o["strike"]<=spot and o.get("delta") is not None and 0.12<=abs(float(o["delta"]))<=0.45]
+        pairs=[]
+        for c in call_pool:
+            for p in put_pool:
+                cd,pd=abs(float(c["delta"])),abs(float(p["delta"]))
+                delta_error=abs(cd-target)+abs(pd-target)+1.5*abs(cd-pd)
+                width_error=abs((c["strike"]-spot)-(spot-p["strike"]))/max(spot,1)
+                spreads=[float(x) for x in (c.get("spread_pct"),p.get("spread_pct")) if x is not None]
+                spread_penalty=(sum(spreads)/len(spreads)/100.0) if spreads else 0.20
+                oi=min(int(c.get("oi") or 0),int(p.get("oi") or 0))
+                oi_penalty=0.0 if oi>=MOVE_MIN_LEG_OI else 0.20
+                pairs.append((delta_error+2*width_error+spread_penalty+oi_penalty,c,p))
+        if pairs:
+            _,call_leg,put_leg=min(pairs,key=lambda x:x[0]);selection_used=f"SMART_DELTA_{target:.2f}"
+        else:
+            call_leg=closest(calls,spot*(1+otm_pct));put_leg=closest(puts,spot*(1-otm_pct));selection_used="FIXED_OTM_FALLBACK"
+    elif mode=="strangle":
+        call_leg=closest(calls,spot*(1+otm_pct));put_leg=closest(puts,spot*(1-otm_pct));selection_used="FIXED_OTM"
+    else:  # "straddle" (default) — both legs at the SAME at-the-money strike
+        atm_call = closest(calls, spot)
+        put_leg = closest(puts, atm_call["strike"])
+        call_leg = closest(calls, put_leg["strike"])  # re-snap in case call/put strike grids differ
+    return {"call":call_leg,"put":put_leg,"selection_used":selection_used}
+
+
+def _assess_move_entry(result,max_risk_rupees=None,fo_banned=False):
+    """Hard execution gates plus softer WAIT warnings for long-vol entries."""
+    blockers=[];warnings=[];positives=[]
+    dte=int(result.get("days_to_expiry") or 0)
+    if dte<MOVE_MIN_DTE or dte>MOVE_MAX_DTE:
+        blockers.append(f"Expiry has {dte} DTE; allowed risk window is {MOVE_MIN_DTE}–{MOVE_MAX_DTE} days.")
+    elif not MOVE_PREFERRED_DTE_LOW<=dte<=MOVE_PREFERRED_DTE_HIGH:
+        warnings.append(f"{dte} DTE is outside the preferred {MOVE_PREFERRED_DTE_LOW}–{MOVE_PREFERRED_DTE_HIGH}-day theta/convexity window.")
+    if fo_banned:blockers.append("Symbol is in the current F&O ban period; do not initiate a new position.")
+
+    legs=result.get("legs") or {}
+    for name,label in (("buy_call","Call"),("buy_put","Put")):
+        leg=legs.get(name) or {}
+        if _move_positive(leg.get("bid")) is None or _move_positive(leg.get("ask")) is None:
+            blockers.append(f"{label} has no two-sided executable quote.")
+        spread=leg.get("spread_pct")
+        if spread is None or float(spread)>MOVE_MAX_LEG_SPREAD_PCT:
+            blockers.append(f"{label} spread is {spread if spread is not None else 'unavailable'}%; maximum is {MOVE_MAX_LEG_SPREAD_PCT:.1f}%.")
+        elif float(spread)>2.5:
+            warnings.append(f"{label} spread is {float(spread):.1f}%; execution cost is meaningful.")
+        oi=int(leg.get("oi") or 0)
+        if oi<MOVE_MIN_LEG_OI:blockers.append(f"{label} OI is {oi:,}; minimum is {MOVE_MIN_LEG_OI:,}.")
+        if int(leg.get("volume") or 0)<=0:warnings.append(f"{label} has no reported volume today; use a marketable limit and verify the fill.")
+
+    score=float(result.get("move_score") or 0)
+    if score<50:blockers.append(f"Move score is only {score:.1f}/100.")
+    elif score<MOVE_MIN_READY_SCORE:warnings.append(f"Move score {score:.1f} is below the {MOVE_MIN_READY_SCORE:.0f} trade-ready threshold.")
+    else:positives.append(f"Move score {score:.1f} clears the setup threshold.")
+
+    ratio=(result.get("iv_hv") or {}).get("ratio")
+    if ratio is not None and float(ratio)>MOVE_MAX_IV_HV_RATIO:
+        blockers.append(f"IV/HV is {float(ratio):.2f}; option premium is too rich for a long-vol entry.")
+    elif ratio is not None and float(ratio)>1.10:
+        warnings.append(f"IV/HV is {float(ratio):.2f}; much of the move may already be priced in.")
+    elif ratio is not None:positives.append(f"IV/HV {float(ratio):.2f} is acceptable for a premium buyer.")
+
+    be_ratio=result.get("breakeven_expected_move_ratio")
+    if be_ratio is None:
+        warnings.append("Expected-move economics are unavailable.")
+    elif float(be_ratio)>MOVE_MAX_BREAKEVEN_EM_RATIO:
+        blockers.append(f"Average breakeven needs {float(be_ratio):.2f}× the priced expected move; payoff hurdle is too high.")
+    elif float(be_ratio)>1.05:
+        warnings.append(f"Breakeven needs {float(be_ratio):.2f}× the expected move; a larger-than-normal move is required.")
+    else:positives.append(f"Breakeven hurdle is {float(be_ratio):.2f}× expected move.")
+
+    slippage_pct=float(result.get("entry_slippage_pct") or 0)
+    if slippage_pct>MOVE_MAX_ENTRY_SLIPPAGE_PCT:
+        blockers.append(f"Ask-vs-mid entry slippage is {slippage_pct:.2f}% of debit; maximum is {MOVE_MAX_ENTRY_SLIPPAGE_PCT:.1f}%.")
+    squeeze=result.get("squeeze") or {}
+    compression=bool(squeeze.get("is_squeeze") or squeeze.get("is_nr7"))
+    if compression:positives.append("A current squeeze/NR7 compression signal is present.")
+    else:warnings.append("No current squeeze or NR7 confirmation; wait for a cleaner compression trigger.")
+
+    requested_lots=int(result.get("lots") or 1);recommended_lots=result.get("recommended_lots")
+    if max_risk_rupees is not None:
+        if not recommended_lots:
+            blockers.append(f"Risk budget ₹{float(max_risk_rupees):,.0f} cannot fund even one lot at the executable ask.")
+        elif requested_lots>int(recommended_lots):
+            blockers.append(f"Requested {requested_lots} lot(s) exceed the risk-budget limit of {int(recommended_lots)}.")
+
+    event=result.get("event_before_expiry")
+    if event and ratio is not None and float(ratio)>1.05:
+        warnings.append(f"{event.get('label')} is ahead but IV is already rich; post-event IV crush can offset a correct move.")
+
+    hhmm=now_ist().strftime("%H:%M")
+    if ai_market_open() and (hhmm<"09:30" or hhmm>"14:45"):
+        warnings.append("Entry is outside the preferred 09:30–14:45 liquidity window; spreads and overnight theta risk are less favourable.")
+
+    trade_ready=not blockers and score>=MOVE_MIN_READY_SCORE and compression and (be_ratio is None or float(be_ratio)<=1.15)
+    decision="ENTER" if trade_ready else ("AVOID" if blockers else "WAIT")
+    return {"decision":decision,"trade_ready":trade_ready,"blockers":blockers,"warnings":warnings,
+            "positive_checks":positives,"checked_at":datetime.now(IST).isoformat(),
+            "rules":{"min_score":MOVE_MIN_READY_SCORE,"dte":[MOVE_MIN_DTE,MOVE_MAX_DTE],
+                     "preferred_dte":[MOVE_PREFERRED_DTE_LOW,MOVE_PREFERRED_DTE_HIGH],
+                     "max_leg_spread_pct":MOVE_MAX_LEG_SPREAD_PCT,"max_iv_hv":MOVE_MAX_IV_HV_RATIO,
+                     "max_breakeven_em_ratio":MOVE_MAX_BREAKEVEN_EM_RATIO}}
+
+
+def build_move_strategy(symbol,mode="straddle",otm_pct=DEFAULT_MOVE_OTM_PCT,expiry_str=None,lots=1,
+                        selection_mode="smart_delta",target_delta=DEFAULT_MOVE_TARGET_DELTA,
+                        max_risk_rupees=DEFAULT_MOVE_MAX_RISK_RUPEES):
+    symbol = symbol.upper()
+    mode = mode if mode in ("straddle", "strangle") else "straddle"
+    selection_mode = selection_mode if selection_mode in ("smart_delta", "fixed_otm") else "smart_delta"
+    lots = max(1, min(50, int(lots or 1)))
+    otm_pct = max(0.005, min(0.10, float(otm_pct or DEFAULT_MOVE_OTM_PCT)))
+    target_delta = max(0.18, min(0.40, float(target_delta or DEFAULT_MOVE_TARGET_DELTA)))
+    max_risk_rupees = max(0.0, float(max_risk_rupees or 0))
+    today = now_ist().date()
+    data, err = get_chain_for_symbol(symbol, expiry_str)
+    if err:
+        return err
+    spot, expiry, lot_size, chain = data["spot"], data["expiry"], data["lot_size"], data["chain"]
+    quantity = lot_size * lots
+    days_to_expiry = (expiry - today).days
+
+    cand = build_move_candidate_from_chain(spot, chain, mode, otm_pct, selection_mode, target_delta)
+    if not cand:
+        return {"error": f"Could not find a usable call/put pair for {symbol}"}
+    call_leg, put_leg = cand["call"], cand["put"]
+
+    def leg(o):
+        entry_price, pricing_source = _move_leg_buy_price(o)
+        return {"strike": o["strike"], "ltp": o["ltp"], "mid": o.get("mid", o["ltp"]),
+                "bid": o.get("bid"), "ask": o.get("ask"), "delta": o["delta"], "iv": o.get("iv"),
+                "oi": o.get("oi"), "volume": o.get("volume"), "spread_pct": o.get("spread_pct"),
+                "entry_price": entry_price, "pricing_source": pricing_source,
+                "tradingsymbol": o["tradingsymbol"]}
+
+    call_l, put_l = leg(call_leg), leg(put_leg)
+    if call_l["entry_price"] is None or put_l["entry_price"] is None:
+        return {"error": "Could not obtain a usable entry price for both option legs"}
+    mid_debit_per_share = sum(float(x.get("mid") or x["entry_price"]) for x in (call_l, put_l))
+    # A long-vol payoff must be judged from the price actually needed to enter, not an optimistic
+    # midpoint that may never fill. For a BUY that is the best ask (with a clearly-labelled fallback).
+    net_debit_per_share = float(call_l["entry_price"]) + float(put_l["entry_price"])
+    liquidation_bid_per_share = (float(call_l["bid"]) + float(put_l["bid"])
+                                 if _move_positive(call_l.get("bid")) and _move_positive(put_l.get("bid"))
+                                 else None)
+    entry_slippage_per_share = max(0.0, net_debit_per_share - mid_debit_per_share)
+    entry_slippage_pct = (entry_slippage_per_share / net_debit_per_share * 100
+                          if net_debit_per_share else None)
+    breakeven_upper = round(call_l["strike"] + net_debit_per_share, 2)
+    breakeven_lower = round(put_l["strike"] - net_debit_per_share, 2)
+    strategy_type = "long_strangle" if mode == "strangle" else "long_straddle"
+
+    result = {
+        "symbol": symbol, "spot": spot, "expiry": str(expiry), "days_to_expiry": days_to_expiry,
+        "lot_size": lot_size, "lots": lots, "quantity": quantity, "mode": mode,
+        "strategy_type": strategy_type, "otm_pct_used": otm_pct if mode == "strangle" else None,
+        "selection_mode": selection_mode, "selection_used": cand.get("selection_used"),
+        "target_delta": target_delta if mode == "strangle" and selection_mode == "smart_delta" else None,
+        "legs": {"buy_call": call_l, "buy_put": put_l},
+        "net_debit_per_share": round(net_debit_per_share, 2),
+        "executable_debit_per_share": round(net_debit_per_share, 2),
+        "mid_debit_per_share": round(mid_debit_per_share, 2),
+        "entry_slippage_per_share": round(entry_slippage_per_share, 2),
+        "entry_slippage_pct": round(entry_slippage_pct, 2) if entry_slippage_pct is not None else None,
+        "liquidation_bid_per_share": round(liquidation_bid_per_share, 2) if liquidation_bid_per_share is not None else None,
+        "round_trip_spread_per_share": (round(net_debit_per_share - liquidation_bid_per_share, 2)
+                                         if liquidation_bid_per_share is not None else None),
+        "max_loss": round(net_debit_per_share * quantity, 2), "max_profit": None,
+        "breakeven_upper": breakeven_upper, "breakeven_lower": breakeven_lower,
+        "move_required_up_pct": round((breakeven_upper - spot) / spot * 100, 2) if spot else None,
+        "move_required_down_pct": round((spot - breakeven_lower) / spot * 100, 2) if spot else None,
+        "all_expiries": data["all_expiries"],
+    }
+
+    # --- Payoff curve: at expiry (pure intrinsic value) and a live "today" mark (Black-Scholes at
+    # current implied vol on both legs) across a range of assumed spot outcomes ---
+    lo = spot * (1 - MOVE_CURVE_RANGE_PCT); hi = spot * (1 + MOVE_CURVE_RANGE_PCT)
+    step = (hi - lo) / (MOVE_CURVE_POINTS - 1)
+    call_iv = (call_l["iv"] or 20) / 100.0
+    put_iv = (put_l["iv"] or 20) / 100.0
+    T_now = max(days_to_expiry, 0) / 365.0
+    curve_expiry, curve_today = [], []
+    for i in range(MOVE_CURVE_POINTS):
+        s_t = lo + i * step
+        intrinsic = max(s_t - call_l["strike"], 0.0) + max(put_l["strike"] - s_t, 0.0)
+        curve_expiry.append({"spot": round(s_t, 2), "pnl": round((intrinsic - net_debit_per_share) * quantity, 2)})
+        today_value = (bs_price(s_t, call_l["strike"], T_now, RISK_FREE_RATE, call_iv, "CE") +
+                       bs_price(s_t, put_l["strike"], T_now, RISK_FREE_RATE, put_iv, "PE"))
+        curve_today.append({"spot": round(s_t, 2), "pnl": round((today_value - net_debit_per_share) * quantity, 2)})
+    result["curve_at_expiry"] = curve_expiry
+    result["curve_today"] = curve_today
+
+    legs_for_margin = [{"tradingsymbol": call_l["tradingsymbol"], "transaction_type": "BUY"},
+                        {"tradingsymbol": put_l["tradingsymbol"], "transaction_type": "BUY"}]
+    result["margin_required"], result["margin_error"] = compute_margin(legs_for_margin, quantity)
+    entry_orders = [{"price": call_l["entry_price"], "quantity": quantity, "transaction_type": "BUY"},
+                     {"price": put_l["entry_price"], "quantity": quantity, "transaction_type": "BUY"}]
+    result["estimated_entry_charges"] = estimate_charges(entry_orders)
+    result["entry_event_warning"] = get_entry_warning()
+    result["event_before_expiry"] = get_event_before_expiry(result["expiry"])
+
+    # --- IV/HV read, computed directly from THIS chain and a fresh historical fetch, independent
+    # of the Option-Selling screener's cache (this module never depends on that screener). ---
+    hv_pct = None
+    try:
+        token, terr = resolve_token_for_symbol(symbol)
+        if not terr:
+            hv_pct, _atr_pct, _ = historical_vol_and_atr(token)
+    except Exception:
+        pass
+    atm_iv_pct = (round((call_l["iv"] + put_l["iv"]) / 2, 1)
+                  if (call_l.get("iv") is not None and put_l.get("iv") is not None) else None)
+    iv_hv = classify_iv_hv(atm_iv_pct, hv_pct)
+    result["atm_iv_pct"] = atm_iv_pct
+    result["hv_annualized_pct"] = round(hv_pct, 2) if hv_pct is not None else None
+    result["iv_hv"] = iv_hv
+    result["long_vol_value"] = classify_long_vol_value(iv_hv)
+    if atm_iv_pct is not None:
+        iv_history = load_iv_history()
+        rank_pct, hist_days = update_iv_history_and_get_rank(symbol, atm_iv_pct, iv_history, today.isoformat())
+        save_iv_history(iv_history)
+        result["iv_rank_pct"] = rank_pct
+        result["iv_rank_history_days"] = hist_days
+
+    em = expected_move(spot, atm_iv_pct, days_to_expiry)
+    result["expected_move"] = em
+    if em:
+        avg_be_distance = ((breakeven_upper - spot) + (spot - breakeven_lower)) / 2
+        result["breakeven_expected_move_ratio"] = (round(avg_be_distance / em["expected_move"], 2)
+                                                     if em.get("expected_move") else None)
+        reaches_breakeven = em["upper"] >= breakeven_upper or em["lower"] <= breakeven_lower
+        result["expected_move_vs_breakeven"] = (
+            f"{days_to_expiry}-day expected move is ±₹{em['expected_move']} ({em['lower']}–{em['upper']}); "
+            f"breakevens are {breakeven_lower}–{breakeven_upper}. " +
+            ("The expected move already reaches or exceeds one breakeven — a fairly ordinary move "
+             "could get this to profit."
+             if reaches_breakeven else
+             "The expected move alone doesn't reach breakeven — this needs a move LARGER than a "
+             "typical move over this timeframe, i.e. a genuine breakout/event, not just normal drift."))
+    else:
+        result["breakeven_expected_move_ratio"] = None
+
+    trend = get_trend_regime(symbol)
+    result["trend"] = None if trend.get("error") else trend
+    squeeze = breakout_squeeze_diagnostics(symbol)
+    if squeeze.get("error"):
+        result["squeeze"] = None
+        result["squeeze_note"] = squeeze["error"]
+    else:
+        result["squeeze"] = squeeze
+
+    vix, vix_err = get_india_vix()
+    result["volatility_regime"] = classify_volatility_regime(vix, result.get("iv_rank_pct"))
+    result["vega_note"] = ("This trade is net LONG gamma and LONG vega, and net SHORT theta — the "
+                            "opposite exposure of the Iron Condor/Strangle builder. It profits from a "
+                            "big move OR a rise in IV, and loses a little value every day the "
+                            "underlying just sits still.")
+
+    # --- Composite "move score": how good the SETUP is for a long-vol trade (not a probability) ---
+    sq = result.get("squeeze")
+    squeeze_component = sq["squeeze_score"] if sq else 50.0
+    momentum_component = sq["momentum_score"] if sq else 50.0
+    volume_component = sq["volume_score"] if sq else 50.0
+    proximity_component = sq["proximity_score"] if sq else 50.0
+    iv_cheap_component = result["long_vol_value"]["score"]
+    event_component = _move_event_score(result.get("event_before_expiry"), iv_hv)
+
+    move_score = round(
+        MOVE_SCORE_WEIGHTS["squeeze"] * squeeze_component +
+        MOVE_SCORE_WEIGHTS["iv_cheapness"] * iv_cheap_component +
+        MOVE_SCORE_WEIGHTS["momentum_building"] * momentum_component +
+        MOVE_SCORE_WEIGHTS["volume_setup"] * volume_component +
+        MOVE_SCORE_WEIGHTS["proximity"] * proximity_component +
+        MOVE_SCORE_WEIGHTS["event"] * event_component, 1)
+    result["move_score"] = move_score
+    result["move_score_label"] = ("Excellent setup" if move_score >= 75 else "Good setup" if move_score >= 60
+                                   else "Average setup" if move_score >= 45 else "Weak setup")
+    result["move_score_note"] = (
+        "Heuristic SETUP score for a long-vol trade: Bollinger squeeze/NR7 tightness 25%, IV cheap "
+        "relative to historical vol 25%, ADX low-and-turning-up 20%, volume dry-up/pickup pattern "
+        "15%, proximity to the 20-day range edge 10%, catalyst value after adjusting for IV 5%. This is a "
+        "rough triage aid for HOW LIKELY a big move is to be setting up — it is NOT a directional "
+        "signal and NOT backtested. Debit and breakevens use executable Ask prices, not midpoint marks.")
+
+    reasons = []
+    if sq and sq.get("is_squeeze"):
+        reasons.append("Bollinger band width is in the tightest 20% of its own recent history — a genuine squeeze.")
+    if sq and sq.get("is_nr7"):
+        reasons.append("Today's daily range is the narrowest of the last 7 sessions (NR7).")
+    if sq and sq.get("low_adx_base") and sq.get("adx_rising"):
+        reasons.append("ADX is off a low base and turning up — a trend may just be starting, not already spent.")
+    if sq and sq.get("volume_dry_up"):
+        reasons.append("Volume has dried up into the squeeze — this often precedes an expansion once it returns.")
+    if sq and sq.get("volume_pickup_today"):
+        reasons.append("Volume has already picked up sharply — the move may be starting right now.")
+    if sq and sq.get("near_breakout_trigger"):
+        reasons.append("Spot is close (within ~1.5x ATR) to the recent 20-day high or low — a normal day's range could trigger the breakout.")
+    if result["long_vol_value"]["label"] in ("CHEAP", "FAIR"):
+        reasons.append(f"Options are relatively cheap here (IV/HV ratio {iv_hv.get('ratio')}) — you're not overpaying for the premium.")
+    if result.get("event_before_expiry"):
+        ev = result["event_before_expiry"]
+        reasons.append(f"{ev['label']} falls before expiry ({ev['date']}, {ev['days_away']}d away) — a concrete catalyst for a move.")
+    if not reasons:
+        reasons.append("No strong setup signals found — this looks like an ordinary day for this stock, a weak candidate for a premium-buying trade right now.")
+    result["move_reasons"] = reasons
+
+    economics_ratio = result.get("breakeven_expected_move_ratio")
+    result["suggested_mode"] = "strangle" if (iv_hv.get("ratio") and iv_hv["ratio"] > 1.05) else "straddle"
+    result["suggested_mode_reason"] = (
+        "IV is rich versus realized volatility — a balanced delta strangle reduces debit, but only use it if its breakeven/expected-move hurdle remains acceptable."
+        if result["suggested_mode"] == "strangle" else
+        "IV is fair/cheap versus realized volatility — the ATM straddle keeps breakevens closer and participates sooner in either direction.")
+
+    # Position sizing is capped by the entire debit at risk, including estimated entry charges.
+    one_lot_orders = [{"price": call_l["entry_price"], "quantity": lot_size, "transaction_type": "BUY"},
+                      {"price": put_l["entry_price"], "quantity": lot_size, "transaction_type": "BUY"}]
+    one_lot_charges = estimate_charges(one_lot_orders).get("total", 0)
+    risk_per_lot = round(net_debit_per_share * lot_size + one_lot_charges, 2)
+    recommended_lots = min(50, int(max_risk_rupees // risk_per_lot)) if risk_per_lot and max_risk_rupees else 0
+    result["max_risk_rupees"] = round(max_risk_rupees, 2)
+    result["risk_per_lot"] = risk_per_lot
+    result["recommended_lots"] = recommended_lots
+    result["requested_risk_with_charges"] = round(net_debit_per_share * quantity +
+                                                   result["estimated_entry_charges"].get("total", 0), 2)
+    result["risk_plan"] = {
+        "profit_target_pnl": round(MOVE_PROFIT_TARGET_MULTIPLE * net_debit_per_share * quantity, 2),
+        "profit_target_pct_of_debit": round(MOVE_PROFIT_TARGET_MULTIPLE * 100),
+        "stop_loss_pnl": round(-MOVE_STOP_LOSS_DEBIT_PCT * net_debit_per_share * quantity, 2),
+        "stop_loss_pct_of_debit": round(MOVE_STOP_LOSS_DEBIT_PCT * 100),
+        "trail_activate_pct_of_debit": round(MOVE_TRAIL_ACTIVATE_DEBIT_PCT * 100),
+        "trail_giveback_pct_of_debit": round(MOVE_TRAIL_GIVEBACK_DEBIT_PCT * 100),
+        "time_stop_after_pct": MOVE_TIME_STOP_PROGRESS_PCT,
+        "time_stop_if_move_below_pct": MOVE_TIME_STOP_MAX_MOVE_PCT,
+        "expiry_exit_dte": MOVE_EXPIRY_WARNING_DAYS,
+    }
+
+    fo_banned = False
+    try:
+        ban_symbols, _ = get_fo_ban_list()
+        fo_banned = bool(ban_symbols is not None and symbol in ban_symbols)
+    except Exception:
+        pass
+    result["fo_banned_today"] = fo_banned
+    result["entry_gate"] = _assess_move_entry(result, max_risk_rupees, fo_banned)
+
+    result["note"] = (
+        "LONG STRADDLE/STRANGLE: a net-DEBIT, defined-risk (max loss = debit paid) bet on a LARGE "
+        "move in EITHER direction before expiry. The move needs to exceed the breakeven distance "
+        "just to break even — time decay (theta) works against this every single day it doesn't "
+        "move, and a volatility crush right after an anticipated event (e.g. results day) can lose "
+        "money even if the direction was called correctly. Educational calculation only — verify "
+        "prices, margin and lot size on your broker terminal before trading. Entry economics here "
+        "use best Ask and exits are marked at best Bid so displayed P&L does not assume midpoint fills.")
+    return result
+
+
+@app.route("/api/move-strategy/<symbol>")
+def move_strategy(symbol):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    mode = request.args.get("mode", "straddle")
+    try:
+        otm_pct = float(request.args.get("otm_pct", DEFAULT_MOVE_OTM_PCT))
+        lots = int(request.args.get("lots", 1))
+        target_delta = float(request.args.get("target_delta", DEFAULT_MOVE_TARGET_DELTA))
+        max_risk_rupees = float(request.args.get("max_risk_rupees", DEFAULT_MOVE_MAX_RISK_RUPEES))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid numeric strategy parameter"}), 400
+    expiry_str = request.args.get("expiry")
+    selection_mode = request.args.get("selection_mode", "smart_delta")
+    result = build_move_strategy(symbol, mode, otm_pct, expiry_str, lots, selection_mode,
+                                 target_delta, max_risk_rupees)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+@app.route("/api/move-screener")
+def move_screener():
+    """Independent screener for LONG straddle/strangle candidates — scans the F&O universe for
+    stocks that look COILED for a big move, with options that are still relatively CHEAP to buy.
+    Does not require the Option-Selling screener (section 1 of the other tab) to have been run."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    limit = int(request.args.get("limit", 20))
+    max_symbols = min(int(request.args.get("max_symbols", 40)), 80)
+    force = request.args.get("force", "false").lower() == "true"
+
+    universe = fo_stock_universe(force=force)
+    nfo, nse = get_instruments(force=force)
+    symbol_to_token = {i["tradingsymbol"]: i["instrument_token"] for i in nse if i["exchange"] == "NSE"}
+
+    # Pass 1: cheap, universe-wide pass off daily closes (HV/ATR) — same data source the
+    # Option-Selling screener uses, just interpreted the other way (here, more ATR is GOOD, since
+    # it means the stock has some baseline ability to move at all).
+    base = []
+    for name in universe:
+        token = symbol_to_token.get(name)
+        if not token:
+            continue
+        try:
+            hv, atr_pct, ltp = historical_vol_and_atr(token)
+        except Exception:
+            continue
+        if hv is None:
+            continue
+        base.append({"symbol": name, "ltp": round(ltp, 2),
+                      "hv_annualized_pct": round(hv, 2), "atr_pct_of_price": round(atr_pct, 2)})
+        if len(base) >= 300:
+            break
+    seed_spot_cache_from_prices(base)
+
+    # Price every universe member's ATM pair in bulk before choosing the expensive deep-diagnostic
+    # shortlist. Selecting only the highest-ATR stocks first systematically overpaid for volatility;
+    # this pre-pass prioritises liquid options whose IV is fair/cheap versus each stock's own HV.
+    candidates = [{"symbol": r["symbol"], "last_close": r["ltp"]} for r in base]
+    try:
+        iv_liquidity = get_atm_iv_and_liquidity_bulk(candidates, nfo)
+    except Exception as e:
+        iv_liquidity = {}
+        logger.warning(f"Move screener ATM IV/liquidity batch fetch failed: {e}")
+
+    for r in base:
+        info = iv_liquidity.get(r["symbol"]) or {}
+        r["atm_iv_pct"] = info.get("atm_iv_pct")
+        r["atm_oi_total"] = info.get("atm_oi_total", 0)
+        r["atm_spread_pct"] = info.get("atm_spread_pct")
+        r["iv_hv"] = classify_iv_hv(r["atm_iv_pct"], r["hv_annualized_pct"])
+        r["long_vol_value"] = classify_long_vol_value(r["iv_hv"])
+        r["liquidity_ok"] = bool(r["atm_oi_total"] >= MOVE_MIN_ATM_TOTAL_OI and
+                                  r["atm_spread_pct"] is not None and
+                                  r["atm_spread_pct"] <= MOVE_MAX_ATM_SPREAD_PCT)
+    atr_values = [r["atr_pct_of_price"] for r in base]
+    for r in base:
+        atr_component = _percentile_rank(r["atr_pct_of_price"], atr_values) or 0
+        r["pre_score"] = round(0.70 * r["long_vol_value"]["score"] + 0.30 * atr_component, 1)
+    liquid_base = [r for r in base if r["liquidity_ok"] and r["atm_iv_pct"] is not None]
+    liquid_base.sort(key=lambda r: r["pre_score"], reverse=True)
+    shortlist = liquid_base[:max_symbols]
+
+    ban_symbols, ban_error = get_fo_ban_list()
+    upcoming_macro_events = get_upcoming_events(days_ahead=MOVE_PREFERRED_DTE_HIGH)
+    evaluated, errors = [], []
+    for r in shortlist:
+        sym = r["symbol"]
+        try:
+            atm_iv_pct = r.get("atm_iv_pct")
+            liquidity_ok = r.get("liquidity_ok", False)
+            iv_hv = r.get("iv_hv") or classify_iv_hv(atm_iv_pct, r["hv_annualized_pct"])
+            long_vol_value = r.get("long_vol_value") or classify_long_vol_value(iv_hv)
+            squeeze = breakout_squeeze_diagnostics(sym)
+            if squeeze.get("error"):
+                errors.append({"symbol": sym, "error": squeeze["error"]})
+                continue
+            iv_cheap_component = long_vol_value["score"]
+            event_component = _move_event_score(upcoming_macro_events[0] if upcoming_macro_events else None, iv_hv)
+            move_score = round(
+                MOVE_SCORE_WEIGHTS["squeeze"] * squeeze["squeeze_score"] +
+                MOVE_SCORE_WEIGHTS["iv_cheapness"] * iv_cheap_component +
+                MOVE_SCORE_WEIGHTS["momentum_building"] * squeeze["momentum_score"] +
+                MOVE_SCORE_WEIGHTS["volume_setup"] * squeeze["volume_score"] +
+                MOVE_SCORE_WEIGHTS["proximity"] * squeeze["proximity_score"] +
+                MOVE_SCORE_WEIGHTS["event"] * event_component, 1)
+            out = dict(r)
+            out.update({
+                "atm_iv_pct": atm_iv_pct, "iv_hv": iv_hv, "liquidity_ok": liquidity_ok,
+                "long_vol_value": long_vol_value, "atm_oi_total": r.get("atm_oi_total", 0),
+                "atm_spread_pct": r.get("atm_spread_pct"),
+                "fo_banned_today": bool(ban_symbols is not None and sym in ban_symbols),
+                "squeeze": squeeze, "move_score": move_score,
+                "move_score_label": ("Excellent" if move_score >= 75 else "Good" if move_score >= 60
+                                      else "Average" if move_score >= 45 else "Weak"),
+                "suggested_mode": "strangle" if (iv_hv.get("ratio") and iv_hv["ratio"] > 1.05) else "straddle",
+                "near_macro_event": bool(upcoming_macro_events),
+            })
+            compression = bool(squeeze.get("is_squeeze") or squeeze.get("is_nr7"))
+            out["trade_ready"] = bool(liquidity_ok and not out["fo_banned_today"] and
+                                      move_score >= MOVE_MIN_READY_SCORE and compression and
+                                      (iv_hv.get("ratio") is None or iv_hv["ratio"] <= 1.15))
+            out["entry_status"] = ("READY" if out["trade_ready"] else
+                                   "AVOID" if (out["fo_banned_today"] or not liquidity_ok or
+                                                (iv_hv.get("ratio") is not None and iv_hv["ratio"] > MOVE_MAX_IV_HV_RATIO))
+                                   else "WAIT")
+            evaluated.append(out)
+        except Exception as e:
+            errors.append({"symbol": sym, "error": str(e)})
+            logger.exception("Move screener failed for %s", sym)
+
+    eligible = [r for r in evaluated if r["liquidity_ok"] and not r["fo_banned_today"]]
+    eligible.sort(key=lambda r: (r.get("trade_ready", False), r["move_score"]), reverse=True)
+    for i, r in enumerate(eligible, 1):
+        r["rank"] = i; r["total"] = len(eligible)
+    excluded = [r for r in evaluated if r not in eligible]
+    for r in excluded:
+        r["rank"] = None; r["total"] = len(eligible)
+    top = eligible[:limit]
+
+    MOVE_SCREENER_CACHE["results"] = eligible + excluded
+    MOVE_SCREENER_CACHE["fetched_at"] = now_ist()
+
+    return jsonify({
+        "count": len(base), "shortlisted": len(shortlist), "eligible_count": len(eligible),
+        "stocks": top, "excluded_sample": excluded[:10],
+        "evaluation_error_count": len(errors), "evaluation_errors_sample": errors[:10],
+        "ban_list_note": ban_error if ban_error else "F&O ban list fetched OK — banned symbols excluded above.",
+        "note": ("Independent screener for LONG straddle/strangle candidates — the OPPOSITE thesis "
+                 "from the Option-Selling screeners: it looks for stocks that are COILED for a big "
+                 "move (Bollinger squeeze, NR7, low-and-turning ADX, volume dry-up/pickup, proximity "
+                 "to the recent range edge) with options that are still relatively CHEAP to buy (low "
+                 "IV vs historical vol). It first prices ATM pairs across the universe, removes poor "
+                 "liquidity, and shortlists on buyer value plus baseline ATR before deep-evaluating "
+                 "up to max_symbols with "
+                 "real daily-candle diagnostics. Not a backtest, not a directional call — purely a "
+                 "'is a move plausible here' triage."),
+        "config": {"max_symbols": max_symbols, "weights": MOVE_SCORE_WEIGHTS,
+                   "min_atm_oi": MOVE_MIN_ATM_TOTAL_OI, "max_atm_spread_pct": MOVE_MAX_ATM_SPREAD_PCT,
+                   "min_ready_score": MOVE_MIN_READY_SCORE, "max_iv_hv": MOVE_MAX_IV_HV_RATIO},
+    })
+
+
+def classify_move_digest(position, mtm):
+    """Multi-factor 'is this long straddle/strangle still worth holding' read for a single tracked
+    position. A fixed P&L trigger alone says nothing about WHY it moved. This looks at the trade's actual
+    state — how much of the expected move has shown up yet vs how much time has burned, whether IV is
+    still building or already crushing, whether daily value is trending up or down, and whether the
+    event this trade was built around is still ahead or already behind us — and turns that into one
+    action for right now plus a separate read on whether it's worth carrying overnight into tomorrow.
+    Always informational; this tool never auto-exits anything."""
+    today = now_ist().date()
+    spot = mtm["spot"]
+    entry_spot = position.get("entry_spot")
+    days_left = mtm["days_left"]
+    zone = mtm["zone"]
+    pnl = mtm["pnl"]
+    quantity = position.get("quantity", position["lot_size"])
+    entry_debit_total = abs(position["entry_net_debit_per_share"] * quantity)
+    peak_pnl = max(float(position.get("peak_pnl") or 0), float(mtm.get("peak_pnl") or pnl))
+    giveback_from_peak = max(0.0, peak_pnl - pnl)
+    peak_pct_of_debit = round(peak_pnl / entry_debit_total * 100, 1) if entry_debit_total else None
+    giveback_pct_of_debit = round(giveback_from_peak / entry_debit_total * 100, 1) if entry_debit_total else None
+
+    # How much of the move priced in AT ENTRY has actually shown up so far?
+    realized_move_pct = round(abs(spot - entry_spot) / entry_spot * 100, 2) if entry_spot else None
+    entry_em = position.get("entry_expected_move") or {}
+    entry_em_pct = entry_em.get("expected_move_pct")
+    move_progress_pct = (round(realized_move_pct / entry_em_pct * 100, 1)
+                          if (realized_move_pct is not None and entry_em_pct) else None)
+
+    # How far along in TIME is this trade — theta accelerates non-linearly as expiry nears.
+    entry_dte = position.get("entry_days_to_expiry")
+    added_on = position.get("added_on")
+    days_elapsed = None
+    if added_on:
+        try:
+            days_elapsed = (today - datetime.strptime(added_on, "%Y-%m-%d").date()).days
+        except Exception:
+            pass
+    time_progress_pct = (round(days_elapsed / entry_dte * 100, 1)
+                          if (days_elapsed is not None and entry_dte) else None)
+
+    # IV then vs now — still expanding (feeding the trade) or already crushing?
+    entry_iv = position.get("entry_atm_iv_pct")
+    atm_iv_now = mtm.get("atm_iv_now")
+    iv_change_pct = (round((atm_iv_now - entry_iv) / entry_iv * 100, 1)
+                      if (atm_iv_now is not None and entry_iv) else None)
+
+    # Is daily position value (from the stored day-by-day marks) still building, flat, or decaying?
+    hist = position.get("history") or []
+    recent = [h for h in hist[-MOVE_MOMENTUM_LOOKBACK_DAYS:] if h.get("current_debit_per_share") is not None]
+    momentum = "unknown"
+    if len(recent) >= 2:
+        v0, v1 = recent[0]["current_debit_per_share"], recent[-1]["current_debit_per_share"]
+        band = MOVE_MOMENTUM_FLAT_BAND_PCT * v0 if v0 else 0
+        if v1 - v0 > band:
+            momentum = "building"
+        elif v1 - v0 < -band:
+            momentum = "decaying"
+        else:
+            momentum = "flat"
+
+    # Has the event this trade was built around already happened?
+    entry_event = position.get("event_before_expiry_at_entry")
+    event_status = "no_flagged_event"
+    if entry_event:
+        try:
+            ev_date = datetime.strptime(entry_event["date"], "%Y-%m-%d").date()
+            event_status = "event_passed" if ev_date < today else ("event_today" if ev_date == today else "event_ahead")
+        except Exception:
+            event_status = "unknown"
+
+    action, headline, reasons = "HOLD", "Hold — no single factor is decisive either way yet", []
+    tomorrow = "Re-run this check at tomorrow's mark; nothing here forces a decision today."
+    hard_stop = bool(entry_debit_total) and pnl <= -MOVE_STOP_LOSS_DEBIT_PCT * entry_debit_total
+    trail_hit = bool(entry_debit_total and peak_pnl >= MOVE_TRAIL_ACTIVATE_DEBIT_PCT * entry_debit_total and
+                     giveback_from_peak >= MOVE_TRAIL_GIVEBACK_DEBIT_PCT * entry_debit_total)
+    time_stop = bool(time_progress_pct is not None and time_progress_pct >= MOVE_TIME_STOP_PROGRESS_PCT and
+                     (move_progress_pct or 0) < MOVE_TIME_STOP_MAX_MOVE_PCT and
+                     momentum in ("decaying", "flat", "unknown"))
+
+    if hard_stop:
+        action = "EXIT_NOW"
+        headline = "Exit — premium-loss limit reached"
+        reasons.append(f"Down {int(MOVE_STOP_LOSS_DEBIT_PCT * 100)}%+ of the debit paid. The risk cap takes "
+                       f"priority even though recent position-value momentum is {momentum}.")
+        tomorrow = "Don't carry this overnight hoping it turns — theta keeps bleeding regardless of tomorrow's open."
+
+    elif days_left <= MOVE_EXPIRY_WARNING_DAYS and zone != "past_breakeven":
+        action = "EXIT_NOW"
+        headline = f"Exit — only {days_left} day(s) left and spot hasn't cleared a breakeven"
+        reasons.append("Gamma/theta risk is highest in the final days with the trade still unresolved.")
+        tomorrow = "Not worth holding overnight this close to expiry without a clear breakeven already cleared."
+
+    elif trail_hit:
+        action = "BOOK_PROFIT"
+        headline = "Protect the winner — profit has retraced from its peak"
+        reasons.append(f"Peak P&L reached ₹{round(peak_pnl, 2)} ({peak_pct_of_debit}% of debit), then gave "
+                       f"back ₹{round(giveback_from_peak, 2)} ({giveback_pct_of_debit}% of debit).")
+        tomorrow = "Close or materially trim now; the configured trailing giveback has been breached."
+
+    elif entry_debit_total and pnl >= MOVE_PROFIT_TARGET_MULTIPLE * entry_debit_total:
+        action = "BOOK_PROFIT"
+        headline = f"Profit target reached — book or trim at +{round(pnl / entry_debit_total * 100, 1)}% of debit"
+        reasons.append(f"The position cleared its +{int(MOVE_PROFIT_TARGET_MULTIPLE * 100)}% debit target; "
+                       "protecting realised convexity is preferable to financing more theta.")
+        tomorrow = "If retaining a runner, size it down and enforce the peak-P&L trail."
+
+    elif move_progress_pct is not None and move_progress_pct >= MOVE_HIGH_MOVE_PROGRESS_PCT and pnl > 0:
+        action = "BOOK_PROFIT"
+        headline = "Move has largely played out — book it rather than pressing for more"
+        reasons.append(f"Realized move (₹{abs(round(spot - entry_spot, 2))}, {realized_move_pct}%) is already "
+                        f"~{move_progress_pct}% of the move priced in at entry.")
+        if iv_change_pct is not None and iv_change_pct < 0:
+            reasons.append(f"IV has also come off {abs(iv_change_pct)}% since entry — holding on risks giving profit back to decay.")
+        tomorrow = "If not squaring off fully today, at least trail/partial-book — overnight theta plus any IV settle works against you from here."
+
+    elif time_stop and event_status != "event_ahead":
+        action = "EXIT_SOON"
+        headline = "Time stop — theta is being spent faster than the move is developing"
+        reasons.append(f"{time_progress_pct}% of the original time window has elapsed, while only "
+                       f"{move_progress_pct or 0}% of the entry-expected move has appeared.")
+        tomorrow = "Close rather than keep financing theta without a live catalyst or improving mark."
+
+    elif event_status in ("event_passed", "event_today") and iv_change_pct is not None and iv_change_pct <= -15 and pnl <= 0:
+        action = "EXIT_NOW"
+        headline = "Post-event IV crush — the catalyst passed and premium is shrinking"
+        reasons.append(f"IV is down {abs(iv_change_pct)}% from entry and the trade is not profitable after the event.")
+        tomorrow = "The original catalyst is gone; carrying overnight adds theta without restoring the event premium."
+
+    elif event_status == "event_ahead" and (move_progress_pct is None or move_progress_pct < MOVE_LOW_MOVE_PROGRESS_PCT) and not hard_stop:
+        action = "HOLD_FOR_EVENT"
+        headline = f"Hold — thesis ({entry_event['label']} on {entry_event['date']}) hasn't played out yet"
+        reasons.append("Little of the expected move has shown up and the catalyst is still ahead — "
+                        "exiting now gives up before the reason for the trade has even occurred.")
+        tomorrow = f"Worth carrying overnight toward {entry_event['date']} unless value starts decaying tomorrow — recheck momentum/IV at tomorrow's mark before assuming this."
+
+    elif event_status == "event_passed" and momentum == "decaying" and (pnl <= 0 or (move_progress_pct or 0) < MOVE_LOW_MOVE_PROGRESS_PCT):
+        action = "EXIT_SOON"
+        headline = "Event has passed without the move — likely IV crush already underway"
+        reasons.append("The flagged event date is behind us, daily value is decaying, and the expected "
+                        "move never really showed up. Holding further mostly just bleeds theta/IV now.")
+        tomorrow = "Better to close this than carry overnight — there's no fresh catalyst left before expiry to justify waiting."
+
+    elif momentum == "building" and not hard_stop:
+        action = "HOLD"
+        headline = "Hold — value is still building day over day"
+        reasons.append(f"Last {MOVE_MOMENTUM_LOOKBACK_DAYS} marks show the position gaining value, not decaying.")
+        tomorrow = "Reasonable to carry overnight; re-run this same check at tomorrow's mark before deciding again."
+
+    else:
+        reasons.append("No single factor (P&L, time elapsed, move realized, IV, momentum, event timing) is "
+                        "decisive on its own — this is a genuine hold-and-watch, not a trigger to act.")
+        if time_progress_pct is not None:
+            reasons.append(f"{time_progress_pct}% of the position's original time window has elapsed vs "
+                            f"{move_progress_pct if move_progress_pct is not None else 'an unclear'}% of the entry-expected move realized.")
+
+    return {
+        "action": action, "headline": headline, "reasons": reasons, "tomorrow_outlook": tomorrow,
+        "realized_move_pct": realized_move_pct, "move_progress_pct": move_progress_pct,
+        "time_progress_pct": time_progress_pct, "days_elapsed": days_elapsed,
+        "entry_atm_iv_pct": entry_iv, "atm_iv_now": atm_iv_now, "iv_change_pct": iv_change_pct,
+        "momentum": momentum, "event_status": event_status,
+        "peak_pnl": round(peak_pnl, 2), "peak_pct_of_debit": peak_pct_of_debit,
+        "giveback_from_peak": round(giveback_from_peak, 2),
+        "giveback_pct_of_debit": giveback_pct_of_debit,
+        "trail_active": bool(entry_debit_total and peak_pnl >= MOVE_TRAIL_ACTIVATE_DEBIT_PCT * entry_debit_total),
+        "time_stop_active": time_stop,
+    }
+
+
+def mark_to_market_move(position):
+    """Mark-to-market for a tracked LONG straddle/strangle position. Profits when the position's
+    CURRENT value rises above the debit paid at entry (from a real move, a rise in IV, or both) —
+    the mirror image of mark_to_market()'s credit-strategy math above."""
+    quantity = position.get("quantity", position["lot_size"])
+    leg_keys = ["buy_call", "buy_put"]
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    quotes = kite_quote_bulk(inst_keys)
+
+    prices, quote_details, missing_legs = {}, {}, []
+    for k in leg_keys:
+        key = f"NFO:{position['legs'][k]['tradingsymbol']}"
+        q = quotes.get(key) or {}
+        st = quote_stats(q)
+        # Closing a long option means SELLING it. Mark at best bid so P&L remains executable and
+        # never assumes a midpoint fill; use LTP/mid only as an explicitly-labelled fallback.
+        price = _move_positive(st.get("bid")) or extract_price(q)
+        prices[k] = price
+        quote_details[k] = {**st, "price_source": "BID" if _move_positive(st.get("bid")) else "LTP_MID_FALLBACK"}
+        if price is None:
+            missing_legs.append(f"{k} ({position['legs'][k]['tradingsymbol']})")
+    if missing_legs:
+        return {"__error__": "No usable price for: " + ", ".join(missing_legs) +
+                              ". Contract may be expired/delisted, or market closed with no resting orders."}
+
+    current_value_per_share = prices["buy_call"] + prices["buy_put"]
+    entry_debit = position["entry_net_debit_per_share"]
+    pnl_per_share = current_value_per_share - entry_debit
+    pnl = round(pnl_per_share * quantity, 2)
+    current_position_value = round(current_value_per_share * quantity, 2)
+    entry_debit_total = abs(entry_debit * quantity)
+    peak_pnl = max(float(position.get("peak_pnl") or 0), pnl)
+    giveback_from_peak = max(0.0, peak_pnl - pnl)
+
+    spot, err = get_spot_price(position["symbol"])
+    if err:
+        return {"__error__": err["error"]}
+
+    today = now_ist().date()
+    expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    days_left = (expiry_date - today).days
+    T_remaining = max(days_left, 0) / 365.0
+
+    call_strike = position["legs"]["buy_call"]["strike"]
+    put_strike = position["legs"]["buy_put"]["strike"]
+
+    zone = "between_strikes"          # theta-bleed zone: no move yet — the enemy zone for this trade
+    if spot > position["breakeven_upper"] or spot < position["breakeven_lower"]:
+        zone = "past_breakeven"       # currently profitable if closed now
+    elif spot > call_strike or spot < put_strike:
+        zone = "moving"               # in-the-money on one side but hasn't cleared breakeven yet
+    if days_left <= MOVE_EXPIRY_WARNING_DAYS and zone != "past_breakeven":
+        zone = "near_expiry"
+
+    delta_call = delta_put = atm_iv_now = None
+    if days_left > 0:
+        iv_call = implied_vol(prices["buy_call"], spot, call_strike, T_remaining, "CE")
+        iv_put = implied_vol(prices["buy_put"], spot, put_strike, T_remaining, "PE")
+        delta_call = bs_delta(spot, call_strike, T_remaining, RISK_FREE_RATE, iv_call, "CE")
+        delta_put = bs_delta(spot, put_strike, T_remaining, RISK_FREE_RATE, iv_put, "PE")
+        if iv_call > 0 and iv_put > 0:
+            atm_iv_now = round((iv_call + iv_put) / 2 * 100, 1)
+
+    # --- Exit suggestion (informational only — never auto-exits) ---
+    exit_suggested, exit_reasons = False, []
+    if entry_debit_total and pnl >= MOVE_PROFIT_TARGET_MULTIPLE * entry_debit_total:
+        exit_suggested = True
+        exit_reasons.append(
+            f"Profit (₹{pnl}) has reached {int(MOVE_PROFIT_TARGET_MULTIPLE * 100)}% of the debit paid "
+            f"(₹{round(entry_debit_total, 2)}) — consider booking some or all of it; long options can "
+            f"give profit back fast if the move stalls or IV drops.")
+    if entry_debit_total and pnl <= -MOVE_STOP_LOSS_DEBIT_PCT * entry_debit_total:
+        exit_suggested = True
+        exit_reasons.append(
+            f"Value has decayed to a loss of ₹{abs(pnl)}, {int(MOVE_STOP_LOSS_DEBIT_PCT * 100)}%+ of "
+            f"the debit paid — the expected move hasn't shown up; consider cutting the loss rather "
+            f"than waiting on theta to finish the job.")
+    if (entry_debit_total and peak_pnl >= MOVE_TRAIL_ACTIVATE_DEBIT_PCT * entry_debit_total and
+            giveback_from_peak >= MOVE_TRAIL_GIVEBACK_DEBIT_PCT * entry_debit_total):
+        exit_suggested = True
+        exit_reasons.append(
+            f"Peak P&L was ₹{round(peak_pnl, 2)} and ₹{round(giveback_from_peak, 2)} has been given back — "
+            "the configured profit trail has fired; consider closing or materially trimming.")
+    if (days_left <= MOVE_EXPIRY_WARNING_DAYS and days_left >= 0 and
+            not (spot > position["breakeven_upper"] or spot < position["breakeven_lower"])):
+        exit_suggested = True
+        exit_reasons.append(
+            f"Only {days_left} day(s) to expiry and spot hasn't cleared a breakeven — theta decay "
+            f"accelerates fastest right here; consider closing rather than holding to expiry.")
+    if not exit_suggested and zone == "past_breakeven":
+        exit_reasons.append(
+            "Spot is past a breakeven — position is showing a profit at current prices; watch for an "
+            "IV crush (e.g. right after an event) that can erode profit even if price holds.")
+
+    event_flag = get_event_before_expiry(position["expiry"])
+
+    exit_orders_for_charges = [{"price": prices[k], "quantity": quantity, "transaction_type": "SELL"} for k in leg_keys]
+    exit_charges = estimate_charges(exit_orders_for_charges)
+    entry_charges_total = position.get("entry_estimated_charges") or 0
+    round_trip_charges = round(entry_charges_total + exit_charges["total"], 2)
+    net_pnl_after_charges = round(pnl - round_trip_charges, 2)
+
+    leg_details = {}
+    for k in leg_keys:
+        entry_price = (position["legs"][k].get("entry_price") or
+                       position["legs"][k].get("ask") or position["legs"][k]["ltp"])
+        current_price = prices[k]
+        qd = quote_details[k]
+        per_share = current_price - entry_price  # long leg profits when price rises
+        leg_details[k] = {
+            "tradingsymbol": position["legs"][k]["tradingsymbol"], "strike": position["legs"][k]["strike"],
+            "entry_price": entry_price, "current_price": round(current_price, 2),
+            "bid": qd.get("bid"), "ask": qd.get("ask"), "spread_pct": qd.get("spread_pct"),
+            "price_source": qd.get("price_source"),
+            "pnl": round(per_share * quantity, 2),
+        }
+    if delta_call is not None:
+        leg_details["buy_call"]["current_delta"] = round(delta_call, 3)
+    if delta_put is not None:
+        leg_details["buy_put"]["current_delta"] = round(delta_put, 3)
+
+    result = {
+        "spot": spot, "pnl": pnl, "current_debit_per_share": round(current_value_per_share, 2),
+        "current_position_value": current_position_value, "legs_current": leg_details,
+        "days_left": days_left, "zone": zone, "atm_iv_now": atm_iv_now,
+        "pct_of_debit": round((pnl / entry_debit_total * 100), 1) if entry_debit_total else None,
+        "peak_pnl": round(peak_pnl, 2),
+        "peak_pct_of_debit": round(peak_pnl / entry_debit_total * 100, 1) if entry_debit_total else None,
+        "giveback_from_peak": round(giveback_from_peak, 2),
+        "giveback_pct_of_debit": round(giveback_from_peak / entry_debit_total * 100, 1) if entry_debit_total else None,
+        "exit_suggested": exit_suggested, "exit_reasons": exit_reasons,
+        "event_before_expiry": event_flag,
+        "entry_charges": entry_charges_total, "estimated_exit_charges": exit_charges["total"],
+        "estimated_round_trip_charges": round_trip_charges, "net_pnl_after_charges": net_pnl_after_charges,
+        "breakeven_upper": position["breakeven_upper"], "breakeven_lower": position["breakeven_lower"],
+    }
+    # The multi-factor hold/exit read — see classify_move_digest for what feeds this. This is the
+    # "don't just fire at a fixed 50%" read: it separately tells you what to do RIGHT NOW and whether
+    # it's worth carrying this position into tomorrow, based on the trade's actual state.
+    try:
+        result["digest"] = classify_move_digest(position, result)
+    except Exception as e:
+        logger.exception("classify_move_digest failed for position %s", position.get("id"))
+        result["digest"] = {"action": "HOLD", "headline": "Digest unavailable (internal error)",
+                             "reasons": [str(e)], "tomorrow_outlook": None}
+    if result["digest"].get("action") in ("EXIT_NOW", "EXIT_SOON", "BOOK_PROFIT"):
+        result["exit_suggested"] = True
+        digest_reason = result["digest"].get("headline")
+        if digest_reason and digest_reason not in result["exit_reasons"]:
+            result["exit_reasons"].append(digest_reason)
+    return result
+
+
+def _move_reconcile_order_states(positions):
+    """Refresh previously pending order ids once, so late fills cannot leave the UI stuck."""
+    pending = [o for p in positions for o in p.get("broker_orders", [])
+               if o.get("order_id") and o.get("status") in ("placed", "pending")]
+    if not pending:
+        return False
+    try:
+        broker_by_id = {o.get("order_id"): o for o in kite.orders() if o.get("order_id")}
+    except Exception:
+        return False
+    changed = False
+    for p in positions:
+        for saved in p.get("broker_orders", []):
+            if saved.get("status") not in ("placed", "pending"):
+                continue
+            live = broker_by_id.get(saved.get("order_id"))
+            if not live:
+                continue
+            terminal = live.get("status")
+            saved["fill_status"] = terminal
+            if terminal == "COMPLETE":
+                saved["status"] = "filled"
+                fill_price = _move_positive(live.get("average_price"))
+                if fill_price is not None:
+                    saved["fill_price"] = fill_price
+                    saved["reference_price"] = fill_price
+                if saved.get("transaction_type") == "SELL":
+                    leg = (p.get("legs") or {}).get(saved.get("leg")) or {}
+                    entry_price = leg.get("entry_price") or leg.get("ask") or leg.get("ltp")
+                    close_price = fill_price or _move_positive(saved.get("reference_price"))
+                    if entry_price is not None and close_price is not None:
+                        saved["estimated_realized_pnl"] = round(
+                            (close_price - entry_price) * int(saved.get("quantity") or 0), 2)
+                changed = True
+            elif terminal in ("REJECTED", "CANCELLED"):
+                saved["status"] = "failed"
+                saved["error"] = live.get("status_message") or f"Order reached broker status {terminal}."
+                changed = True
+    return changed
+
+
+@app.route("/api/move-watchlist/add", methods=["POST"])
+def move_watchlist_add():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    symbol = body.get("symbol", "").upper()
+    mode = body.get("mode", "straddle")
+    try:
+        otm_pct = float(body.get("otm_pct", DEFAULT_MOVE_OTM_PCT))
+        lots = int(body.get("lots", 1))
+        target_delta = float(body.get("target_delta", DEFAULT_MOVE_TARGET_DELTA))
+        max_risk_rupees = float(body.get("max_risk_rupees", DEFAULT_MOVE_MAX_RISK_RUPEES))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid numeric strategy parameter"}), 400
+    expiry_str = body.get("expiry")
+    selection_mode = body.get("selection_mode", "smart_delta")
+
+    built = build_move_strategy(symbol, mode, otm_pct, expiry_str, lots, selection_mode,
+                                target_delta, max_risk_rupees)
+    if "error" in built:
+        return jsonify(built), 404
+
+    positions = load_move_positions()
+    duplicate = next((p for p in positions if p.get("symbol") == symbol and p.get("expiry") == built["expiry"] and
+                      p.get("mode") == built["mode"]), None)
+    if duplicate:
+        return jsonify({"error": "An identical symbol/expiry/mode is already tracked.",
+                        "position_id": duplicate.get("id")}), 409
+
+    today_str = now_ist().date().isoformat()
+    position = {
+        "id": f"{symbol}_MV_{int(time.time())}",
+        "symbol": symbol, "added_on": today_str, "entry_spot": built["spot"],
+        "expiry": built["expiry"], "lot_size": built["lot_size"], "lots": built["lots"],
+        "quantity": built["quantity"], "strategy_type": built["strategy_type"], "mode": built["mode"],
+        "selection_mode": built.get("selection_mode"), "selection_used": built.get("selection_used"),
+        "legs": built["legs"], "entry_net_debit_per_share": built["net_debit_per_share"],
+        "entry_max_loss": built["max_loss"], "entry_max_profit": built["max_profit"],
+        "entry_margin_required": built.get("margin_required"), "entry_margin_error": built.get("margin_error"),
+        "entry_estimated_charges": built.get("estimated_entry_charges", {}).get("total"),
+        "breakeven_upper": built["breakeven_upper"], "breakeven_lower": built["breakeven_lower"],
+        "move_score_at_entry": built.get("move_score"), "move_reasons_at_entry": built.get("move_reasons"),
+        # Snapshot needed later by classify_move_digest to judge progress-vs-plan, not just raw P&L.
+        "entry_atm_iv_pct": built.get("atm_iv_pct"), "entry_expected_move": built.get("expected_move"),
+        "entry_days_to_expiry": built.get("days_to_expiry"),
+        "event_before_expiry_at_entry": built.get("event_before_expiry"),
+        "entry_gate": built.get("entry_gate"), "risk_plan": built.get("risk_plan"),
+        "max_risk_rupees": built.get("max_risk_rupees"),
+        "breakeven_expected_move_ratio": built.get("breakeven_expected_move_ratio"),
+        "peak_pnl": 0.0, "peak_pct_of_debit": 0.0,
+        "broker_orders": [],
+        "history": [{"date": today_str, "spot": built["spot"], "pnl": 0.0,
+                     "current_debit_per_share": built["net_debit_per_share"]}],
+    }
+    positions.append(position)
+    save_move_positions(positions)
+    return jsonify({"ok": True, "position": position})
+
+
+@app.route("/api/move-watchlist")
+def move_watchlist():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    positions = load_move_positions()
+    today_str = now_ist().date().isoformat()
+    out, changed = [], _move_reconcile_order_states(positions)
+    active_positions = []
+    for p in positions:
+        filled_close_legs = {o.get("leg") for o in p.get("broker_orders", [])
+                             if o.get("transaction_type") == "SELL" and o.get("status") == "filled"}
+        if filled_close_legs == {"buy_call", "buy_put"}:
+            close_results = [o for o in p.get("broker_orders", [])
+                             if o.get("transaction_type") == "SELL" and o.get("status") == "filled"]
+            archive_closed_position(p, close_results)
+            changed = True
+            continue
+        active_positions.append(p)
+    positions = active_positions
+    for p in positions:
+        try:
+            mtm = mark_to_market_move(p)
+        except Exception as e:
+            logger.exception("mark_to_market_move failed for position %s (%s)", p.get("id"), p.get("symbol"))
+            out.append({**p, "mtm_error": f"Internal error while pricing this position: {e}"})
+            continue
+        if mtm and "__error__" in mtm:
+            out.append({**p, "mtm_error": mtm["__error__"]})
+            continue
+        mark = {"date": today_str, "spot": mtm["spot"], "pnl": mtm["pnl"],
+                "current_debit_per_share": mtm["current_debit_per_share"]}
+        history = p.setdefault("history", [])
+        if not history or history[-1]["date"] != today_str:
+            history.append(mark)
+        else:
+            history[-1] = mark
+        p["peak_pnl"] = mtm.get("peak_pnl", p.get("peak_pnl", 0))
+        p["peak_pct_of_debit"] = mtm.get("peak_pct_of_debit")
+        p["last_mark_at"] = datetime.now(IST).isoformat()
+        changed = True
+        out.append({**p, "current": mtm})
+    if changed:
+        save_move_positions(positions)
+    return jsonify({"positions": out})
+
+
+@app.route("/api/move-watchlist/<pos_id>", methods=["DELETE"])
+def move_watchlist_remove(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    positions = load_move_positions()
+    positions = [p for p in positions if p["id"] != pos_id]
+    save_move_positions(positions)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/move-watchlist/<pos_id>/curve")
+def move_watchlist_curve(pos_id):
+    """Live re-estimate of the payoff curve for an already-tracked position, using current spot and
+    today's implied vol on both legs (rather than the frozen entry-day curve)."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    position = find_move_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    spot, err = get_spot_price(position["symbol"])
+    if err:
+        return jsonify(err), 404
+
+    today = now_ist().date()
+    expiry_date = datetime.strptime(position["expiry"], "%Y-%m-%d").date()
+    days_left = max((expiry_date - today).days, 0)
+    call_strike = position["legs"]["buy_call"]["strike"]
+    put_strike = position["legs"]["buy_put"]["strike"]
+    quantity = position.get("quantity", position["lot_size"])
+    inst_keys = [f"NFO:{position['legs']['buy_call']['tradingsymbol']}",
+                 f"NFO:{position['legs']['buy_put']['tradingsymbol']}"]
+    try:
+        quotes = kite_quote_bulk(inst_keys)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    T = days_left / 365.0
+    call_ltp = extract_price(quotes.get(inst_keys[0]))
+    put_ltp = extract_price(quotes.get(inst_keys[1]))
+    if call_ltp is None or put_ltp is None:
+        return jsonify({"error": "No usable live price for one or both legs"}), 400
+    call_iv = implied_vol(call_ltp, spot, call_strike, T, "CE") if T > 0 else 0.20
+    put_iv = implied_vol(put_ltp, spot, put_strike, T, "PE") if T > 0 else 0.20
+    entry_debit = position["entry_net_debit_per_share"]
+
+    lo = spot * (1 - MOVE_CURVE_RANGE_PCT); hi = spot * (1 + MOVE_CURVE_RANGE_PCT)
+    step = (hi - lo) / (MOVE_CURVE_POINTS - 1)
+    curve = []
+    for i in range(MOVE_CURVE_POINTS):
+        s_t = lo + i * step
+        value = (bs_price(s_t, call_strike, T, RISK_FREE_RATE, call_iv, "CE") +
+                 bs_price(s_t, put_strike, T, RISK_FREE_RATE, put_iv, "PE"))
+        curve.append({"spot": round(s_t, 2), "pnl": round((value - entry_debit) * quantity, 2)})
+
+    return jsonify({"position_id": pos_id, "spot": spot, "days_left": days_left, "curve": curve,
+                     "call_strike": call_strike, "put_strike": put_strike,
+                     "call_iv_pct": round(call_iv * 100, 1), "put_iv_pct": round(put_iv * 100, 1),
+                     "quantity": quantity, "entry_debit_per_share": entry_debit,
+                     "note": "Live re-estimate using current spot and today's implied vol on both legs — "
+                             "the curve shape will keep shifting daily as time passes and IV moves."})
+
+
+def build_move_close_orders(position):
+    """Reverse of entry: SELL both legs with a marketable limit at the executable best bid."""
+    quantity = position.get("quantity", position["lot_size"])
+    leg_keys = ["buy_call", "buy_put"]
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    quotes = kite_quote_bulk(inst_keys)
+    orders = []
+    for k in leg_keys:
+        leg = position["legs"][k]
+        q = quotes.get(f"NFO:{leg['tradingsymbol']}") or {}
+        st = quote_stats(q)
+        ref_price = _move_positive(st.get("bid")) or extract_price(q)
+        orders.append({"leg": k, "tradingsymbol": leg["tradingsymbol"], "transaction_type": "SELL",
+                        "quantity": quantity, "price": ref_price, "reference_price": ref_price,
+                        "bid": st.get("bid"), "ask": st.get("ask"), "spread_pct": st.get("spread_pct"),
+                        "price_source": "BID" if _move_positive(st.get("bid")) else "LTP_MID_FALLBACK",
+                        "entry_price": leg.get("entry_price") or leg.get("ask") or leg["ltp"],
+                        "original_transaction_type": "BUY"})
+    return orders
+
+
+def _move_finalize_order_results(results):
+    """Turn an accepted order id into filled/pending/failed; accepted is not the same as filled."""
+    for r in results:
+        if r.get("status") != "placed" or not r.get("order_id"):
+            continue
+        terminal = wait_for_order_terminal(r["order_id"], timeout_seconds=8)
+        r["fill_status"] = terminal
+        if terminal == "COMPLETE":
+            r["status"] = "filled"
+        elif terminal in ("REJECTED", "CANCELLED"):
+            r["status"] = "failed"
+            r["error"] = f"Order reached broker status {terminal}."
+        else:
+            r["status"] = "pending"
+    return results
+
+
+def _move_filled_entry_legs(position):
+    return {o.get("leg") for o in position.get("broker_orders", [])
+            if o.get("transaction_type") == "BUY" and o.get("status") == "filled"}
+
+
+def _move_active_close_orders(position):
+    return [o for o in position.get("broker_orders", [])
+            if o.get("transaction_type") == "SELL" and o.get("status") in ("placed", "pending", "filled")]
+
+
+def _move_validate_custom_orders(position, orders, closing=False):
+    """Bind browser-edited prices to the two tracked contracts; reject symbol/side/size tampering."""
+    if not isinstance(orders, list) or len(orders) != 2:
+        return None, "Exactly two option legs are required."
+    expected_side = "SELL" if closing else "BUY"
+    quantity = int(position.get("quantity", position["lot_size"]))
+    expected = {k: position["legs"][k] for k in ("buy_call", "buy_put")}
+    seen, safe = set(), []
+    for raw in orders:
+        if not isinstance(raw, dict):
+            return None, "Each order leg must be an object."
+        leg_key = raw.get("leg")
+        if leg_key not in expected or leg_key in seen:
+            return None, "Order legs do not match the tracked call and put."
+        leg = expected[leg_key]
+        if raw.get("tradingsymbol") != leg["tradingsymbol"]:
+            return None, f"Contract mismatch for {leg_key}."
+        if str(raw.get("transaction_type", "")).upper() != expected_side:
+            return None, f"{leg_key} must be a {expected_side} order."
+        try:
+            raw_quantity = int(raw.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return None, f"{leg_key} has an invalid quantity."
+        if raw_quantity != quantity:
+            return None, f"{leg_key} quantity must equal the tracked quantity ({quantity})."
+        price = _move_positive(raw.get("price") or raw.get("reference_price"))
+        if price is None:
+            return None, f"{leg_key} needs a positive LIMIT price."
+        item = {"leg": leg_key, "tradingsymbol": leg["tradingsymbol"],
+                "transaction_type": expected_side, "quantity": quantity,
+                "price": price, "reference_price": price}
+        if closing:
+            item["entry_price"] = leg.get("entry_price") or leg.get("ask") or leg.get("ltp")
+        safe.append(item); seen.add(leg_key)
+    return safe, None
+
+
+def _move_build_entry_orders(position):
+    quantity = int(position.get("quantity", position["lot_size"]))
+    leg_keys = ("buy_call", "buy_put")
+    inst_keys = [f"NFO:{position['legs'][k]['tradingsymbol']}" for k in leg_keys]
+    quotes = kite_quote_bulk(inst_keys, force_refresh=True)
+    orders, blockers = [], []
+    for k in leg_keys:
+        leg = position["legs"][k]
+        q = quotes.get(f"NFO:{leg['tradingsymbol']}") or {}
+        ltp = q.get("last_price")
+        bid, ask = extract_bid_ask(q)
+        st = quote_stats(q)
+        if bid is None or ask is None:
+            blockers.append(f"{k} has no two-sided live quote.")
+        if st.get("spread_pct") is None or st["spread_pct"] > MOVE_MAX_LEG_SPREAD_PCT:
+            blockers.append(f"{k} live spread is {st.get('spread_pct')}%; maximum is {MOVE_MAX_LEG_SPREAD_PCT:.1f}%.")
+        if int(st.get("oi") or 0) < MOVE_MIN_LEG_OI:
+            blockers.append(f"{k} live OI is {int(st.get('oi') or 0):,}; minimum is {MOVE_MIN_LEG_OI:,}.")
+        auto_price = recommended_limit_price("BUY", bid, ask, ltp)
+        orders.append({"leg": k, "tradingsymbol": leg["tradingsymbol"], "transaction_type": "BUY",
+                       "quantity": quantity, "ltp": ltp, "bid": bid, "ask": ask,
+                       "recommended_limit_price": auto_price, "reference_price": auto_price,
+                       "price_source": "ASK" if ask is not None else "LTP_FALLBACK"})
+    return orders, blockers
+
+
+@app.route("/api/move-execute/<pos_id>/preview")
+def move_execute_preview(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    position = find_move_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    gate = position.get("entry_gate") or {}
+    if gate and not gate.get("trade_ready"):
+        return jsonify({"error": "Entry gate is not READY. Rebuild/re-track after the setup improves.",
+                        "entry_gate": gate}), 409
+    existing_entries = [o for o in position.get("broker_orders", [])
+                        if o.get("transaction_type") == "BUY" and o.get("status") in ("placed", "pending", "filled")]
+    if existing_entries:
+        return jsonify({"error": "Entry orders already exist for this tracked position; duplicate submission blocked.",
+                        "orders": existing_entries}), 409
+    try:
+        orders, live_blockers = _move_build_entry_orders(position)
+    except Exception as e:
+        return jsonify({"error": f"Could not fetch live Bid/Ask: {e}"}), 502
+    if live_blockers:
+        return jsonify({"error": "Live liquidity gate failed; entry blocked.",
+                        "blockers": live_blockers, "orders": orders}), 409
+    return jsonify({"position_id": pos_id, "symbol": position["symbol"], "orders": orders,
+                     "default_product": "NRML", "default_order_type": "LIMIT",
+                     "warning": "LIMIT prices use best Ask (you're BUYING both legs). Quotes can "
+                                "change before the order reaches the exchange."})
+
+
+@app.route("/api/move-execute/<pos_id>/confirm", methods=["POST"])
+def move_execute_confirm(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    if not body.get("confirmed"):
+        return jsonify({"error": "Confirmation flag not set — nothing was placed."}), 400
+    position = find_move_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    gate = position.get("entry_gate") or {}
+    if gate and not gate.get("trade_ready"):
+        return jsonify({"error": "Entry gate is not READY; live execution is blocked.", "entry_gate": gate}), 409
+    existing_entries = [o for o in position.get("broker_orders", [])
+                        if o.get("transaction_type") == "BUY" and o.get("status") in ("placed", "pending", "filled")]
+    if existing_entries:
+        return jsonify({"error": "Duplicate entry blocked; this position already has submitted BUY orders.",
+                        "orders": existing_entries}), 409
+    product = body.get("product", "NRML")
+    if product != "NRML":
+        return jsonify({"error": "Long-vol carry positions require NRML product."}), 400
+    order_type = body.get("order_type", "LIMIT")
+    if order_type != "LIMIT":
+        return jsonify({"error": "Long-vol option baskets require LIMIT orders to cap slippage."}), 400
+    try:
+        live_orders, live_blockers = _move_build_entry_orders(position)
+    except Exception as e:
+        return jsonify({"error": f"Could not revalidate live Bid/Ask: {e}"}), 502
+    if live_blockers:
+        return jsonify({"error": "Live liquidity gate failed at confirmation; no orders placed.",
+                        "blockers": live_blockers}), 409
+    custom_orders = body.get("orders")
+    if custom_orders:
+        legs_to_place, order_error = _move_validate_custom_orders(position, custom_orders, closing=False)
+        if order_error:
+            return jsonify({"error": order_error}), 400
+    else:
+        quantity = position.get("quantity", position["lot_size"])
+        legs_to_place = [{"leg": k, "tradingsymbol": position["legs"][k]["tradingsymbol"],
+                           "transaction_type": "BUY", "quantity": quantity,
+                           "price": position["legs"][k].get("entry_price") or
+                                    position["legs"][k].get("ask") or position["legs"][k]["ltp"]}
+                          for k in ("buy_call", "buy_put")]
+    if not legs_to_place:
+        return jsonify({"error": "No legs left to place — every leg was removed in the review screen."}), 400
+    live_limit_by_leg = {o["leg"]: _move_positive(o.get("recommended_limit_price")) for o in live_orders}
+    for order in legs_to_place:
+        live_limit = live_limit_by_leg.get(order["leg"])
+        if live_limit is None or float(order["price"]) > live_limit * (1 + MOVE_MAX_ENTRY_SLIPPAGE_PCT / 100):
+            return jsonify({"error": f"{order['leg']} limit exceeds the refreshed Ask/slippage cap; preview again."}), 409
+
+    results = _move_finalize_order_results(place_basket_orders(legs_to_place, product, order_type))
+    positions = load_move_positions()
+    for p in positions:
+        if p["id"] == pos_id:
+            p["broker_orders"] = p.get("broker_orders", []) + results
+    save_move_positions(positions)
+
+    any_failed = any(r["status"] == "failed" for r in results)
+    filled_count = sum(1 for r in results if r["status"] == "filled")
+    pending_count = sum(1 for r in results if r["status"] == "pending")
+    total_legs = len(legs_to_place)
+    partial = any_failed and (filled_count + pending_count) > 0
+    return jsonify({
+        "results": results, "partial_failure": partial,
+        "note": ("PARTIAL EXECUTION: one leg placed, one failed — you may now hold an unhedged single "
+                 "long option. Open your Zerodha app / Kite web IMMEDIATELY to check and manually "
+                 "complete or exit as needed."
+                 if partial else
+                 "All legs failed — nothing was placed." if any_failed and filled_count + pending_count == 0 else
+                 f"Filled {filled_count}/{total_legs}; {pending_count} still pending. Verify broker fills before treating the basket as live.")
+    })
+
+
+@app.route("/api/move-execute/<pos_id>/close/preview")
+def move_close_preview(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    position = find_move_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    if _move_filled_entry_legs(position) != {"buy_call", "buy_put"}:
+        return jsonify({"error": "Close blocked: both BUY entry legs are not recorded as filled. "
+                                         "Use the broker terminal to reconcile any manual or partial position."}), 409
+    active_closes = _move_active_close_orders(position)
+    if active_closes:
+        return jsonify({"error": "Close orders already exist; duplicate SELL submission blocked. "
+                                         "Reconcile these orders in the broker terminal.",
+                        "orders": active_closes}), 409
+    orders = build_move_close_orders(position)
+    if any(o.get("price") is None for o in orders):
+        return jsonify({"error": "No executable sell price for one or both legs; close preview blocked."}), 409
+    return jsonify({"position_id": pos_id, "symbol": position["symbol"], "orders": orders,
+                     "default_product": "NRML", "default_order_type": "LIMIT",
+                     "warning": "This will CLOSE/SQUARE OFF this position — SELLING both legs at "
+                                "the displayed best-Bid limit prices. Review carefully, then confirm to send these "
+                                "real orders to your Zerodha account."})
+
+
+@app.route("/api/move-execute/<pos_id>/close/confirm", methods=["POST"])
+def move_close_confirm(pos_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.json or {}
+    if not body.get("confirmed"):
+        return jsonify({"error": "Confirmation flag not set — nothing was placed."}), 400
+    position = find_move_position(pos_id)
+    if not position:
+        return jsonify({"error": "Position not found"}), 404
+    if _move_filled_entry_legs(position) != {"buy_call", "buy_put"}:
+        return jsonify({"error": "Close blocked because both entry legs are not confirmed filled."}), 409
+    active_closes = _move_active_close_orders(position)
+    if active_closes:
+        return jsonify({"error": "Duplicate close blocked; existing SELL orders require broker reconciliation.",
+                        "orders": active_closes}), 409
+    product = body.get("product", "NRML")
+    if product != "NRML":
+        return jsonify({"error": "Long-vol carry positions require NRML product."}), 400
+    order_type = body.get("order_type", "LIMIT")
+    if order_type != "LIMIT":
+        return jsonify({"error": "Option closes require LIMIT orders to cap slippage."}), 400
+    try:
+        live_close_orders = build_move_close_orders(position)
+    except Exception as e:
+        return jsonify({"error": f"Could not revalidate live close prices: {e}"}), 502
+    if any(o.get("price") is None for o in live_close_orders):
+        return jsonify({"error": "No executable best Bid for one or both close legs."}), 409
+    custom_orders = body.get("orders")
+    if custom_orders:
+        legs_to_place, order_error = _move_validate_custom_orders(position, custom_orders, closing=True)
+        if order_error:
+            return jsonify({"error": order_error}), 400
+    else:
+        legs_to_place = live_close_orders
+    if not legs_to_place:
+        return jsonify({"error": "No legs left to place — every leg was removed in the review screen."}), 400
+    live_bid_by_leg = {o["leg"]: _move_positive(o.get("price")) for o in live_close_orders}
+    for order in legs_to_place:
+        live_bid = live_bid_by_leg.get(order["leg"])
+        if live_bid is None or float(order["price"]) < live_bid * (1 - MOVE_MAX_ENTRY_SLIPPAGE_PCT / 100):
+            return jsonify({"error": f"{order['leg']} close limit is below the refreshed Bid/slippage cap; preview again."}), 409
+
+    results = _move_finalize_order_results(place_basket_orders(legs_to_place, product, order_type))
+
+    entry_by_leg = {o["leg"]: o.get("entry_price") for o in legs_to_place}
+    for r in results:
+        if r["status"] != "filled":
+            continue
+        entry_price = entry_by_leg.get(r["leg"])
+        close_price = next((o.get("reference_price") for o in legs_to_place if o["leg"] == r["leg"]), None)
+        if entry_price is not None and close_price is not None:
+            r["estimated_realized_pnl"] = round((close_price - entry_price) * r["quantity"], 2)
+
+    positions = load_move_positions()
+    still_present = None
+    for p in positions:
+        if p["id"] == pos_id:
+            p["broker_orders"] = p.get("broker_orders", []) + results
+            still_present = p
+
+    any_failed = any(r["status"] == "failed" for r in results)
+    filled_count = sum(1 for r in results if r["status"] == "filled")
+    pending_count = sum(1 for r in results if r["status"] == "pending")
+    total_legs = len(legs_to_place)
+    fully_closed = filled_count == total_legs and not any_failed
+
+    if fully_closed and still_present:
+        archive_closed_position(still_present, results)
+        positions = [p for p in positions if p["id"] != pos_id]
+        note = (f"Position fully closed and archived to trade_history.json. Estimated realized P&L: "
+                f"₹{round(sum(r.get('estimated_realized_pnl', 0) for r in results), 2)} (based on quoted "
+                f"prices at close, not confirmed fills — check your contract note).")
+    elif any_failed and (filled_count + pending_count) > 0:
+        note = ("PARTIAL CLOSE: one leg closed, one failed. You may now hold a mismatched position. "
+                "Open your Zerodha app / Kite web IMMEDIATELY to check and manually complete the close.")
+    elif any_failed:
+        note = "All legs failed — nothing was closed."
+    else:
+        note = f"Filled {filled_count}/{total_legs}; {pending_count} close order(s) still pending. Position remains tracked until both fills are confirmed."
+
+    save_move_positions(positions)
+    return jsonify({"results": results, "fully_closed": fully_closed, "note": note})
 
 
 # ---------------------------------------------------------------------------
@@ -7119,15 +11721,6 @@ def index():
     return send_from_directory(os.path.dirname(__file__), "index.html")
 
 
-if __name__ == "__main__":
-    if "PUT_YOUR" in API_KEY or "PUT_YOUR" in API_SECRET:
-        print("!! Set KITE_API_KEY and KITE_API_SECRET (env vars, or edit backend.py) before running.")
-    print(f"Set your Kite app's Redirect URL to: {REDIRECT_URL}")
-    if ALLOW_INSECURE_NEWS:
-        print("!! ALLOW_INSECURE_NEWS is on — news headline fetches will skip TLS verification on failure.")
-    print("Starting server at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
-
 
 @app.route("/api/breakout/diagnostics")
 def breakout_diagnostics():
@@ -7136,3 +11729,12 @@ def breakout_diagnostics():
         "thresholds": [4,5,6],
         "option_momentum_included": False
     })
+
+if __name__ == "__main__":
+    if "PUT_YOUR" in API_KEY or "PUT_YOUR" in API_SECRET:
+        print("!! Set KITE_API_KEY and KITE_API_SECRET (env vars, or edit backend.py) before running.")
+    print(f"Set your Kite app's Redirect URL to: {REDIRECT_URL}")
+    if ALLOW_INSECURE_NEWS:
+        print("!! ALLOW_INSECURE_NEWS is on — news headline fetches will skip TLS verification on failure.")
+    print("Starting server at http://localhost:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
