@@ -1,16 +1,71 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="website-checking">
 <head>
+<style>
+html.website-checking body { display:none !important; }
+html.website-checking { background:#0b1220; }
+html.website-checking::before { content:'Checking website access…'; display:block; padding:48px; color:#edf3fa; font:18px system-ui; }
+</style>
 <script>
 const websiteFetch = window.fetch.bind(window);
+let websiteRevoked=false, websiteStatusBusy=false, websiteCsrf='', websiteLockBusy=false;
+function websiteHide(){document.documentElement.classList.add('website-checking')}
+function websiteSignOut(){
+  websiteRevoked=true;websiteHide();window.location.replace('/website-login');
+}
+let websiteChannel=null;
+try{websiteChannel=new BroadcastChannel('website-access');websiteChannel.onmessage=e=>{if(e.data==='locked')websiteSignOut()}}catch{}
+window.addEventListener('storage',e=>{if(e.key==='website-global-lock')websiteSignOut()});
 window.fetch = async (...args) => {
   const response = await websiteFetch(...args);
   if (response.status === 401) {
     const data = await response.clone().json().catch(() => null);
-    if (data?.website_login_required) window.location.replace('/website-login');
+    if (data?.website_login_required) websiteSignOut();
   }
   return response;
 };
+async function websiteCheck(){
+  if(websiteStatusBusy||websiteRevoked||websiteLockBusy)return;
+  websiteStatusBusy=true;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+  try{
+    const response=await websiteFetch('/api/website-status',{cache:'no-store',signal:controller.signal});
+    if(response.status===401){websiteSignOut();return}
+    if(!response.ok)throw Error('Access check failed');
+    const data=await response.json();
+    if(data.authenticated!==true||!data.csrf)throw Error('Access check failed');
+    websiteCsrf=data.csrf;
+    if(!websiteRevoked&&!websiteLockBusy&&!document.hidden)document.documentElement.classList.remove('website-checking');
+  }catch{websiteHide()}finally{clearTimeout(timer);websiteStatusBusy=false}
+}
+async function websiteLockAll(event){
+  event.preventDefault();
+  if(websiteLockBusy)return;
+  websiteLockBusy=true;websiteHide();
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{
+    // Fetch a fresh CSRF token; a second tab may have renewed the shared cookie.
+    const status=await websiteFetch('/api/website-status',{cache:'no-store',signal:controller.signal});
+    if(status.status===401){websiteSignOut();return}
+    if(!status.ok)throw Error('Cannot confirm access');
+    websiteCsrf=(await status.json()).csrf;
+    if(!websiteCsrf)throw Error('Missing access token');
+    const response=await websiteFetch('/website-logout',{method:'POST',headers:{'X-Website-CSRF':websiteCsrf},cache:'no-store',signal:controller.signal});
+    if(!response.ok||!(await response.json()).locked)throw Error('Lock was not confirmed');
+    try{websiteChannel?.postMessage('locked');localStorage.setItem('website-global-lock',String(Date.now()))}catch{}
+    websiteSignOut();
+  }catch{
+    alert('Could not confirm that all devices are locked. Check your connection and try Lock all devices again.');
+  }finally{clearTimeout(timer);websiteLockBusy=false;if(!websiteRevoked)websiteCheck()}
+}
+window.addEventListener('offline',websiteHide);
+window.addEventListener('online',websiteCheck);
+window.addEventListener('focus',()=>{websiteHide();websiteCheck()});
+window.addEventListener('pagehide',websiteHide);
+window.addEventListener('pageshow',()=>{websiteHide();websiteCheck()});
+document.addEventListener('visibilitychange',()=>{websiteHide();if(!document.hidden)websiteCheck()});
+setInterval(websiteCheck,2000);
+websiteCheck();
 </script>
 <meta charset="UTF-8">
 <title>Option Selling Dashboard (Local)</title>
@@ -381,7 +436,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 
 </head>
 <body>
-<form action="/website-logout" method="post" style="text-align:right;padding:8px 18px"><button type="submit">Lock website</button></form>
+<form action="/website-logout" method="post" onsubmit="websiteLockAll(event)" style="text-align:right;padding:8px 18px"><button type="submit" title="Sign out all tabs, browsers and computers. Trading continues.">Lock all devices</button></form>
 
 <header>
   <div>
