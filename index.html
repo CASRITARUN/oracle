@@ -1,6 +1,17 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script>
+const websiteFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const response = await websiteFetch(...args);
+  if (response.status === 401) {
+    const data = await response.clone().json().catch(() => null);
+    if (data?.website_login_required) window.location.replace('/website-login');
+  }
+  return response;
+};
+</script>
 <meta charset="UTF-8">
 <title>Option Selling Dashboard (Local)</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -370,6 +381,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 
 </head>
 <body>
+<form action="/website-logout" method="post" style="text-align:right;padding:8px 18px"><button type="submit">Lock website</button></form>
 
 <header>
   <div>
@@ -2554,15 +2566,15 @@ async function dkAction(action,body={}){
     await dkRequest('control/'+action,body);dkNotice(action==='train'?'Training started. Follow progress in Learning lab.':action==='sync'?'Recent-history sync started.':'Control accepted; refreshing state.');await refreshAutoTradeAI();
   }catch(e){dkNotice(e.message,true)}
 }
-const dkFields=[['capital','Capital per trade · ₹',1000,10000000,1000],['risk','Planned risk per trade · ₹',100,100000,100],['daily_loss','Daily loss limit · ₹',100,1000000,100],['max_positions','Maximum open positions',1,5,1],['confidence','Minimum direction confidence',.55,.85,.01],['max_spread','Maximum option spread · %',.1,3,.1],['stop_pct','Option stop distance · %',3,40,1],['reward_r','Target / planned risk',1,4,.1],['partial_take_r','Trim half at profit · R',.5,3,.1],['max_hold','Maximum hold · minutes',5,360,5],['square_off','Square-off time · IST'],['cooldown','Re-entry cooldown · minutes',1,120,1],['slippage_bps','Adverse slippage · basis points',1,100,1],['fee_per_order','Estimated cost per order · ₹',1,500,1]];
+const dkFields=[['lots','Lots per trade · 0 = Auto',0,50,1],['capital','Capital per trade · ₹',1000,10000000,1000],['risk','Planned risk per trade · ₹',100,100000,100],['daily_loss','Daily loss limit · ₹',100,1000000,100],['max_positions','Maximum open positions',1,5,1],['confidence','Minimum direction confidence',.55,.85,.01],['max_spread','Maximum option spread · %',.1,3,.1],['stop_pct','Option stop distance · %',3,40,1],['reward_r','Target / planned risk',1,4,.1],['partial_take_r','Trim half at profit · R',.5,3,.1],['max_hold','Maximum hold · minutes',5,360,5],['square_off','Square-off time · IST'],['cooldown','Re-entry cooldown · minutes (0 / NA = off)',0,120,1],['slippage_bps','Adverse slippage · basis points',1,100,1],['fee_per_order','Estimated cost per order · ₹',1,500,1]];
 function initAutoTradeAIUI(){
   if(deskInitialized){refreshAutoTradeAI();return}deskInitialized=true;
-  dkHTML('dkSettingsFields',dkFields.map(([k,label,min,max,step])=>`<label>${dkEsc(label)}<input name="${k}" type="${k==='square_off'?'time':'number'}" ${min!=null?`min="${min}" max="${max}" step="${step}"`:''} required></label>`).join(''));
+  dkHTML('dkSettingsFields',dkFields.map(([k,label,min,max,step])=>k==='cooldown'?`<label>${dkEsc(label)}<input name="cooldown" type="text" inputmode="text" pattern="([0-9]+|[Nn]/?[Aa])" title="Enter 0 to 120 whole minutes, or NA" required></label>`:`<label>${dkEsc(label)}<input name="${k}" type="${k==='square_off'?'time':'number'}" ${min!=null?`min="${min}" max="${max}" step="${step}"`:''} required></label>`).join(''));
   document.querySelectorAll('#desk [data-view]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('#desk [data-view]').forEach(x=>{x.classList.toggle('selected',x===b);x.setAttribute('aria-current',x===b?'page':'false')});document.querySelectorAll('#desk [data-pane]').forEach(p=>p.hidden=p.dataset.pane!==b.dataset.view)}));
   [['dkLiveOverride','live-override'],['dkArm','arm'],['dkDisarm','disarm'],['dkClose','close'],['dkScan','scan'],['dkTrain','train'],['dkSync','sync'],['dkClear','clear-halt']].forEach(([id,a])=>dkEl(id).onclick=()=>dkAction(a));
   dkEl('dkMode').onchange=async e=>{const mode=e.target.value;try{if(mode==='live'&&!await dkConfirm('Switch to live mode?','Live mode requires a qualifying forward paper record or an enabled manual override. Switching modes disarms entries; arming live requires a separate confirmation.')){e.target.value=deskState?.config.mode||'paper';return}await dkRequest('control/mode',{mode,ack:mode==='live'});await refreshAutoTradeAI()}catch(err){dkNotice(err.message,true);e.target.value=deskState?.config.mode||'paper'}};
   dkEl('dkSettings').oninput=()=>deskDirty=true;
-  dkEl('dkSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='square_off'?v:Number(v));await dkRequest('config',body);deskDirty=false;dkNotice('Risk settings saved.');await refreshAutoTradeAI()}catch(err){dkNotice(err.message,true)}};
+  dkEl('dkSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='square_off'||k==='cooldown'?v:Number(v));await dkRequest('config',body);deskDirty=false;dkNotice('Risk settings saved.');await refreshAutoTradeAI()}catch(err){dkNotice(err.message,true)}};
   dkEl('dkExport').onclick=()=>{if(!deskState)return;const keys=['ts','symbol','mode','contract','qty','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...deskState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='ai-desk-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
   refreshAutoTradeAI();deskTimer=setInterval(()=>{if(!document.hidden&&dkEl('desk')?.getClientRects().length)refreshAutoTradeAI()},8000);
 }
@@ -2584,7 +2596,7 @@ function dkRender(s){
   dkHTML('dkModels',dkKV('Historical model',sig.historical_probability==null?'—':dkNum(sig.historical_probability*100,1)+'% UP')+dkKV('Forward model',sig.online_probability==null?'Collecting evidence':dkNum(sig.online_probability*100,1)+'% UP'));
   const factors=sig.factors||[],max=Math.max(.01,...factors.map(f=>Math.abs(f.impact)));
   dkHTML('dkFactors',factors.length?factors.map(f=>`<div class="dk-factor"><span>${dkEsc(f.name.replace(/_/g,' '))}</span><div class="dk-factor-track"><i style="width:${Math.abs(f.impact)/max*100}%;background:${f.impact>0?'#b1ef65':'#8bb6ff'}"></i></div><b>${f.impact>0?'+':''}${dkNum(f.impact)}</b></div>`).join(''):'<span class="dk-muted">Feature contributions appear with a prediction.</span>');
-  dkText('dkContract',sig.contract||'No qualified contract');dkHTML('dkPlan',dkKV('Status',sig.decision||'WAIT')+dkKV('Quantity',sig.qty??'—')+dkKV('Estimated entry',dkMoney(sig.entry))+dkKV('Stop / target',dkMoney(sig.stop)+' / '+dkMoney(sig.target))+dkKV('Spread',sig.spread==null?'—':dkNum(sig.spread)+'%'));
+  dkText('dkContract',sig.contract||'No qualified contract');dkHTML('dkPlan',dkKV('Status',sig.decision||'WAIT')+dkKV('Lots',sig.lots??'—')+dkKV('Quantity',sig.qty??'—')+dkKV('Estimated entry',dkMoney(sig.entry))+dkKV('Stop / target',dkMoney(sig.stop)+' / '+dkMoney(sig.target))+dkKV('Spread',sig.spread==null?'—':dkNum(sig.spread)+'%'));
   dkText('dkLiveLock',cfg.live_override?'Manual override':ev.ready?'Eligible':'Locked');dkText('dkLiveOverride',cfg.live_override?'Disable manual override':'Enable manual override');dkEl('dkLiveOverride').disabled=false;dkHTML('dkGates',(ev.checks||[]).map(g=>`<div class="dk-gate ${g.ok?'pass':''}"><i>${g.ok?'✓':'○'}</i><span>${dkEsc(g.name)}</span><b>${dkEsc(g.value==null?(g.ok?'No losses':'—'):g.value)} / ${g.required}</b></div>`).join(''));
   dkHTML('dkPositions',dkTable(['Index / option','Mode','Qty','Entry','Bid','Open P&L','Status / action'],(s.positions||[]).map(p=>[p.symbol+' / '+p.contract,p.mode,p.qty,dkNum(p.entry),dkNum(p.bid),dkMoney(p.unrealized),p.status+' · '+(p.reason||'Reconciling')])));
   dkHTML('dkEvents',(s.events||[]).slice(0,8).map(e=>`<div class="dk-event"><time>${dkTime(e.ts)}</time><b>${dkEsc(e.kind)}</b><span>${dkEsc((e.symbol?e.symbol+' · ':'')+e.detail)}</span></div>`).join('')||'<div class="dk-empty">The next scan will add its decision and reason here.</div>');
