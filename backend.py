@@ -2,7 +2,7 @@
 Kite Option-Selling Dashboard — local backend
 ------------------------------------------------
 Run:  python backend.py
-Then open: https://algo.wecon.in
+Then open: https://algo2.wecon.in
 
 What this does
 - Logs you into Kite Connect (daily login, token expires every day - that's Kite's design, not a bug here)
@@ -40,7 +40,9 @@ import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, request, jsonify, send_from_directory, redirect
+from flask import Flask, request, jsonify, send_from_directory, redirect, session, render_template_string
+import secrets
+import hmac
 
 try:
     from kiteconnect import KiteConnect
@@ -59,9 +61,9 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # this process starts) — do NOT hardcode real keys/secrets directly in this file,
 # especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
-API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
+API_KEY = os.environ.get("KITE_API_KEY", "").strip()
+API_SECRET = os.environ.get("KITE_API_SECRET", "").strip()
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -484,6 +486,86 @@ INDEX_OPTION_EXCHANGE = {"SENSEX": "BFO", "NIFTY": "NFO", "BANKNIFTY": "NFO", "F
 OPTION_EXCHANGE_SEGMENT = {"NFO": "NFO-OPT", "BFO": "BFO-OPT"}
 
 app = Flask(__name__, static_folder="static", static_url_path="")
+
+# Website access: set WEBSITE_PASSWORD and WEBSITE_SECRET_KEY in the server environment.
+# Serve ALL dashboard paths through Flask (including / and /index.html).
+# WEBSITE_SECRET_KEY should be a long random value shared by all server workers.
+WEBSITE_PASSWORD = os.environ.get("WEBSITE_PASSWORD", "")
+app.secret_key = os.environ.get("WEBSITE_SECRET_KEY") or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("WEBSITE_COOKIE_SECURE", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8), MAX_CONTENT_LENGTH=2 * 1024 * 1024)
+_SITE_FAILURES = {}
+_SITE_LOGIN_LOCK = threading.Lock()
+_SITE_LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Website sign in</title>
+<style>body{margin:0;background:#0b1220;color:#edf3fa;font:16px system-ui;display:grid;place-items:center;min-height:100vh}
+main{width:min(360px,80vw);padding:32px;background:#162235;border:1px solid #334155;border-radius:18px}
+h1{margin-top:0}p{color:#abbad0}input,button{box-sizing:border-box;width:100%;padding:13px;margin-top:12px;border-radius:8px;border:1px solid #64748b;font:inherit}
+button{background:#b1ef65;color:#142009;cursor:pointer;font-weight:700}.error{color:#ffb4b4}</style></head>
+<body><main><h1>Website sign in</h1><p>Enter your password to open the dashboard.</p>
+<form method="post" action="/website-login"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
+<button type="submit">Enter website</button></form><p class="error" role="alert">{{ error }}</p></main></body></html>"""
+
+def _site_authenticated():
+    return bool(WEBSITE_PASSWORD and session.get('website_authenticated'))
+
+@app.before_request
+def require_website_password():
+    if request.endpoint == 'website_login':
+        return None
+    if not _site_authenticated():
+        if request.path.startswith('/api/'):
+            return jsonify(error='Website password required', website_login_required=True), 401
+        return redirect('/website-login')
+
+@app.after_request
+def protect_website_cache(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
+
+@app.route('/website-login', methods=['GET', 'POST'])
+def website_login():
+    if _site_authenticated():
+        return redirect('/')
+    error = ''; status = 200
+    session.setdefault('website_csrf', secrets.token_urlsafe(32))
+    if not WEBSITE_PASSWORD:
+        error = 'Website access is not configured. Set WEBSITE_PASSWORD on the server.'; status = 503
+    elif request.method == 'POST':
+        token = request.form.get('csrf', '')
+        if not hmac.compare_digest(token, session['website_csrf']):
+            error = 'Please refresh this page and try again.'; status = 400
+        else:
+            address = request.remote_addr or 'unknown'
+            with _SITE_LOGIN_LOCK:
+                now = time.monotonic()
+                for key in list(_SITE_FAILURES):
+                    if now - _SITE_FAILURES[key][1] >= 300: del _SITE_FAILURES[key]
+                count, started = _SITE_FAILURES.get(address, (0, now))
+                if count >= 5:
+                    error = 'Too many attempts. Please try again in five minutes.'; status = 429
+                elif hmac.compare_digest(request.form.get('password', '').encode(), WEBSITE_PASSWORD.encode()):
+                    _SITE_FAILURES.pop(address, None)
+                    session.clear(); session['website_authenticated'] = True; session.permanent = True
+                    return redirect('/')
+                else:
+                    _SITE_FAILURES[address] = (count + 1, started)
+                    error = 'Incorrect password.'; status = 401
+    return render_template_string(_SITE_LOGIN_HTML, error=error, csrf=session['website_csrf']), status
+
+@app.route('/website-logout', methods=['POST'])
+def website_logout():
+    session.clear()
+    return redirect('/website-login')
+
+@app.route('/index.html')
+def website_index_html():
+    return send_from_directory(os.path.dirname(__file__), 'index.html')
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11820,7 +11902,7 @@ def _build_desk_engine_class():
     DEFAULTS = dict(mode='paper', armed=False, live_override=False, capital=25000., risk=1500.,
         daily_loss=7500., max_positions=3, confidence=.58, stop_pct=12.,
         reward_r=1.8, max_spread=1., max_hold=90, square_off='15:15',
-        cooldown=10, slippage_bps=5., fee_per_order=25., partial_take_r=1.)
+        lots=0, cooldown=10, slippage_bps=5., fee_per_order=25., partial_take_r=1.)
     TERMINAL = {'COMPLETE','CANCELLED','REJECTED'}
 
     def stamp(): return datetime.now(IST).isoformat()
@@ -11901,17 +11983,18 @@ def _build_desk_engine_class():
                 cfg=self.config()
                 bounds=dict(capital=(1000,10000000),risk=(100,100000),daily_loss=(100,1000000),max_positions=(1,5),
                   confidence=(.55,.85),stop_pct=(3,40),reward_r=(1,4),max_spread=(.1,3),max_hold=(5,360),
-                  cooldown=(1,120),slippage_bps=(1,100),fee_per_order=(1,500),partial_take_r=(.5,3))
+                  lots=(0,50),cooldown=(0,120),slippage_bps=(1,100),fee_per_order=(1,500),partial_take_r=(.5,3))
                 for k,v in body.items():
                     if k=='square_off':
                         if not isinstance(v,str) or len(v)!=5 or not '10:00'<=v<='15:20':raise ValueError('Square-off must be 10:00–15:20 IST')
                         datetime.strptime(v,'%H:%M');cfg[k]=v
                     elif k in bounds:
                         if isinstance(v,bool):raise ValueError('Invalid '+k)
+                        if k=='cooldown' and (v is None or isinstance(v,str) and v.strip().lower() in ('na','n/a','')):v=0
                         v=float(v);lo,hi=bounds[k]
                         if not math.isfinite(v) or not lo<=v<=hi:raise ValueError(f'{k}: expected {lo} to {hi}')
-                        if k in ('max_positions','max_hold','cooldown') and not v.is_integer():raise ValueError(k+' must be a whole number')
-                        cfg[k]=int(v) if k in ('max_positions','max_hold','cooldown') else v
+                        if k in ('max_positions','max_hold','cooldown','lots') and not v.is_integer():raise ValueError(k+' must be a whole number')
+                        cfg[k]=int(v) if k in ('max_positions','max_hold','cooldown','lots') else v
                     else:raise ValueError('Unsupported setting: '+k)
                 if cfg['partial_take_r']>=cfg['reward_r']:raise ValueError('Partial take-profit must be below the full target in R')
                 if cfg['risk']>cfg['capital']:raise ValueError('Risk budget exceeds capital per trade')
@@ -12023,7 +12106,12 @@ def _build_desk_engine_class():
             if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:s['reason']='Option spread widened';return s
             if s['lot']<=0:s['reason']='Invalid contract lot size';return s
             entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/s['tick'])*s['tick'],2);risk=entry*cfg['stop_pct']/100
-            lots=int(min(cfg['capital']/entry,cfg['risk']/risk,q['ask_qty'])//s['lot']);qty=lots*s['lot']
+            max_lots=max(0,int(min(cfg['capital']/entry,cfg['risk']/risk,q['ask_qty'])//s['lot']))
+            lots=cfg['lots'] or max_lots
+            s.update(requested_lots=cfg['lots'],max_lots=max_lots,lots=lots)
+            if lots>max_lots:
+                s['qty']=0;s['reason']=f'Requested {lots} lots exceed capital, risk or visible depth limit ({max_lots} lots)';return s
+            qty=lots*s['lot']
             s.update(entry=entry,stop=entry-risk,target=entry+risk*cfg['reward_r'],qty=qty)
             if qty<=0:s['reason']='Budget or visible ask depth cannot fund one lot';return s
             s.update(decision='READY',reason=f'{typ} qualifies: direction, quote freshness, spread and size passed')
@@ -12149,7 +12237,7 @@ def _build_desk_engine_class():
             active=self.active()
             if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
             recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
-            if recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
+            if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
             pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
             with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
