@@ -11816,7 +11816,7 @@ def _build_desk_engine_class():
     FEATURES = ['ret_1','ret_3','ret_5','ret_10','ret_20','ema_gap_9_20',
                 'ema_gap_20_50','rsi14','volatility_10','range_20','volume_ratio',
                 'trend_score','momentum_score','time_sin','time_cos']
-    DEFAULTS = dict(mode='paper', armed=False, capital=25000., risk=1500.,
+    DEFAULTS = dict(mode='paper', armed=False, live_override=False, capital=25000., risk=1500.,
         daily_loss=7500., max_positions=3, confidence=.58, stop_pct=12.,
         reward_r=1.8, max_spread=1., max_hold=90, square_off='15:15',
         cooldown=10, slippage_bps=5., fee_per_order=25., partial_take_r=1.)
@@ -12039,18 +12039,6 @@ def _build_desk_engine_class():
             total=0;curve=[]
             for r,v in zip(rows,vals):total+=v;curve.append(dict(ts=r['exit_ts'],pnl=round(total,2)))
             return dict(ready=all(x['ok'] for x in checks),checks=checks,trades=n,net=round(total,2),win_rate=wr,equity=curve)
-        def live_pass(self):
-            """A user-authorised entitlement for live execution.
-
-            This is deliberately separate from the paper-trading evidence: it
-            records an explicit activation, but does not relax operational
-            safeguards such as broker connection, model, risk, or reconciliation
-            checks.
-            """
-            value=self.get('live_pass',{})
-            return value if isinstance(value,dict) else {}
-        def live_eligible(self):
-            return bool(self.evidence()['ready'] or self.live_pass().get('active'))
         def block(self):
             cfg=self.config()
             if not self.a.connected():return 'Connect Kite to receive market data'
@@ -12061,7 +12049,7 @@ def _build_desk_engine_class():
             if any(p['qty']>0 and self.health.get(p['id'],{}).get('bid') is None for p in self.active()):return 'Position quote unavailable · new entries paused'
             if datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:return 'Square-off window · no new entries'
             if self.train_lock.locked():return 'Model training · new entries paused'
-            if cfg['mode']=='live' and not self.live_eligible():return 'Live locked · activate a Live Trading Pass or build the forward paper record'
+            if cfg['mode']=='live' and not (cfg.get('live_override') is True or self.evidence()['ready']):return 'Live locked · build the forward paper record'
             if self.get('close_requested'):return 'Close requested · waiting for all exits'
             if self.day_pnl(cfg['mode'])<=-cfg['daily_loss']:return 'Daily loss limit reached'
             return None
@@ -12245,25 +12233,24 @@ def _build_desk_engine_class():
         def control(self,action,body):
             with self.lock:
                 cfg=self.config()
-                if action=='mode':
+                if action=='live-override':
+                    enabled=body.get('enabled')
+                    if not isinstance(enabled,bool):raise ValueError('Override enabled must be true or false')
+                    if enabled and body.get('ack') is not True:raise ValueError('Manual live override requires explicit acknowledgement')
+                    cfg.update(live_override=enabled,armed=False)
+                    self.event('LIVE_OVERRIDE','Enabled' if enabled else 'Disabled')
+                elif action=='mode':
                     if body.get('mode') not in ('paper','live'):raise ValueError('Invalid execution mode')
                     if self.active():raise ValueError('Close active positions before switching execution mode')
-                    if body['mode']=='live' and (not self.live_eligible() or body.get('ack') is not True):raise ValueError('Live requires an active Live Trading Pass or qualifying paper evidence, plus explicit acknowledgement')
+                    if body['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live requires paper evidence or manual override, and explicit acknowledgement')
                     cfg.update(mode=body['mode'],armed=False)
                 elif action=='arm':
                     if not self.a.connected():raise ValueError('Connect Kite first')
                     if self.get('halt'):raise ValueError(self.get('halt'))
                     if not self.model():raise ValueError('Train a model first')
-                    if cfg['mode']=='live' and (not self.live_eligible() or body.get('ack') is not True):raise ValueError('Live pass/evidence or acknowledgement missing')
+                    if cfg['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live evidence or manual override / acknowledgement missing')
                     if self.a.legacy_open():raise ValueError('Legacy positions must be reconciled and closed first')
                     cfg['armed']=True
-                elif action=='activate-live-pass':
-                    if body.get('ack') is not True:raise ValueError('Explicit risk acknowledgement is required to activate the Live Trading Pass')
-                    if self.active():raise ValueError('Close active positions before activating the Live Trading Pass')
-                    live_pass=dict(active=True,activated_at=stamp(),acknowledged=True)
-                    self.put('live_pass',live_pass)
-                    self.event('LIVE_PASS','Live Trading Pass activated by user acknowledgement')
-                    return dict(config=cfg,live_pass=live_pass)
                 elif action=='disarm':cfg['armed']=False
                 elif action=='close':
                     cfg['armed']=False;self.put('close_requested',True)
@@ -12292,10 +12279,8 @@ def _build_desk_engine_class():
             if model:model={k:v for k,v in model.items() if k not in ('mu','sd','w','bias')}
             online=self.get('online_model');online={k:online[k] for k in ('samples','accuracy','auc','ts')} if online else None
             trades=self.rows("SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100")
-            live_pass=self.live_pass()
             return dict(version='2.0',timestamp=stamp(),connected=self.a.connected(),market_open=self.a.market_open(),config=cfg,
                 block=self.block(),last_cycle=self.last_cycle,training=self.training,model=model,online=online,evidence=evidence,
-                live_pass=live_pass,live_eligible=self.live_eligible(),
                 observations=obs,signals=signals,positions=active,trades=trades,
                 orders=self.rows('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60'),
                 events=self.rows('SELECT * FROM desk_events ORDER BY id DESC LIMIT 70'),
