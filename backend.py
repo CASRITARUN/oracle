@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_from_directory, redirect, session, render_template_string
 import secrets
 import hmac
+import sqlite3
 
 try:
     from kiteconnect import KiteConnect
@@ -497,6 +498,21 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8), MAX_CONTENT_LENGTH=2 * 1024 * 1024)
 _SITE_FAILURES = {}
 _SITE_LOGIN_LOCK = threading.Lock()
+# A durable, shared session generation revokes signed cookies on every device.
+# Keep this file across deployments; it contains no password or trading data.
+_SITE_AUTH_DB = os.environ.get('WEBSITE_AUTH_DB') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'website_auth.sqlite3')
+
+def _site_generation(revoke=False):
+    from contextlib import closing
+    with closing(sqlite3.connect(_SITE_AUTH_DB, timeout=10)) as connection:
+        with connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS website_auth (id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL)')
+            connection.execute('INSERT OR IGNORE INTO website_auth VALUES(1, ?)', (secrets.token_hex(32),))
+            if revoke:
+                connection.execute('UPDATE website_auth SET generation=? WHERE id=1', (secrets.token_hex(32),))
+            return connection.execute('SELECT generation FROM website_auth WHERE id=1').fetchone()[0]
+
 _SITE_LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Website sign in</title>
 <style>body{margin:0;background:#0b1220;color:#edf3fa;font:16px system-ui;display:grid;place-items:center;min-height:100vh}
@@ -509,7 +525,8 @@ button{background:#b1ef65;color:#142009;cursor:pointer;font-weight:700}.error{co
 <button type="submit">Enter website</button></form><p class="error" role="alert">{{ error }}</p></main></body></html>"""
 
 def _site_authenticated():
-    return bool(WEBSITE_PASSWORD and session.get('website_authenticated'))
+    return bool(WEBSITE_PASSWORD and session.get('website_authenticated') and
+                session.get('website_generation') == _site_generation())
 
 @app.before_request
 def require_website_password():
@@ -551,6 +568,8 @@ def website_login():
                 elif hmac.compare_digest(request.form.get('password', '').encode(), WEBSITE_PASSWORD.encode()):
                     _SITE_FAILURES.pop(address, None)
                     session.clear(); session['website_authenticated'] = True; session.permanent = True
+                    session['website_generation'] = _site_generation()
+                    session['website_csrf'] = secrets.token_urlsafe(32)
                     return redirect('/')
                 else:
                     _SITE_FAILURES[address] = (count + 1, started)
@@ -559,8 +578,19 @@ def website_login():
 
 @app.route('/website-logout', methods=['POST'])
 def website_logout():
+    token = request.headers.get('X-Website-CSRF', '') or request.form.get('csrf', '')
+    if not token or not hmac.compare_digest(token, session.get('website_csrf', '')):
+        return jsonify(error='Refresh the website before locking all devices.'), 403
+    # Revoke first; never report a successful global lock unless it was committed.
+    _site_generation(revoke=True)
     session.clear()
+    if request.headers.get('X-Website-CSRF'):
+        return jsonify(locked=True)
     return redirect('/website-login')
+
+@app.route('/api/website-status')
+def website_status():
+    return jsonify(authenticated=True, csrf=session['website_csrf'])
 
 @app.route('/index.html')
 def website_index_html():
