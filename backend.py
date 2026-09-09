@@ -2456,12 +2456,12 @@ def get_chain_for_symbol(symbol, expiry_str=None):
     T = max((expiry - today).days, 0) / 365.0
     chain = [o for o in opts if o["expiry"] == expiry]
     lot_size = chain[0]["lot_size"]
-    inst_keys = [f"NFO:{o['tradingsymbol']}" for o in chain]
+    inst_keys = [f"{exchange}:{o['tradingsymbol']}" for o in chain]
     quotes = kite_quote_bulk(inst_keys)
 
     enriched = []
     for o in chain:
-        key = f"NFO:{o['tradingsymbol']}"
+        key = f"{exchange}:{o['tradingsymbol']}"
         q = quotes.get(key)
         st = quote_stats(q)
         ltp = st["mid"] if st["mid"] is not None else extract_price(q)
@@ -7233,7 +7233,7 @@ from statistics import mean
 # so the revised collector starts with a clean database and ignores the old archive.
 AI_DB_FILE = os.path.join(os.path.dirname(__file__), "ai_evolution_fresh.db")
 AI_POLL_SECONDS = int(os.environ.get("AI_POLL_SECONDS", "60"))
-AI_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+AI_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
 # Autonomous universe: indices + every currently listed NSE F&O stock.  The engine
 # rotates through this universe in small chunks so it can run continuously without
 # bursting Kite rate limits.  Set AI_UNIVERSE_MODE=INDEX_ONLY to restrict it.
@@ -7244,7 +7244,7 @@ AI_LOCK = threading.Lock()
 # Historical index pre-training: builds market-behaviour data before option-specific
 # paper trades have accumulated. This never places orders and is independent of the
 # existing Iron Condor / Calendar / Breakout engines.
-AI_HIST_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+AI_HIST_SYMBOLS = list(AI_SYMBOLS)
 AI_HIST_INTERVAL = os.environ.get("AI_HIST_INTERVAL", "5minute")
 # Research target is intentionally larger than the usual recent-history window.
 # Kite's actual earliest available 5-minute candle is the hard boundary; the collector
@@ -8480,7 +8480,8 @@ def ai_close_trades():
     if not require_session():return
     for t in ai_open_trades():
         try:
-            q=kite_quote_bulk([f'NFO:{t["option_symbol"]}']).get(f'NFO:{t["option_symbol"]}')
+            key = f'{option_exchange_for_symbol(t["symbol"])}:{t["option_symbol"]}'
+            q = kite_quote_bulk([key]).get(key)
             st=quote_stats(q)
             # Closing side must also be executable: LONG closes at bid, SHORT closes at ask.
             close_side="BID" if t["side"]=="LONG" else "ASK"
@@ -9339,10 +9340,10 @@ def ai_loop():
 @app.route('/api/ai-evolution/directional-latest')
 def ai_directional_latest():
     """Return the latest directional AI decision for each index.
-    The dashboard uses this endpoint for the three live decision cards.
+    The dashboard uses this endpoint for the live decision cards for every configured index.
     """
     ai_init_db()
-    symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    symbols = list(AI_SYMBOLS)
     latest = {}
     c = ai_db()
     rows = c.execute(
@@ -9389,7 +9390,7 @@ def ai_directional_latest():
             "paper_only": True
         }
 
-    # Always return all three cards, even before the first qualifying decision.
+    # Always return all configured index cards, even before the first qualifying decision.
     result = []
     for sym in symbols:
         result.append(latest.get(sym, {
@@ -9599,14 +9600,14 @@ def ai_option_capture_api():
 # =============================================================================
 
 AUTOTRADE_AI_POLL_SECONDS = int(os.environ.get("AUTOTRADE_AI_POLL_SECONDS", "20"))
-AUTOTRADE_AI_SYMBOLS = list(AI_HIST_SYMBOLS)  # NIFTY, BANKNIFTY, FINNIFTY
+AUTOTRADE_AI_SYMBOLS = list(AI_HIST_SYMBOLS)  # NIFTY, BANKNIFTY, FINNIFTY, SENSEX
 
 AUTOTRADE_AI_DEFAULTS = {
     "execution_mode": "paper",           # "paper" (default, always available) | "live"
     "armed": False,                      # master on/off switch for NEW automatic entries
     "capital_per_trade_live": 25000.0,   # rupees earmarked per LIVE entry
     "capital_per_trade_paper": 25000.0,  # rupees used to size PAPER quantity (for realistic P&L)
-    "max_concurrent_positions": 3,       # across NIFTY/BANKNIFTY/FINNIFTY combined
+    "max_concurrent_positions": 3,       # across all configured AI indices combined
     "max_daily_loss_paper": 15000.0,     # paper circuit breaker (rupees)
     "max_daily_loss_live": 7500.0,       # live circuit breaker (rupees) -- deliberately tighter
     "max_hold_minutes": 180,             # force flatten a stale position even if flat
@@ -12292,7 +12293,7 @@ DeskEngine = _build_desk_engine_class()
 
 
 class DeskAdapter:
-    symbols = ("NIFTY", "BANKNIFTY", "FINNIFTY")
+    symbols = tuple(AI_SYMBOLS)
     @contextmanager
     def db(self):
         c=ai_db()
