@@ -594,7 +594,10 @@ def website_status():
 
 @app.route('/index.html')
 def website_index_html():
-    return send_from_directory(os.path.dirname(__file__), 'index.html')
+    frontend = os.environ.get('DASHBOARD_FRONTEND_FILE', 'index_CAS.html')
+    if not os.path.exists(os.path.join(os.path.dirname(__file__), frontend)):
+        frontend = 'index.html'
+    return send_from_directory(os.path.dirname(__file__), frontend)
 
 
 logging.basicConfig(
@@ -11894,7 +11897,10 @@ def move_close_confirm(pos_id):
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return send_from_directory(os.path.dirname(__file__), "index.html")
+    frontend = os.environ.get("DASHBOARD_FRONTEND_FILE", "index_CAS.html")
+    if not os.path.exists(os.path.join(os.path.dirname(__file__), frontend)):
+        frontend = "index.html"
+    return send_from_directory(os.path.dirname(__file__), frontend)
 
 
 
@@ -12728,6 +12734,1101 @@ def stock_ai_control(action):
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
+
+# ============================================================================
+# CAS REACTION AI — Closing Auction Session index-reaction scanner
+# ============================================================================
+# NSE CAS is a CASH-market call auction. This module does not submit cash CAS
+# orders and does not claim index options themselves are in the auction. It
+# watches the live reaction of NIFTY/BANKNIFTY/FINNIFTY/SENSEX while eligible
+# cash constituents transition through CAS, then uses the still-open index F&O
+# market as the execution instrument.
+#
+# Safety model for this module:
+#   * PAPER_AUTO: signals, entries and exits are simulated automatically.
+#   * LIVE_ASSIST: the scanner can generate a pending BUY/SELL recommendation,
+#     but EACH real order requires a fresh explicit confirmation request from
+#     the UI. There is intentionally no unattended live execution path here.
+# ============================================================================
+CAS_STATE_FILE = os.path.join(os.path.dirname(__file__), "cas_reaction_state.json")
+CAS_TRADES_FILE = os.path.join(os.path.dirname(__file__), "cas_reaction_trades.json")
+_CAS_LOCK = threading.RLock()
+_CAS_SAMPLES = {s: [] for s in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX")}
+_CAS_SIGNALS = {}
+_CAS_AI_CONTEXT = {}
+_CAS_LAST_SIGNAL_AT = {}
+_CAS_WORKER_STARTED = False
+_CAS_CONSTITUENT_SAMPLES = {}
+_CAS_FUTURE_SAMPLES = {s: [] for s in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX")}
+_CAS_BASIS_SAMPLES = {s: [] for s in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX")}
+_CAS_OPTION_SAMPLES = {s: {"CE": [], "PE": []} for s in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX")}
+_CAS_MICRO = {}
+_CAS_SAMPLE_DAY = None
+
+# High-impact constituent baskets used to aggregate the cash-auction fields exposed by Kite during CAS.
+# `weight` is an importance hint, NOT a claim of the exchange's current official index weight. The values
+# are normalized inside the engine; update them as index composition changes. SENSEX uses BSE quotes,
+# while the NSE indices use NSE cash quotes.
+CAS_CONSTITUENT_BASKETS = {
+    "NIFTY": [
+        ("NSE","HDFCBANK",11.0),("NSE","RELIANCE",9.0),("NSE","ICICIBANK",8.0),("NSE","BHARTIARTL",5.0),
+        ("NSE","INFY",5.0),("NSE","LT",4.0),("NSE","ITC",4.0),("NSE","TCS",4.0),
+        ("NSE","SBIN",3.5),("NSE","AXISBANK",3.0),("NSE","M&M",3.0),("NSE","KOTAKBANK",2.8),
+    ],
+    "BANKNIFTY": [
+        ("NSE","HDFCBANK",28.0),("NSE","ICICIBANK",23.0),("NSE","SBIN",11.0),("NSE","AXISBANK",10.0),
+        ("NSE","KOTAKBANK",9.0),("NSE","INDUSINDBK",5.0),("NSE","BANKBARODA",4.0),("NSE","FEDERALBNK",3.0),
+        ("NSE","AUBANK",2.5),("NSE","PNB",2.5),
+    ],
+    "FINNIFTY": [
+        ("NSE","HDFCBANK",20.0),("NSE","ICICIBANK",16.0),("NSE","BAJFINANCE",8.0),("NSE","SBIN",7.0),
+        ("NSE","AXISBANK",7.0),("NSE","KOTAKBANK",6.0),("NSE","BAJAJFINSV",5.0),("NSE","HDFCLIFE",4.0),
+        ("NSE","SBILIFE",4.0),("NSE","ICICIGI",3.5),("NSE","SHRIRAMFIN",3.5),("NSE","PFC",2.5),
+    ],
+    "SENSEX": [
+        ("BSE","HDFCBANK",13.0),("BSE","RELIANCE",11.0),("BSE","ICICIBANK",9.0),("BSE","BHARTIARTL",7.0),
+        ("BSE","INFY",6.0),("BSE","LT",5.0),("BSE","ITC",5.0),("BSE","TCS",5.0),
+        ("BSE","SBIN",4.0),("BSE","AXISBANK",3.5),("BSE","BAJFINANCE",3.0),("BSE","M&M",3.0),
+        ("BSE","KOTAKBANK",3.0),("BSE","MARUTI",2.5),
+    ],
+}
+
+CAS_DEFAULTS = {
+    "armed": False,                       # controls ENTRIES only; data collection is automatic
+    "execution_mode": "paper_auto",       # paper_auto | live_assist
+    "symbols": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"],
+    "poll_seconds": 3.0,
+    "auto_collect": True,                 # collector starts automatically when Kite is authenticated
+    "collection_start": "15:05",          # pre-CAS warm-up/baseline begins automatically
+    "entry_start": "15:27",
+    "entry_end": "15:35",
+    "square_off_time": "15:39",
+    "min_5s_bps": 5.0,
+    "min_20s_bps": 10.0,
+    "min_reference_bps": 15.0,
+    "min_score": 70.0,
+    # Imbalance Intelligence gates. A trade needs at least this many independent confirmations
+    # among cash-auction imbalance, index futures, option-premium pressure and learned AI direction.
+    "min_confirmations": 2,
+    "min_constituent_coverage": 0.50,
+    "min_breadth_pct": 60.0,
+    "min_weighted_iep_bps": 2.0,
+    "min_direct_imbalance_pct": 3.0,
+    "min_futures_bps": 3.0,
+    "min_option_pressure_bps": 20.0,
+    "capital_per_trade": 25000.0,
+    "max_concurrent_positions": 1,
+    "max_trades_per_day": 2,
+    "max_daily_loss_paper": 5000.0,
+    "cooldown_seconds": 60,
+    "max_spread_pct": 5.0,
+    "min_option_volume": 10,
+    "min_option_oi": 50,
+    "stop_pct": 18.0,
+    "target_pct": 30.0,
+    "trailing_pct": 12.0,
+    "max_hold_seconds": 360,
+    "live_signal_ttl_seconds": 20,
+}
+
+CAS_CONFIGURABLE_KEYS = (
+    "execution_mode", "symbols", "collection_start", "entry_start", "entry_end", "square_off_time",
+    "min_5s_bps", "min_20s_bps", "min_reference_bps", "min_score",
+    "min_confirmations", "min_constituent_coverage", "min_breadth_pct", "min_weighted_iep_bps",
+    "min_direct_imbalance_pct", "min_futures_bps", "min_option_pressure_bps",
+    "capital_per_trade", "max_concurrent_positions", "max_trades_per_day",
+    "max_daily_loss_paper", "cooldown_seconds", "max_spread_pct",
+    "min_option_volume", "min_option_oi", "stop_pct", "target_pct",
+    "trailing_pct", "max_hold_seconds", "live_signal_ttl_seconds",
+)
+
+
+def _cas_json_load(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value
+    except Exception:
+        return default
+
+
+def _cas_json_save(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+def cas_load_state():
+    with _CAS_LOCK:
+        raw = _cas_json_load(CAS_STATE_FILE, {})
+        cfg = dict(CAS_DEFAULTS)
+        cfg.update(raw.get("config") or {})
+        state = {
+            "config": cfg,
+            "pending_entry": raw.get("pending_entry"),
+            "last_error": raw.get("last_error"),
+        }
+        return state
+
+
+def cas_save_state(state):
+    with _CAS_LOCK:
+        _cas_json_save(CAS_STATE_FILE, state)
+
+
+def cas_load_trades():
+    with _CAS_LOCK:
+        rows = _cas_json_load(CAS_TRADES_FILE, [])
+        return rows if isinstance(rows, list) else []
+
+
+def cas_save_trades(rows):
+    with _CAS_LOCK:
+        _cas_json_save(CAS_TRADES_FILE, rows)
+
+
+def _cas_time(s):
+    return datetime.strptime(str(s), "%H:%M").time()
+
+
+def cas_phase(now=None):
+    n = now or now_ist()
+    if n.weekday() >= 5:
+        return "CLOSED"
+    t = n.time()
+    cfg = cas_load_state().get("config", {})
+    collection_start = _cas_time(cfg.get("collection_start", "15:05"))
+    if t < collection_start:
+        return "WAITING"
+    if t < _cas_time("15:15"):
+        return "PRE_CAS_WARMUP"
+    if t < _cas_time("15:20"):
+        return "REFERENCE"
+    if t < _cas_time("15:25"):
+        return "ORDER_ENTRY"
+    if t < _cas_time("15:30"):
+        return "LIMIT_ONLY_RANDOM_CLOSE"
+    if t < _cas_time("15:35"):
+        return "MATCHING"
+    if t < _cas_time("15:40"):
+        return "FNO_EXIT_WINDOW"
+    return "CLOSED"
+
+
+def cas_session_active(now=None):
+    return cas_phase(now) not in ("WAITING", "CLOSED")
+
+
+def cas_collection_active(cfg=None, now=None):
+    """Automatic data collection window. This is deliberately independent of `armed`:
+    disarming CAS prevents new entries but never stops the pre-CAS/CAS data recorder."""
+    n = now or now_ist()
+    if n.weekday() >= 5:
+        return False
+    cfg = cfg or cas_load_state().get("config", {})
+    if cfg.get("auto_collect", True) is not True:
+        return False
+    try:
+        start = _cas_time(cfg.get("collection_start", "15:05"))
+        end = _cas_time("15:40")
+    except Exception:
+        start, end = _cas_time("15:05"), _cas_time("15:40")
+    return start <= n.time() < end
+
+
+def _cas_entry_window(cfg, now=None):
+    n = now or now_ist()
+    return n.weekday() < 5 and _cas_time(cfg.get("entry_start", "15:27")) <= n.time() < _cas_time(cfg.get("entry_end", "15:35"))
+
+
+def _cas_today_rows(rows, status=None):
+    day = now_ist().strftime("%Y-%m-%d")
+    out = [r for r in rows if str(r.get("opened_at") or "").startswith(day)]
+    if status:
+        out = [r for r in out if r.get("status") == status]
+    return out
+
+
+def _cas_today_realized(rows, mode=None):
+    day = now_ist().strftime("%Y-%m-%d")
+    total = 0.0
+    for r in rows:
+        if r.get("status") != "CLOSED" or not str(r.get("closed_at") or "").startswith(day):
+            continue
+        if mode and r.get("execution_mode") != mode:
+            continue
+        total += float(r.get("realized_pnl") or 0.0)
+    return round(total, 2)
+
+
+def _cas_trim_samples(symbol, now_ts):
+    rows = _CAS_SAMPLES.setdefault(symbol, [])
+    # Retain the whole pre-CAS + CAS window so the 15:13-15:15 baseline is
+    # still available during the 15:27-15:35 entry window.
+    cutoff = now_ts - 2700.0
+    rows[:] = [x for x in rows if x[0] >= cutoff]
+    return rows
+
+
+def _cas_sample_at_age(rows, now_ts, age_seconds):
+    target = now_ts - float(age_seconds)
+    older = [x for x in rows if x[0] <= target]
+    if not older:
+        return None
+    return min(older, key=lambda x: abs(x[0] - target))[1]
+
+
+def _cas_reference(rows):
+    # Prefer the last ~2 minutes of normal continuous trading before 15:15.
+    # Because the collector now starts automatically at 15:05, the CAS tab
+    # does not need to be open to build this baseline.
+    pre = []
+    official = []
+    for ts, px, iso in rows:
+        try:
+            t = datetime.fromisoformat(iso).time()
+            if _cas_time("15:13") <= t < _cas_time("15:15"):
+                pre.append(float(px))
+            if _cas_time("15:15") <= t < _cas_time("15:20"):
+                official.append(float(px))
+        except Exception:
+            pass
+    if pre:
+        return sum(pre) / len(pre), "auto pre-CAS baseline (15:13-15:15 mean)"
+    if official:
+        return sum(official) / len(official), "15:15-15:20 sample mean (late-start fallback)"
+    return (float(rows[0][1]), "oldest local sample (late-start fallback)") if rows else (None, "not available")
+
+
+def _cas_bps(current, past):
+    if current is None or past in (None, 0):
+        return None
+    return (float(current) / float(past) - 1.0) * 10000.0
+
+
+def _cas_series_append(store, key, now_epoch, value, now_iso, keep_seconds=600.0):
+    if value is None:
+        return
+    try:
+        value = float(value)
+    except Exception:
+        return
+    if not math.isfinite(value) or value <= 0:
+        return
+    rows = store.setdefault(key, [])
+    cutoff = now_epoch - keep_seconds
+    rows[:] = [r for r in rows if r[0] >= cutoff]
+    rows.append((now_epoch, value, now_iso))
+
+
+def _cas_field(q, *names):
+    """Read newly-added CAS fields defensively across Kite SDK/API naming revisions."""
+    if not q:
+        return None
+    for name in names:
+        v = q.get(name)
+        if v is not None:
+            try:
+                f = float(v)
+                if math.isfinite(f):
+                    return f
+            except Exception:
+                pass
+    return None
+
+
+def _cas_direction_sign(direction):
+    return 1.0 if direction == "UP" else (-1.0 if direction == "DOWN" else 0.0)
+
+
+def _cas_future_contract(symbol):
+    """Nearest listed index future. Returns a quote key or None if the broker instrument dump has no future."""
+    ex = option_exchange_for_symbol(symbol)
+    try:
+        instruments = get_bfo_instruments() if ex == "BFO" else get_instruments()[0]
+    except Exception:
+        return None
+    today = now_ist().date()
+    rows = []
+    for i in instruments:
+        if str(i.get("name") or "").upper() != symbol.upper():
+            continue
+        seg = str(i.get("segment") or "").upper()
+        typ = str(i.get("instrument_type") or "").upper()
+        if typ != "FUT" and not seg.endswith("-FUT"):
+            continue
+        exp = i.get("expiry")
+        if exp and exp >= today:
+            rows.append(i)
+    if not rows:
+        return None
+    rows.sort(key=lambda x: x.get("expiry"))
+    i = rows[0]
+    return {"exchange": ex, "tradingsymbol": i.get("tradingsymbol"), "expiry": str(i.get("expiry")),
+            "key": f"{ex}:{i.get('tradingsymbol')}"}
+
+
+def _cas_atm_pair(symbol, spot):
+    """Nearest-expiry CE+PE at the closest common strike, used only as a pressure sensor."""
+    try:
+        ex, opts = get_option_instruments_for_symbol(symbol)
+    except Exception:
+        return None
+    today = now_ist().date()
+    expiries = sorted({o.get("expiry") for o in opts if o.get("expiry") and o.get("expiry") >= today})
+    if not expiries:
+        return None
+    exp = expiries[0]
+    chain = [o for o in opts if o.get("expiry") == exp]
+    ce_by = {float(o.get("strike") or 0): o for o in chain if o.get("instrument_type") == "CE"}
+    pe_by = {float(o.get("strike") or 0): o for o in chain if o.get("instrument_type") == "PE"}
+    common = [k for k in ce_by if k in pe_by and k > 0]
+    if not common:
+        return None
+    strike = min(common, key=lambda k: abs(k-float(spot)))
+    ce, pe = ce_by[strike], pe_by[strike]
+    return {"exchange": ex, "expiry": str(exp), "strike": strike,
+            "CE": ce.get("tradingsymbol"), "PE": pe.get("tradingsymbol"),
+            "ce_key": f"{ex}:{ce.get('tradingsymbol')}", "pe_key": f"{ex}:{pe.get('tradingsymbol')}"}
+
+
+def _cas_normalized_basket(symbol):
+    rows = list(CAS_CONSTITUENT_BASKETS.get(symbol, []))
+    total = sum(max(0.0, float(x[2])) for x in rows) or 1.0
+    return [(ex, ts, max(0.0, float(w))/total) for ex, ts, w in rows]
+
+
+def _cas_collect_microstructure(symbols, spot_map, cfg, now_epoch, now_iso):
+    """Collect the *underlying* CAS fields plus futures and ATM-option pressure in one bulk quote call.
+
+    During CAS, recent Kite Quote API builds expose indicative_close_price, reference_limit_price,
+    cumulative buy_quantity/sell_quantity and total_imbalance for eligible cash stocks. We consume
+    those fields directly when present. If a particular field is absent, 20-second constituent LTP
+    pressure remains as an explicitly-labelled fallback, not as fake order-book data.
+    """
+    basket_keys = []
+    futures = {}
+    pairs = {}
+    for symbol in symbols:
+        for ex, ts, _ in _cas_normalized_basket(symbol):
+            basket_keys.append(f"{ex}:{ts}")
+        fut = _cas_future_contract(symbol)
+        if fut:
+            futures[symbol] = fut; basket_keys.append(fut["key"])
+        if spot_map.get(symbol):
+            pair = _cas_atm_pair(symbol, spot_map[symbol])
+            if pair:
+                pairs[symbol] = pair; basket_keys += [pair["ce_key"], pair["pe_key"]]
+    quotes = kite_quote_bulk(list(dict.fromkeys(basket_keys)), chunk_size=500, retries=1, force_refresh=True) if basket_keys else {}
+
+    for symbol in symbols:
+        spot = spot_map.get(symbol)
+        basket = _cas_normalized_basket(symbol)
+        components = []
+        for ex, ts, weight in basket:
+            key = f"{ex}:{ts}"; q = quotes.get(key) or {}
+            ltp = q.get("last_price")
+            if ltp is not None and float(ltp or 0) > 0:
+                _cas_series_append(_CAS_CONSTITUENT_SAMPLES, key, now_epoch, ltp, now_iso)
+            old = _cas_sample_at_age(_CAS_CONSTITUENT_SAMPLES.get(key, []), now_epoch, 20)
+            ltp_bps20 = _cas_bps(ltp, old) if ltp and old else None
+            buyq = _cas_field(q, "buy_quantity", "total_buy_quantity")
+            sellq = _cas_field(q, "sell_quantity", "total_sell_quantity")
+            imbalance_qty = _cas_field(q, "total_imbalance", "total_imbalance_qty", "imbalance_quantity")
+            ref = _cas_field(q, "reference_limit_price", "reference_price")
+            iep = _cas_field(q, "indicative_close_price", "indicative_equilibrium_price", "iep")
+            # Guard against transient/malformed IEP values. A valid CAS IEP should be near its reference price.
+            if iep is not None and ref and not (0.90*ref <= iep <= 1.10*ref):
+                iep = None
+            iep_bps = _cas_bps(iep, ref) if iep and ref else None
+            denom = (buyq or 0.0) + (sellq or 0.0)
+            imbalance_pct = ((buyq or 0.0) - (sellq or 0.0)) / denom * 100.0 if denom > 0 else None
+            components.append({"symbol": ts, "exchange": ex, "weight": weight, "ltp": ltp,
+                               "ltp_bps_20s": ltp_bps20, "buy_quantity": buyq, "sell_quantity": sellq,
+                               "imbalance_qty": imbalance_qty, "imbalance_pct": imbalance_pct,
+                               "reference_price": ref, "indicative_price": iep, "iep_bps": iep_bps})
+
+        iep_rows = [x for x in components if x["iep_bps"] is not None]
+        imb_rows = [x for x in components if x["imbalance_pct"] is not None]
+        direct_rows = [x for x in components if x["iep_bps"] is not None or x["imbalance_pct"] is not None]
+        proxy_rows = [x for x in components if x["ltp_bps_20s"] is not None]
+        iep_weight = sum(x["weight"] for x in iep_rows)
+        imb_weight = sum(x["weight"] for x in imb_rows)
+        direct_weight = sum(x["weight"] for x in direct_rows)
+        proxy_weight = sum(x["weight"] for x in proxy_rows)
+        weighted_iep = sum(x["weight"]*float(x["iep_bps"]) for x in iep_rows) / iep_weight if iep_weight else None
+        weighted_imb = sum(x["weight"]*float(x["imbalance_pct"]) for x in imb_rows) / imb_weight if imb_weight else None
+        weighted_proxy = sum(x["weight"]*float(x["ltp_bps_20s"]) for x in proxy_rows) / proxy_weight if proxy_weight else None
+
+        # Raw breadth is stored both ways; the scorer picks the relevant side for the candidate direction.
+        def pct_positive(field, rows):
+            vals=[float(x[field]) for x in rows if x.get(field) is not None]
+            return (100.0*sum(v>0 for v in vals)/len(vals)) if vals else None
+        iep_up = pct_positive("iep_bps", direct_rows)
+        imb_up = pct_positive("imbalance_pct", direct_rows)
+        proxy_up = pct_positive("ltp_bps_20s", proxy_rows)
+        contrib_source = "iep_bps" if direct_rows else "ltp_bps_20s"
+        contrib_rows = direct_rows if direct_rows else proxy_rows
+        top = sorted([{"symbol":x["symbol"],"contribution_bps":round(x["weight"]*float(x.get(contrib_source) or 0),2)}
+                      for x in contrib_rows], key=lambda x: abs(x["contribution_bps"]), reverse=True)[:4]
+
+        fut = futures.get(symbol); fut_bps20=None; basis=None; basis_change=None; fut_px=None
+        if fut:
+            fq = quotes.get(fut["key"]) or {}; fut_px = fq.get("last_price")
+            if fut_px and float(fut_px)>0:
+                _cas_series_append(_CAS_FUTURE_SAMPLES, symbol, now_epoch, fut_px, now_iso)
+                fp20=_cas_sample_at_age(_CAS_FUTURE_SAMPLES.get(symbol,[]),now_epoch,20)
+                fut_bps20=_cas_bps(fut_px,fp20) if fp20 else None
+                if spot and float(spot)>0:
+                    basis=_cas_bps(fut_px,spot)
+                    _cas_series_append(_CAS_BASIS_SAMPLES,symbol,now_epoch,basis+100000.0,now_iso)  # shift keeps generic series >0
+                    bp20=_cas_sample_at_age(_CAS_BASIS_SAMPLES.get(symbol,[]),now_epoch,20)
+                    basis_change=(basis-(bp20-100000.0)) if bp20 is not None else None
+
+        pair=pairs.get(symbol); ce_bps=None; pe_bps=None; option_pressure=None; option_spread=None
+        if pair:
+            cs=quote_stats(quotes.get(pair["ce_key"])); ps=quote_stats(quotes.get(pair["pe_key"]))
+            ce_mid=cs.get("mid"); pe_mid=ps.get("mid")
+            if ce_mid and float(ce_mid)>0:
+                _cas_series_append(_CAS_OPTION_SAMPLES[symbol],"CE",now_epoch,ce_mid,now_iso)
+                old=_cas_sample_at_age(_CAS_OPTION_SAMPLES[symbol]["CE"],now_epoch,20); ce_bps=_cas_bps(ce_mid,old) if old else None
+            if pe_mid and float(pe_mid)>0:
+                _cas_series_append(_CAS_OPTION_SAMPLES[symbol],"PE",now_epoch,pe_mid,now_iso)
+                old=_cas_sample_at_age(_CAS_OPTION_SAMPLES[symbol]["PE"],now_epoch,20); pe_bps=_cas_bps(pe_mid,old) if old else None
+            if ce_bps is not None and pe_bps is not None:
+                option_pressure=ce_bps-pe_bps
+            spreads=[x for x in (cs.get("spread_pct"),ps.get("spread_pct")) if x is not None]
+            option_spread=sum(spreads)/len(spreads) if spreads else None
+
+        _CAS_MICRO[symbol]={
+            "data_mode":"DIRECT_CAS" if direct_weight >= float(cfg.get("min_constituent_coverage",.5)) else "PROXY_FALLBACK",
+            "direct_coverage":round(direct_weight,3), "iep_coverage":round(iep_weight,3),
+            "imbalance_coverage":round(imb_weight,3), "proxy_coverage":round(proxy_weight,3),
+            "weighted_iep_bps":round(weighted_iep,2) if weighted_iep is not None else None,
+            "weighted_imbalance_pct":round(weighted_imb,2) if weighted_imb is not None else None,
+            "weighted_ltp_bps_20s":round(weighted_proxy,2) if weighted_proxy is not None else None,
+            "iep_up_breadth_pct":round(iep_up,1) if iep_up is not None else None,
+            "imbalance_up_breadth_pct":round(imb_up,1) if imb_up is not None else None,
+            "proxy_up_breadth_pct":round(proxy_up,1) if proxy_up is not None else None,
+            "top_contributors":top, "constituents":components,
+            "future_symbol":fut.get("tradingsymbol") if fut else None,
+            "future_expiry":fut.get("expiry") if fut else None,
+            "future_price":round(float(fut_px),2) if fut_px else None,
+            "future_bps_20s":round(fut_bps20,2) if fut_bps20 is not None else None,
+            "basis_bps":round(basis,2) if basis is not None else None,
+            "basis_change_bps_20s":round(basis_change,2) if basis_change is not None else None,
+            "atm_strike":pair.get("strike") if pair else None, "option_expiry":pair.get("expiry") if pair else None,
+            "ce_bps_20s":round(ce_bps,2) if ce_bps is not None else None,
+            "pe_bps_20s":round(pe_bps,2) if pe_bps is not None else None,
+            "option_pressure_bps":round(option_pressure,2) if option_pressure is not None else None,
+            "option_avg_spread_pct":round(option_spread,2) if option_spread is not None else None,
+        }
+
+
+def _cas_directional_micro_score(symbol, direction, cfg):
+    m=dict(_CAS_MICRO.get(symbol) or {}); sign=_cas_direction_sign(direction)
+    if not m or sign == 0:
+        return {**m,"cash_score":0.0,"future_score":0.0,"option_score":0.0,"confirmations":[],"confirmation_count":0}
+    direct_ok=float(m.get("direct_coverage") or 0)>=float(cfg.get("min_constituent_coverage",.5))
+    direct_iep=m.get("weighted_iep_bps"); direct_imb=m.get("weighted_imbalance_pct")
+    proxy=m.get("weighted_ltp_bps_20s")
+    if direct_ok and (direct_iep is not None or direct_imb is not None):
+        iep=float(direct_iep or 0); imb=float(direct_imb or 0)
+        breadth_raw=m.get("iep_up_breadth_pct") if direct_iep is not None else m.get("imbalance_up_breadth_pct")
+        breadth=(float(breadth_raw) if sign>0 else 100.0-float(breadth_raw)) if breadth_raw is not None else 50.0
+        iep_support=sign*iep; imb_support=sign*imb
+        cash_score=max(0.0,min(100.0,
+            45.0*max(0.0,iep_support)/max(float(cfg.get("min_weighted_iep_bps",2.0))*2.0,.01)+
+            30.0*max(0.0,imb_support)/max(float(cfg.get("min_direct_imbalance_pct",3.0))*2.0,.01)+
+            15.0*max(0.0,min(100.0,breadth))/100.0+10.0*min(1.0,float(m.get("direct_coverage") or 0))))
+        cash_confirm=(breadth>=float(cfg.get("min_breadth_pct",60.0)) and
+                      (iep_support>=float(cfg.get("min_weighted_iep_bps",2.0)) or
+                       imb_support>=float(cfg.get("min_direct_imbalance_pct",3.0))))
+        cash_reason=f"direct CAS IEP {iep:+.1f}bps / order imbalance {imb:+.1f}% / breadth {breadth:.0f}%"
+    else:
+        pv=float(proxy or 0); up=m.get("proxy_up_breadth_pct"); breadth=(float(up) if sign>0 else 100.0-float(up)) if up is not None else 50.0
+        support=sign*pv
+        cash_score=max(0.0,min(75.0,55.0*max(0.0,support)/max(float(cfg.get("min_weighted_iep_bps",2.0))*3.0,.01)+20.0*max(0.0,min(100.0,breadth))/100.0))
+        cash_confirm=(float(m.get("proxy_coverage") or 0)>=float(cfg.get("min_constituent_coverage",.5)) and breadth>=float(cfg.get("min_breadth_pct",60.0)) and support>=float(cfg.get("min_weighted_iep_bps",2.0)))
+        cash_reason=f"fallback constituent LTP {pv:+.1f}bps / breadth {breadth:.0f}%"
+
+    fut=float(m.get("future_bps_20s") or 0); basis_change=float(m.get("basis_change_bps_20s") or 0)
+    fut_support=sign*fut; basis_support=sign*basis_change
+    future_score=max(0.0,min(100.0,70.0*max(0.0,fut_support)/max(float(cfg.get("min_futures_bps",3.0))*2.0,.01)+30.0*max(0.0,basis_support)/max(float(cfg.get("min_futures_bps",3.0))*2.0,.01)))
+    future_confirm=fut_support>=float(cfg.get("min_futures_bps",3.0))
+
+    pressure=float(m.get("option_pressure_bps") or 0); opt_support=sign*pressure
+    option_score=max(0.0,min(100.0,100.0*max(0.0,opt_support)/max(float(cfg.get("min_option_pressure_bps",20.0))*2.0,.01)))
+    option_confirm=(m.get("option_pressure_bps") is not None and opt_support>=float(cfg.get("min_option_pressure_bps",20.0)) and
+                    (m.get("option_avg_spread_pct") is None or float(m.get("option_avg_spread_pct"))<=float(cfg.get("max_spread_pct",5.0))*1.5))
+
+    confirmations=[]
+    if cash_confirm: confirmations.append("CASH_CAS")
+    if future_confirm: confirmations.append("FUTURES")
+    if option_confirm: confirmations.append("OPTIONS")
+    m.update({"cash_score":round(cash_score,1),"cash_confirmed":cash_confirm,"cash_reason":cash_reason,
+              "future_score":round(future_score,1),"future_confirmed":future_confirm,
+              "option_score":round(option_score,1),"option_confirmed":option_confirm,
+              "confirmations":confirmations,"confirmation_count":len(confirmations)})
+    return m
+
+
+def _cas_ai_read(symbol):
+    """Read the existing AI Desk's latest learned direction without adding a
+    fresh option-chain/API burst to the latency-sensitive CAS loop. The AI Desk
+    already refreshes its index model every ~15 seconds during the normal session;
+    its latest direction/confidence is used only as supporting context here."""
+    cached = _CAS_AI_CONTEXT.get(symbol)
+    try:
+        desk = globals().get("DESK")
+        signal = dict((getattr(desk, "signals", {}) or {}).get(symbol) or {}) if desk else {}
+        direction = signal.get("direction")
+        confidence = signal.get("confidence")
+        if direction in ("UP", "DOWN") and confidence is not None:
+            value = {
+                "direction": direction,
+                "confidence": float(confidence),
+                "source": "AI Desk v2 latest learned direction",
+            }
+            _CAS_AI_CONTEXT[symbol] = {"at": time.monotonic(), "value": value}
+            return value
+    except Exception:
+        pass
+    if cached:
+        return cached.get("value")
+    # No learned desk read is available yet. Stay neutral rather than blocking
+    # a genuine high-speed auction impulse or fabricating an AI prediction.
+    value = {"direction": "WAIT", "confidence": None, "source": "AI Desk context not ready"}
+    _CAS_AI_CONTEXT[symbol] = {"at": time.monotonic(), "value": value}
+    return value
+
+
+def _cas_score_signal(symbol, spot, rows, cfg, index_quote=None):
+    now_ts = time.time()
+    p5 = _cas_sample_at_age(rows, now_ts, 5)
+    p10 = _cas_sample_at_age(rows, now_ts, 10)
+    p20 = _cas_sample_at_age(rows, now_ts, 20)
+    bps5 = _cas_bps(spot, p5); bps20 = _cas_bps(spot, p20)
+    ref, ref_source = _cas_reference(rows); bps_ref = _cas_bps(spot, ref)
+    prev5 = _cas_bps(p5, p10) if p5 is not None and p10 is not None else None
+
+    # Kite now carries an indicative CAS close/index value. Use it only if it is plausibly near spot;
+    # malformed/transitional values are ignored rather than allowed to dominate a trade decision.
+    indicative_index = _cas_field(index_quote or {}, "indicative_close_price", "indicative_index", "indicative_index_value")
+    if indicative_index is not None and not (0.90*float(spot) <= indicative_index <= 1.10*float(spot)):
+        indicative_index = None
+    indicative_index_bps = _cas_bps(indicative_index, spot) if indicative_index else None
+
+    direction = "WAIT"
+    if bps5 is not None and abs(bps5) >= float(cfg["min_5s_bps"]): direction = "UP" if bps5 > 0 else "DOWN"
+    elif bps20 is not None and abs(bps20) >= float(cfg["min_20s_bps"]): direction = "UP" if bps20 > 0 else "DOWN"
+    elif indicative_index_bps is not None and abs(indicative_index_bps) >= float(cfg.get("min_weighted_iep_bps",2.0)):
+        direction = "UP" if indicative_index_bps > 0 else "DOWN"
+
+    abs5=abs(bps5 or 0.0); abs20=abs(bps20 or 0.0); absref=abs(bps_ref or 0.0)
+    accel=max(0.0,abs5-abs(prev5 or 0.0)); same_sign=bool(bps5 and bps20 and (bps5>0)==(bps20>0))
+    speed=min(30.0,30.0*abs5/max(float(cfg["min_5s_bps"])*2.0,.01))
+    persistence=min(25.0,25.0*abs20/max(float(cfg["min_20s_bps"])*2.0,.01))
+    reference=min(15.0,15.0*absref/max(float(cfg["min_reference_bps"])*2.0,.01))
+    acceleration=min(15.0,15.0*accel/max(float(cfg["min_5s_bps"]),.01))
+    alignment=15.0 if same_sign else (5.0 if direction!="WAIT" else 0.0)
+    reaction_score=min(100.0,speed+persistence+reference+acceleration+alignment)
+
+    micro=_cas_directional_micro_score(symbol,direction,cfg)
+    ai=_cas_ai_read(symbol) if direction!="WAIT" and cas_phase() in ("LIMIT_ONLY_RANDOM_CLOSE","MATCHING") else _CAS_AI_CONTEXT.get(symbol,{}).get("value")
+    ai=ai or {"direction":"WAIT","confidence":None,"source":"not sampled yet"}
+    if direction!="WAIT" and ai.get("direction")==direction:
+        conf=float(ai.get("confidence") or .5); ai_score=min(100.0,max(55.0,conf*100.0)); ai_confirm=conf>=.55
+    elif ai.get("direction") in (None,"WAIT"):
+        ai_score=50.0; ai_confirm=False
+    else:
+        ai_score=0.0; ai_confirm=False
+    confirmations=list(micro.get("confirmations") or [])
+    if ai_confirm: confirmations.append("AI")
+
+    score=round(min(100.0,0.50*reaction_score+0.25*float(micro.get("cash_score") or 0)+
+                        0.10*float(micro.get("future_score") or 0)+0.10*float(micro.get("option_score") or 0)+0.05*ai_score),1)
+    move_gate=abs5>=float(cfg["min_5s_bps"]) and (abs20>=float(cfg["min_20s_bps"]) or absref>=float(cfg["min_reference_bps"]))
+    confirmation_gate=len(confirmations)>=int(cfg.get("min_confirmations",2))
+    # At least one market-microstructure confirmation is mandatory; AI alone can never qualify a CAS trade.
+    structural_gate=any(x in confirmations for x in ("CASH_CAS","FUTURES","OPTIONS"))
+    ready=direction!="WAIT" and same_sign and move_gate and confirmation_gate and structural_gate and score>=float(cfg["min_score"])
+    reason_bits=[]
+    if not _cas_entry_window(cfg): reason_bits.append("outside configured entry window")
+    if direction=="WAIT": reason_bits.append("index impulse below direction threshold")
+    elif not same_sign: reason_bits.append("5s/20s direction not aligned")
+    if not move_gate and direction!="WAIT": reason_bits.append("index persistence/reference move too small")
+    if direction!="WAIT" and not confirmation_gate: reason_bits.append(f"only {len(confirmations)}/{int(cfg.get('min_confirmations',2))} confirmations")
+    if direction!="WAIT" and not structural_gate: reason_bits.append("no cash/futures/options confirmation")
+    if score<float(cfg["min_score"]): reason_bits.append(f"score {score:.1f} < {float(cfg['min_score']):.1f}")
+    if not reason_bits and ready:
+        reason_bits.append(" + ".join(confirmations)+" confirm "+micro.get("cash_reason","CAS impulse"))
+    decision="READY" if ready and _cas_entry_window(cfg) else "WATCH"
+    return {
+        "symbol":symbol,"ts":datetime.now(IST).isoformat(),"spot":round(float(spot),2),
+        "bps_5s":round(bps5,2) if bps5 is not None else None,"bps_20s":round(bps20,2) if bps20 is not None else None,
+        "bps_reference":round(bps_ref,2) if bps_ref is not None else None,"reference":round(ref,2) if ref else None,
+        "reference_source":ref_source,"acceleration_bps":round(accel,2),"direction":direction,"score":score,
+        "reaction_score":round(reaction_score,1),"decision":decision,"reason":"; ".join(reason_bits) or "CAS evidence building",
+        "indicative_index":round(indicative_index,2) if indicative_index is not None else None,
+        "indicative_index_bps":round(indicative_index_bps,2) if indicative_index_bps is not None else None,
+        "ai_direction":ai.get("direction"),"ai_confidence":ai.get("confidence"),"ai_source":ai.get("source"),
+        "confirmations":confirmations,"confirmation_count":len(confirmations),"microstructure":micro,
+        "components":{"reaction":round(reaction_score,1),"cash_cas":micro.get("cash_score",0.0),
+                      "futures":micro.get("future_score",0.0),"options":micro.get("option_score",0.0),"ai":round(ai_score,1)},
+    }
+
+
+def _cas_option_candidates(symbol, direction, cfg):
+    exchange, opts = get_option_instruments_for_symbol(symbol)
+    today = now_ist().date()
+    valid_exp = sorted({o.get("expiry") for o in opts if o.get("expiry") and o.get("expiry") >= today})
+    if not valid_exp:
+        return None, "No current index-option expiry available"
+    expiry = valid_exp[0]
+    spot, err = get_spot_price(symbol)
+    if err or not spot:
+        return None, (err or {}).get("error", "Spot unavailable")
+    opt_type = "CE" if direction == "UP" else "PE"
+    same = [o for o in opts if o.get("expiry") == expiry and o.get("instrument_type") == opt_type]
+    if not same:
+        return None, f"No {opt_type} options for nearest expiry"
+    same.sort(key=lambda o: abs(float(o.get("strike") or 0) - float(spot)))
+    # ATM-first, but inspect nearby strikes and let executable spread/depth decide.
+    same = same[:8]
+    keys = [f"{exchange}:{o['tradingsymbol']}" for o in same]
+    quotes = kite_quote_bulk(keys, chunk_size=500, retries=1, force_refresh=True)
+    candidates = []
+    for o in same:
+        q = quotes.get(f"{exchange}:{o['tradingsymbol']}")
+        st = quote_stats(q)
+        ask, bid = st.get("ask"), st.get("bid")
+        if ask is None or float(ask) <= 0 or bid is None or float(bid) <= 0:
+            continue
+        spread = st.get("spread_pct")
+        if spread is not None and float(spread) > float(cfg["max_spread_pct"]):
+            continue
+        if int(st.get("volume") or 0) < int(cfg["min_option_volume"]):
+            continue
+        if int(st.get("oi") or 0) < int(cfg["min_option_oi"]):
+            continue
+        distance_bps = abs(float(o.get("strike") or 0) / float(spot) - 1) * 10000
+        quality = (
+            max(0.0, 50.0 - distance_bps * 0.25)
+            + max(0.0, 25.0 - float(spread or 0) * 4.0)
+            + min(15.0, math.log1p(int(st.get("oi") or 0)) * 1.25)
+            + min(10.0, math.log1p(int(st.get("volume") or 0)))
+        )
+        candidates.append((quality, o, st))
+    if not candidates:
+        return None, "No nearby option passes executable bid/ask, spread, volume and OI checks"
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    quality, o, st = candidates[0]
+    lot = int(o.get("lot_size") or 1)
+    ask = float(st["ask"])
+    qty = int(float(cfg["capital_per_trade"]) // (ask * lot)) * lot
+    if qty < lot:
+        return None, f"Capital ₹{float(cfg['capital_per_trade']):,.0f} cannot fund one lot at current ask ₹{ask:.2f}"
+    return {
+        "exchange": exchange, "expiry": str(expiry), "option_type": opt_type,
+        "option_symbol": o.get("tradingsymbol"), "token": int(o.get("instrument_token") or 0),
+        "strike": float(o.get("strike") or 0), "lot_size": lot, "qty": qty,
+        "bid": float(st["bid"]), "ask": ask, "spread_pct": round(float(st.get("spread_pct") or 0),2),
+        "volume": int(st.get("volume") or 0), "oi": int(st.get("oi") or 0),
+        "quality_score": round(float(quality),1), "spot": float(spot),
+    }, None
+
+
+def _cas_new_trade(signal, contract, mode, entry_price, qty=None, order_id=None):
+    entry = float(entry_price)
+    q = int(qty or contract["qty"])
+    return {
+        "id": "CAS-" + secrets.token_hex(6).upper(), "status": "OPEN",
+        "execution_mode": mode, "symbol": signal["symbol"], "direction": signal["direction"],
+        "option_type": contract["option_type"], "option_symbol": contract["option_symbol"],
+        "exchange": contract["exchange"], "expiry": contract["expiry"], "strike": contract["strike"],
+        "qty": q, "original_qty": q, "lot_size": contract["lot_size"],
+        "entry": round(entry,2), "opened_at": datetime.now(IST).isoformat(),
+        "stop": round(entry * (1 - float(cas_load_state()["config"]["stop_pct"]) / 100), 2),
+        "target": round(entry * (1 + float(cas_load_state()["config"]["target_pct"]) / 100), 2),
+        "peak": round(entry,2), "last_bid": round(float(contract.get("bid") or entry),2),
+        "unrealized_pnl": 0.0, "realized_pnl": 0.0, "recommended_action": "HOLD",
+        "recommended_reason": "New position", "entry_order_id": order_id,
+        "exit_order_id": None, "signal": signal,
+    }
+
+
+def _cas_wait_fill(order_id, timeout_seconds=8.0):
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            hist = kite.order_history(order_id) or []
+            if hist:
+                last = hist[-1]
+                status = str(last.get("status") or "").upper()
+                if status == "COMPLETE":
+                    return True, float(last.get("average_price") or 0), int(last.get("filled_quantity") or 0), status
+                if status in ("REJECTED", "CANCELLED"):
+                    return False, 0.0, int(last.get("filled_quantity") or 0), status + ": " + str(last.get("status_message") or "")
+        except Exception as e:
+            last = {"status_message": str(e)}
+        time.sleep(0.5)
+    return False, 0.0, int((last or {}).get("filled_quantity") or 0), "Fill not confirmed within safety timeout; verify broker order book"
+
+
+def _cas_paper_enter(signal, cfg):
+    rows = cas_load_trades()
+    contract, err = _cas_option_candidates(signal["symbol"], signal["direction"], cfg)
+    if err:
+        signal["execution_note"] = err
+        return None
+    trade = _cas_new_trade(signal, contract, "paper_auto", contract["ask"])
+    rows.append(trade)
+    cas_save_trades(rows)
+    _CAS_LAST_SIGNAL_AT[signal["symbol"]] = time.monotonic()
+    return trade
+
+
+def _cas_make_live_pending(signal, cfg):
+    contract, err = _cas_option_candidates(signal["symbol"], signal["direction"], cfg)
+    if err:
+        signal["execution_note"] = err
+        return None
+    pending = {
+        "id": "PEND-" + secrets.token_hex(6).upper(), "created_at": datetime.now(IST).isoformat(),
+        "expires_at_epoch": time.time() + float(cfg["live_signal_ttl_seconds"]),
+        "signal": signal, "contract": contract,
+        "message": "Live Assist: review and explicitly confirm this BUY; no order has been sent.",
+    }
+    state = cas_load_state(); state["pending_entry"] = pending; cas_save_state(state)
+    _CAS_LAST_SIGNAL_AT[signal["symbol"]] = time.monotonic()
+    return pending
+
+
+def _cas_update_position(trade, q, cfg, signal_map):
+    st = quote_stats(q)
+    bid = st.get("bid")
+    if bid is None or float(bid) <= 0:
+        trade["recommended_action"] = "WAIT_QUOTE"
+        trade["recommended_reason"] = "No executable bid"
+        return False
+    bid = float(bid)
+    trade["last_bid"] = round(bid, 2)
+    trade["peak"] = round(max(float(trade.get("peak") or trade["entry"]), bid), 2)
+    trade["unrealized_pnl"] = round((bid - float(trade["entry"])) * int(trade["qty"]), 2)
+    action, reason = "HOLD", "Impulse still within risk plan"
+    opened = _ai_ts_naive(trade.get("opened_at"))
+    age = (now_ist().replace(tzinfo=None) - opened).total_seconds() if opened else 0
+    trailing_stop = float(trade["peak"]) * (1 - float(cfg["trailing_pct"]) / 100)
+    sig = signal_map.get(trade["symbol"]) or {}
+    opposite = sig.get("decision") == "READY" and sig.get("direction") not in (None, "WAIT", trade.get("direction")) and float(sig.get("score") or 0) >= float(cfg["min_score"]) + 5
+    if bid <= float(trade["stop"]):
+        action, reason = "SELL", "Premium stop-loss reached"
+    elif bid >= float(trade["target"]):
+        action, reason = "SELL", "Premium target reached"
+    elif float(trade["peak"]) > float(trade["entry"]) * 1.08 and bid <= trailing_stop:
+        action, reason = "SELL", f"Trailing protection triggered below ₹{trailing_stop:.2f}"
+    elif opposite:
+        action, reason = "SELL", "High-score CAS impulse reversed direction"
+    elif age >= float(cfg["max_hold_seconds"]):
+        action, reason = "SELL", "Maximum CAS hold time reached"
+    elif now_ist().time() >= _cas_time(cfg.get("square_off_time", "15:39")):
+        action, reason = "SELL", "CAS/F&O end-of-session square-off threshold reached"
+    trade["recommended_action"] = action
+    trade["recommended_reason"] = reason
+    trade["trailing_stop"] = round(trailing_stop, 2)
+    return action == "SELL"
+
+
+def _cas_paper_close(trade, price, reason):
+    trade["status"] = "CLOSED"
+    trade["exit"] = round(float(price), 2)
+    trade["closed_at"] = datetime.now(IST).isoformat()
+    trade["realized_pnl"] = round((float(price) - float(trade["entry"])) * int(trade["qty"]), 2)
+    trade["unrealized_pnl"] = 0.0
+    trade["exit_reason"] = reason
+    trade["recommended_action"] = "CLOSED"
+
+
+def _cas_reset_day_if_needed():
+    """Clear in-memory rolling evidence at the first collection tick of each trading day."""
+    global _CAS_SAMPLE_DAY
+    day = now_ist().strftime("%Y-%m-%d")
+    if _CAS_SAMPLE_DAY == day:
+        return
+    with _CAS_LOCK:
+        for store in (_CAS_SAMPLES, _CAS_FUTURE_SAMPLES, _CAS_BASIS_SAMPLES):
+            for k in list(store):
+                store[k] = []
+        for k in list(_CAS_OPTION_SAMPLES):
+            _CAS_OPTION_SAMPLES[k] = {"CE": [], "PE": []}
+        _CAS_CONSTITUENT_SAMPLES.clear()
+        _CAS_SIGNALS.clear()
+        _CAS_MICRO.clear()
+        _CAS_AI_CONTEXT.clear()
+        _CAS_LAST_SIGNAL_AT.clear()
+        _CAS_SAMPLE_DAY = day
+
+
+def cas_cycle():
+    # The worker is alive whenever the backend is running. After Kite login it
+    # automatically starts data collection at collection_start even when CAS
+    # entries are disarmed and even when the CAS tab is never opened.
+    if not require_session():
+        return
+    state=cas_load_state(); cfg=state["config"]; phase=cas_phase()
+    if not cas_collection_active(cfg):
+        return
+    _cas_reset_day_if_needed()
+    symbols=[s for s in cfg.get("symbols",[]) if s in INDEX_SYMBOLS]
+    rows=cas_load_trades(); open_rows=[r for r in rows if r.get("status")=="OPEN"]
+    keys=[INDEX_SYMBOLS[s] for s in symbols]+[f"{r['exchange']}:{r['option_symbol']}" for r in open_rows]
+    quotes=kite_quote_bulk(keys,chunk_size=500,retries=1,force_refresh=True)
+    now_epoch=time.time(); now_iso=datetime.now(IST).isoformat(); spot_map={}; index_quote_map={}
+    for symbol in symbols:
+        q=quotes.get(INDEX_SYMBOLS[symbol]) or {}; px=q.get("last_price")
+        if px is None or float(px)<=0: continue
+        spot_map[symbol]=float(px); index_quote_map[symbol]=q
+        samples=_cas_trim_samples(symbol,now_epoch); samples.append((now_epoch,float(px),now_iso))
+
+    # Second bulk snapshot: direct cash CAS auction fields + nearest future + ATM CE/PE pressure.
+    # Rate limiting is handled centrally by kite_quote_bulk().
+    if spot_map:
+        _cas_collect_microstructure(symbols,spot_map,cfg,now_epoch,now_iso)
+
+    signal_map={}
+    for symbol,px in spot_map.items():
+        sig=_cas_score_signal(symbol,px,_CAS_SAMPLES.get(symbol,[]),cfg,index_quote_map.get(symbol))
+        _CAS_SIGNALS[symbol]=sig; signal_map[symbol]=sig
+
+    changed=False
+    for trade in open_rows:
+        oq=quotes.get(f"{trade['exchange']}:{trade['option_symbol']}")
+        should_exit=_cas_update_position(trade,oq,cfg,signal_map); changed=True
+        if should_exit and trade.get("execution_mode")=="paper_auto":
+            _cas_paper_close(trade,float(trade.get("last_bid") or 0),trade.get("recommended_reason") or "Paper CAS exit")
+    if changed: cas_save_trades(rows)
+
+    if not cfg.get("armed") or not _cas_entry_window(cfg): return
+    rows=cas_load_trades(); open_rows=[r for r in rows if r.get("status")=="OPEN"]
+    if len(open_rows)>=int(cfg["max_concurrent_positions"]): return
+    if len(_cas_today_rows(rows))>=int(cfg["max_trades_per_day"]): return
+    if cfg.get("execution_mode")=="paper_auto" and _cas_today_realized(rows,"paper_auto")<=-abs(float(cfg["max_daily_loss_paper"])): return
+    if cfg.get("execution_mode")=="live_assist":
+        pending=cas_load_state().get("pending_entry")
+        if pending and float(pending.get("expires_at_epoch") or 0)>time.time(): return
+
+    ready=[s for s in signal_map.values() if s.get("decision")=="READY"]
+    ready.sort(key=lambda s:(float(s.get("score") or 0),int(s.get("confirmation_count") or 0)),reverse=True)
+    for sig in ready:
+        if any(r.get("symbol")==sig["symbol"] for r in open_rows): continue
+        if time.monotonic()-_CAS_LAST_SIGNAL_AT.get(sig["symbol"],-1e9)<float(cfg["cooldown_seconds"]): continue
+        if cfg.get("execution_mode")=="paper_auto":
+            if _cas_paper_enter(sig,cfg): break
+        else:
+            if _cas_make_live_pending(sig,cfg): break
+
+
+def cas_loop():
+    global _CAS_WORKER_STARTED
+    if _CAS_WORKER_STARTED:
+        return
+    _CAS_WORKER_STARTED = True
+    while True:
+        try:
+            cas_cycle()
+        except Exception as e:
+            try:
+                state = cas_load_state(); state["last_error"] = f"{type(e).__name__}: {e}"; cas_save_state(state)
+            except Exception:
+                pass
+            logger.exception("CAS reaction cycle failed")
+        cfg = cas_load_state()["config"]
+        time.sleep(max(2.0, float(cfg.get("poll_seconds", 3.0))))
+
+
+def _cas_state_payload():
+    state = cas_load_state(); cfg = state["config"]
+    rows = cas_load_trades()
+    now_epoch = time.time()
+    pending = state.get("pending_entry")
+    if pending and float(pending.get("expires_at_epoch") or 0) <= now_epoch:
+        state["pending_entry"] = None; cas_save_state(state); pending = None
+    signals = []
+    for sym in cfg.get("symbols", []):
+        sig = dict(_CAS_SIGNALS.get(sym) or {"symbol": sym, "decision": "WATCH", "reason": "Waiting for local CAS samples"})
+        samples = _CAS_SAMPLES.get(sym, [])
+        sig["sample_count"] = len(samples)
+        signals.append(sig)
+    open_rows = [dict(r) for r in rows if r.get("status") == "OPEN"]
+    return {
+        "config": cfg, "phase": cas_phase(), "market_session_active": cas_session_active(),
+        "collection_active": cas_collection_active(cfg),
+        "collection_mode": "AUTOMATIC",
+        "collection_start": cfg.get("collection_start", "15:05"),
+        "signals": signals, "pending_entry": pending, "open_positions": open_rows,
+        "today_trades": len(_cas_today_rows(rows)), "today_realized_pnl": _cas_today_realized(rows),
+        "recent_trades": list(reversed(rows[-20:])), "last_error": state.get("last_error"),
+        "server_time": datetime.now(IST).isoformat(),
+        "microstructure_policy": "Reads Kite CAS cash-quote fields directly when available: indicative_close_price, reference_limit_price/reference_price, buy_quantity, sell_quantity and total_imbalance/total_imbalance_qty. Falls back to constituent LTP pressure only when direct CAS fields are unavailable.",
+        "weighting_note": "Constituent basket weights are configurable importance hints used for aggregation, not guaranteed current official index weights.",
+        "live_policy": "LIVE_ASSIST only: every real BUY and SELL requires a fresh explicit confirmation; no unattended live order path exists in the CAS module.",
+        "timing_note": "Automatic collection starts at 15:05 IST by default, builds a pre-CAS baseline before 15:15, continues through CAS 15:15-15:35 and the F&O exit window to 15:40. Arming controls entries only; it does not control collection.",
+    }
+
+
+@app.route("/api/cas/state")
+def cas_state_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    return jsonify(_cas_state_payload())
+
+
+@app.route("/api/cas/config", methods=["POST"])
+def cas_config_route():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.get_json(silent=True) or {}
+    state = cas_load_state(); cfg = dict(state["config"])
+    for k in CAS_CONFIGURABLE_KEYS:
+        if k in body:
+            cfg[k] = body[k]
+    mode = str(cfg.get("execution_mode", "paper_auto"))
+    if mode not in ("paper_auto", "live_assist"):
+        return jsonify({"error": "CAS supports only 'paper_auto' or 'live_assist'. Unattended live execution is intentionally not available."}), 400
+    syms = cfg.get("symbols") or []
+    if not isinstance(syms, list) or not syms or any(s not in INDEX_SYMBOLS for s in syms):
+        return jsonify({"error": "symbols must be a non-empty list drawn from NIFTY, BANKNIFTY, FINNIFTY, SENSEX"}), 400
+    # Basic bounds avoid accidental zero/negative gates or absurd risk settings.
+    for k in ("min_5s_bps", "min_20s_bps", "min_reference_bps", "min_score", "min_constituent_coverage",
+              "min_breadth_pct", "min_weighted_iep_bps", "min_direct_imbalance_pct", "min_futures_bps",
+              "min_option_pressure_bps", "capital_per_trade", "max_spread_pct", "stop_pct", "target_pct", "trailing_pct"):
+        try:
+            if float(cfg[k]) <= 0:
+                return jsonify({"error": f"{k} must be > 0"}), 400
+        except Exception:
+            return jsonify({"error": f"{k} must be numeric"}), 400
+    try:
+        collection_start = _cas_time(cfg.get("collection_start", "15:05"))
+        entry_start = _cas_time(cfg.get("entry_start", "15:27"))
+        entry_end = _cas_time(cfg.get("entry_end", "15:35"))
+        if collection_start >= _cas_time("15:15"):
+            return jsonify({"error":"collection_start must be before 15:15 so automatic collection can build a pre-CAS baseline"}),400
+        if not (_cas_time("15:15") <= entry_start < entry_end <= _cas_time("15:40")):
+            return jsonify({"error":"CAS entry window must be within 15:15-15:40 and start before end"}),400
+        if int(cfg.get("min_confirmations",2)) < 1 or int(cfg.get("min_confirmations",2)) > 4:
+            return jsonify({"error":"min_confirmations must be between 1 and 4"}),400
+        if not 0 < float(cfg.get("min_constituent_coverage",.5)) <= 1:
+            return jsonify({"error":"min_constituent_coverage must be > 0 and <= 1"}),400
+        if not 0 < float(cfg.get("min_breadth_pct",60)) <= 100:
+            return jsonify({"error":"min_breadth_pct must be > 0 and <= 100"}),400
+    except Exception:
+        return jsonify({"error":"Invalid CAS Imbalance Intelligence thresholds"}),400
+    state["config"] = cfg; state["pending_entry"] = None
+    cas_save_state(state)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/cas/control/<action>", methods=["POST"])
+def cas_control_route(action):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    if action not in ("arm", "disarm", "clear-pending"):
+        return jsonify({"error": "Unknown CAS control action"}), 404
+    state = cas_load_state()
+    if action == "arm":
+        state["config"]["armed"] = True
+    elif action == "disarm":
+        state["config"]["armed"] = False
+        state["pending_entry"] = None
+    else:
+        state["pending_entry"] = None
+    cas_save_state(state)
+    return jsonify({"ok": True, "state": _cas_state_payload()})
+
+
+@app.route("/api/cas/confirm-entry", methods=["POST"])
+def cas_confirm_entry_route():
+    """Explicit per-order confirmation route for LIVE_ASSIST.
+    Merely arming/scanning can never reach this placement call."""
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.get_json(silent=True) or {}
+    if body.get("ack") is not True:
+        return jsonify({"error": "Explicit confirmation required (ack: true)."}), 400
+    state = cas_load_state(); cfg = state["config"]
+    if cfg.get("execution_mode") != "live_assist":
+        return jsonify({"error": "Switch CAS execution mode to Live Assist first."}), 400
+    pending = state.get("pending_entry")
+    if not pending or pending.get("id") != body.get("pending_id"):
+        return jsonify({"error": "Pending signal not found or changed; refresh before confirming."}), 409
+    if float(pending.get("expires_at_epoch") or 0) <= time.time():
+        state["pending_entry"] = None; cas_save_state(state)
+        return jsonify({"error": "Signal expired; wait for a fresh CAS impulse."}), 409
+    if not _cas_entry_window(cfg):
+        return jsonify({"error": "Outside the configured CAS live entry window."}), 409
+    c = pending["contract"]
+    key = f"{c['exchange']}:{c['option_symbol']}"
+    q = kite_quote_bulk([key], force_refresh=True).get(key)
+    st = quote_stats(q); ask = st.get("ask")
+    if ask is None or float(ask) <= 0:
+        return jsonify({"error": "No executable ask; no order sent."}), 409
+    spread = st.get("spread_pct")
+    if spread is not None and float(spread) > float(cfg["max_spread_pct"]):
+        return jsonify({"error": f"Spread widened to {float(spread):.2f}%; no order sent."}), 409
+    leg = {"leg": "cas_live_assist_entry", "tradingsymbol": c["option_symbol"], "exchange": c["exchange"],
+           "transaction_type": "BUY", "quantity": int(c["qty"])}
+    result = (place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False) or [{}])[0]
+    if result.get("status") != "placed" or not result.get("order_id"):
+        return jsonify({"error": "Broker did not accept the BUY order.", "broker_result": result}), 409
+    ok, avg, filled, fill_status = _cas_wait_fill(result["order_id"])
+    if not ok or filled <= 0:
+        return jsonify({"error": "BUY was submitted but fill was not safely confirmed. Check Zerodha before retrying.",
+                        "order_id": result.get("order_id"), "fill_status": fill_status}), 409
+    contract = dict(c); contract["ask"] = avg; contract["bid"] = float(st.get("bid") or avg)
+    signal = pending["signal"]
+    trade = _cas_new_trade(signal, contract, "live_assist", avg, qty=filled, order_id=result["order_id"])
+    rows = cas_load_trades(); rows.append(trade); cas_save_trades(rows)
+    state["pending_entry"] = None; cas_save_state(state)
+    return jsonify({"ok": True, "trade": trade, "message": "Confirmed broker fill recorded. CAS module will recommend exits, but will not send a SELL without another explicit confirmation."})
+
+
+@app.route("/api/cas/confirm-exit/<trade_id>", methods=["POST"])
+def cas_confirm_exit_route(trade_id):
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    body = request.get_json(silent=True) or {}
+    if body.get("ack") is not True:
+        return jsonify({"error": "Explicit confirmation required (ack: true)."}), 400
+    rows = cas_load_trades()
+    trade = next((r for r in rows if r.get("id") == trade_id and r.get("status") == "OPEN"), None)
+    if not trade:
+        return jsonify({"error": "Open CAS trade not found."}), 404
+    if trade.get("execution_mode") != "live_assist":
+        return jsonify({"error": "This endpoint is only for Live Assist positions."}), 400
+    key = f"{trade['exchange']}:{trade['option_symbol']}"
+    q = kite_quote_bulk([key], force_refresh=True).get(key); st = quote_stats(q)
+    if st.get("bid") is None or float(st["bid"]) <= 0:
+        return jsonify({"error": "No executable bid; no SELL order sent."}), 409
+    leg = {"leg": "cas_live_assist_exit", "tradingsymbol": trade["option_symbol"], "exchange": trade["exchange"],
+           "transaction_type": "SELL", "quantity": int(trade["qty"])}
+    result = (place_basket_orders([leg], product="MIS", order_type="MARKET", sequence_for_margin=False) or [{}])[0]
+    if result.get("status") != "placed" or not result.get("order_id"):
+        return jsonify({"error": "Broker did not accept the SELL order.", "broker_result": result}), 409
+    ok, avg, filled, fill_status = _cas_wait_fill(result["order_id"])
+    if not ok or filled != int(trade["qty"]):
+        return jsonify({"error": "SELL was submitted but full exit was not safely confirmed. Check Zerodha immediately.",
+                        "order_id": result.get("order_id"), "filled_quantity": filled, "fill_status": fill_status}), 409
+    trade["status"] = "CLOSED"; trade["exit"] = round(avg,2); trade["closed_at"] = datetime.now(IST).isoformat()
+    trade["realized_pnl"] = round((avg - float(trade["entry"])) * filled, 2); trade["unrealized_pnl"] = 0.0
+    trade["exit_reason"] = body.get("reason") or trade.get("recommended_reason") or "User-confirmed Live Assist exit"
+    trade["exit_order_id"] = result["order_id"]; trade["recommended_action"] = "CLOSED"
+    cas_save_trades(rows)
+    return jsonify({"ok": True, "trade": trade})
+
+
 def start_application_workers():
     if os.environ.get("AI_START_WORKERS","1")!="1":return
     def legacy_manage():
@@ -12744,6 +13845,7 @@ def start_application_workers():
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
     DESK.start()
     STOCK_DESK.start()
+    threading.Thread(target=cas_loop,daemon=True,name='cas-reaction-ai').start()
 
 start_application_workers()
 
