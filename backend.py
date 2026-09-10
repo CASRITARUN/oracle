@@ -12047,7 +12047,7 @@ def _build_desk_engine_class():
                         if (end-t).total_seconds()!=900:continue
                         f=self.a.features(rows,i,arr);x=[f[k] for k in FEATURES]
                         if all(finite(v) for v in x):samples.append((t.timestamp(),end.timestamp(),x,int(rows[i+3]['close']>rows[i]['close'])))
-                    self.training=dict(status='BUILDING FEATURES',progress=10+20*(j+1),symbol=symbol)
+                    self.training=dict(status='BUILDING FEATURES',progress=10+20*(j+1)/max(1,len(self.a.symbols)),symbol=symbol)
                 samples.sort(key=lambda r:r[0])
                 if len(samples)<300:raise ValueError('Need at least 300 labelled observations from five-minute history. Connect Kite and sync the archive.')
                 split=int(len(samples)*.8);cut=samples[split][0]
@@ -12517,6 +12517,217 @@ def desk_legacy_close_route():
     if (request.get_json(silent=True) or {}).get('ack') is not True:return jsonify({"error":"Explicit acknowledgement required"}),400
     return jsonify({"closed":autotrade_ai_close_all("Migration: user requested legacy close")})
 
+
+# ===========================================================================
+# STOCK OPTIONS AI — isolated ledger/models; same validated desk execution core.
+# Broad cash-turnover shortlist, then directional and executable-option ranking.
+# API reference: https://kite.trade/docs/connect/v3/market-quotes/
+# API reference: https://kite.trade/docs/connect/v3/historical/
+# ===========================================================================
+class StockDeskAdapter(DeskAdapter):
+    def __init__(self):
+        self.symbols=()
+        self.refreshed={}
+        self.history_lock=threading.Lock()
+    @contextmanager
+    def db(self):
+        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'stock_options_ai.db'),timeout=30)
+        c.row_factory=sqlite3.Row
+        try:
+            c.execute('PRAGMA journal_mode=WAL')
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback();raise
+        finally:c.close()
+    def refresh(self,symbol):
+        # Reuse the canonical five-minute archive, never an index model/ledger.
+        with self.history_lock:
+            if time.monotonic()-self.refreshed.get(symbol,-1e9)<60:return
+            token,err=resolve_token_for_symbol(symbol)
+            if err:raise ValueError(err)
+            end=now_ist()
+            recent=self.bars(symbol,1)
+            start=end-timedelta(days=20)
+            if recent:
+                last=_ai_ts_naive(recent[-1]['ts'])
+                if last:start=max(start,last-timedelta(minutes=10))
+            candles,err=_hist_fetch_chunk(token,start,end)
+            if err:raise ValueError(str(err))
+            _hist_insert_candles(symbol,candles)
+            self.refreshed[symbol]=time.monotonic()
+    def chain(self,symbol):
+        exchange,opts=get_option_instruments_for_symbol(symbol)
+        today=now_ist().date()
+        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=max(4,MIN_DAYS_TO_EXPIRY)})
+        if not expiries:return None,'No stock expiry at least four calendar days away'
+        data,err=get_chain_for_symbol(symbol,str(expiries[0]))
+        if err:return None,err
+        data=dict(data)
+        data['chain']=[o for o in data['chain'] if float(o.get('volume') or 0)>=max(1,int(o.get('lot_size') or 1))*10 and float(o.get('oi') or 0)>=max(1,int(o.get('lot_size') or 1))*20]
+        return data,None
+
+class StockDeskEngine(DeskEngine):
+    def __init__(self,adapter):
+        super().__init__(adapter)
+        self.a.symbols=tuple(self.get('stock_universe',[]))
+        self.scan_status={'status':'IDLE','completed':0,'total':0}
+        self.ban_checked=0;self.banned=None;self.ban_error='Ban list not checked yet'
+        self.risk_lock=threading.Lock()
+    def select_universe(self,body=None):
+        body=body or {}
+        if self.config()['armed']:raise ValueError('Disarm entries before changing the scan universe')
+        universe=fo_stock_universe()
+        selected=body.get('symbols',[])
+        if not isinstance(selected,list) or any(not isinstance(x,str) for x in selected):raise ValueError('symbols must be a list of stock symbols')
+        if selected:
+            selected=list(dict.fromkeys(x.strip().upper() for x in selected if x.strip()))
+            if not 1<=len(selected)<=30 or any(x not in universe for x in selected):raise ValueError('Choose 1–30 current F&O stocks; indices are excluded')
+            mode='Custom watchlist';quoted=len(selected)
+        else:
+            quotes=kite_quote_bulk(['NSE:'+s for s in universe],chunk_size=500,force_refresh=True)
+            liquid=[]
+            for symbol in universe:
+                q=quotes.get('NSE:'+symbol,{})
+                price=float(q.get('last_price') or 0);volume=float(q.get('volume') or 0)
+                if price>0 and volume>0 and math.isfinite(price*volume):liquid.append((price*volume,symbol))
+            liquid.sort(reverse=True)
+            selected=[s for _,s in liquid[:20]];quoted=len(liquid)
+            if not selected:raise ValueError('No valid stock turnover quotes. Connect Kite and retry during/after a session.')
+            mode='Top 20 by cash turnover'
+        self.a.symbols=tuple(selected)
+        self.put('stock_universe',selected)
+        self.put('stock_universe_info',dict(mode=mode,total_fo=len(universe),quoted=quoted,selected=len(selected),updated=now_ist().isoformat()))
+        self.signals={k:v for k,v in self.signals.items() if k in selected}
+        self.event('UNIVERSE',f'{mode}: {len(selected)} stocks; {len(universe)} F&O universe')
+        return selected
+    @staticmethod
+    def rank_signal(s,max_spread):
+        if s.get('decision')!='READY':return 0.
+        confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
+        spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
+        depth=min(1.,float(s.get('depth_qty') or 0)/max(1,float(s.get('qty') or 1))/3)
+        return round(70*confidence+20*spread+10*depth,2)
+    def inspect(self,symbol):
+        s=super().inspect(symbol)
+        s['reason']=s.get('reason','').replace('index candles','stock candles')
+        if self.banned is not None and symbol in self.banned:s.update(decision='WAIT',reason='Stock in F&O ban list; new entries excluded')
+        if self.config()['mode']=='live' and self.banned is None:s.update(decision='WAIT',reason='Daily F&O ban list unavailable; live entries paused')
+        s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        return s
+    def enter(self,s):
+        # Reprice after the full scan: a high rank never permits stale fills.
+        if s.get('decision')!='READY' or self.block():return
+        fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
+        return super().enter(fresh)
+    def cycle(self):
+        if not self.lock.acquire(False):return
+        try:
+            self.last_cycle=now_ist().isoformat()
+            if not self.a.connected():return
+            if not self.a.symbols:self.select_universe()
+            if time.monotonic()-self.ban_checked>1800:
+                self.banned,self.ban_error=get_fo_ban_list();self.ban_checked=time.monotonic()
+            self.supervise()
+            names=list(dict.fromkeys(list(self.a.symbols)+[p['symbol'] for p in self.active()]))
+            self.scan_status=dict(status='SCANNING',completed=0,total=len(names),started=now_ist().isoformat())
+            for i,symbol in enumerate(names):
+                try:self.signals[symbol]=self.inspect(symbol)
+                except Exception as e:self.signals[symbol]=dict(symbol=symbol,ts=now_ist().isoformat(),decision='WAIT',reason=str(e),rank_score=0)
+                self.scan_status.update(completed=i+1,symbol=symbol)
+                self.supervise()
+            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',s.get('rank_score',0)),reverse=True)
+            for signal in ranked:
+                if signal['symbol'] in self.a.symbols:
+                    with self.risk_lock:self.enter(signal)
+            self.settle_observations();self.maybe_train()
+            self.scan_status.update(status='COMPLETE',finished=now_ist().isoformat())
+            self.last_cycle=now_ist().isoformat()
+            if self.get('close_requested') and not self.active():self.put('close_requested',False)
+        except Exception as e:
+            self.scan_status.update(status='ERROR',error=str(e));self.event('ERROR','Stock scan: '+str(e))
+        finally:self.lock.release()
+    def supervise(self):
+        if not self.risk_lock.acquire(False):return
+        try:
+            self.reconcile();self.verify_positions()
+            if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
+        except Exception as e:
+            self.put('halt','Position supervision error: '+str(e));self.event('ERROR',str(e))
+        finally:self.risk_lock.release()
+    def start(self):
+        if self.started:return
+        self.started=True
+        def scan_loop():
+            while not self.stop_event.is_set():self.cycle();self.stop_event.wait(30)
+        def risk_loop():
+            while not self.stop_event.wait(5):
+                if self.a.connected():self.supervise()
+        threading.Thread(target=scan_loop,daemon=True,name='stock-ai-scan').start()
+        threading.Thread(target=risk_loop,daemon=True,name='stock-ai-risk').start()
+    def state(self):
+        s=super().state()
+        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('rank_score',0)),reverse=True)
+        for i,row in enumerate(s['signals'],1):row['rank']=i
+        s.update(universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols))
+        return s
+    def control(self,action,body):
+        # Disarming is immediate even while a broad scan is running.
+        if action in ('disarm','close'):
+            with self.risk_lock:
+                cfg=self.config();cfg['armed']=False;self.put('config',cfg)
+                if action=='close':self.put('close_requested',True)
+                self.event('CONTROL',action)
+                return cfg
+        if not self.lock.acquire(False):raise ValueError('Scan in progress; retry after completion')
+        try:
+            with self.risk_lock:return super().control(action,body)
+        finally:self.lock.release()
+
+STOCK_DESK=StockDeskEngine(StockDeskAdapter())
+
+@app.route('/api/stock-ai/state')
+def stock_ai_state():
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    return jsonify(STOCK_DESK.state())
+
+@app.route('/api/stock-ai/config',methods=['POST'])
+def stock_ai_config():
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    if not STOCK_DESK.lock.acquire(False):return jsonify(error='Scan in progress; retry after completion'),409
+    try:
+        with STOCK_DESK.risk_lock:return jsonify(ok=True,config=STOCK_DESK.save_config(request.get_json(silent=True) or {}))
+    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+    finally:STOCK_DESK.lock.release()
+
+@app.route('/api/stock-ai/control/<action>',methods=['POST'])
+def stock_ai_control(action):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    body=request.get_json(silent=True) or {}
+    try:
+        if action in ('scan','universe','sync'):
+            if not STOCK_DESK.train_lock.acquire(False):return jsonify(error='Learning/universe job already running'),409
+            def job():
+                try:
+                    if action in ('universe','sync'):
+                        with STOCK_DESK.lock:
+                            if action=='universe' or not STOCK_DESK.a.symbols:STOCK_DESK.select_universe(body)
+                            if action=='sync':
+                                for i,symbol in enumerate(STOCK_DESK.a.symbols):
+                                    STOCK_DESK.training=dict(status='SYNCING HISTORY',progress=round(100*i/max(1,len(STOCK_DESK.a.symbols))))
+                                    STOCK_DESK.a.refresh(symbol)
+                                STOCK_DESK.training=dict(status='HISTORY READY',progress=100)
+                    STOCK_DESK.cycle()
+                except Exception as e:
+                    STOCK_DESK.training=dict(status='ERROR',progress=0,error=str(e));STOCK_DESK.event('ERROR',str(e))
+                finally:STOCK_DESK.train_lock.release()
+            threading.Thread(target=job,daemon=True,name='stock-ai-job').start()
+            return jsonify(ok=True,started=True)
+        if action=='train':return jsonify(ok=True,started=STOCK_DESK.train())
+        return jsonify(ok=True,config=STOCK_DESK.control(action,body))
+    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+
 def start_application_workers():
     if os.environ.get("AI_START_WORKERS","1")!="1":return
     def legacy_manage():
@@ -12532,6 +12743,7 @@ def start_application_workers():
     threading.Thread(target=_autotrade_loop,daemon=True).start()
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
     DESK.start()
+    STOCK_DESK.start()
 
 start_application_workers()
 
