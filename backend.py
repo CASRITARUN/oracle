@@ -12223,18 +12223,80 @@ def _build_desk_engine_class():
                     c.execute('UPDATE desk_positions SET status=?,exit_ts=? WHERE id=?',(new,stamp() if closed else None,p['id']))
             if delta:self.event('FILL',f"{o['side']} {delta} units confirmed at cumulative average {avg:.2f}",p['symbol'])
             if status in ('REJECTED','CANCELLED'):self.event(status,update.get('status_message') or status,p['symbol'])
+        def broker_match(self,o,book,manual_id=None):
+            p=self.rows('SELECT * FROM desk_positions WHERE id=?',(o['position_id'],))[0]
+            bid=str(manual_id or o['broker_id'] or '')
+            matches=[r for r in book if str(r.get('order_id'))==bid] if bid else [r for r in book if r.get('tag')==o['tag']]
+            if not matches and bid:
+                history=self.a.order_history(bid)
+                if history:matches=[history[-1]]
+            if len(matches)!=1:raise ValueError('No unique broker match. Supply the exact Kite order ID; do not delete the pending record.')
+            r=matches[0]
+            if (r.get('tradingsymbol')!=p['contract'] or r.get('exchange')!=p['exchange'] or
+                r.get('transaction_type')!=o['side'] or int(r.get('quantity') or 0)!=o['qty'] or
+                r.get('product')!=p.get('product','MIS')):raise ValueError('Broker order contract, side, quantity or product does not match this entry')
+            if manual_id:
+                when=r.get('order_timestamp')
+                if not when or abs((dt(when)-dt(o['ts'])).total_seconds())>120:raise ValueError('Manual order ID does not match the local submission time')
+                if self.rows('SELECT id FROM desk_orders WHERE broker_id=? AND id!=?',(bid,o['id'])):raise ValueError('Broker ID already belongs to another local order')
+            return r
+        def recover_order(self,oid,body):
+            # Caller owns the engine's execution/risk lock. No automatic re-arming.
+            cfg=self.config();cfg['armed']=False;self.put('config',cfg)
+            rows=self.rows('SELECT * FROM desk_orders WHERE id=?',(oid,))
+            if not rows:raise ValueError('Order not found')
+            o=rows[0]
+            if o['mode']!='live':raise ValueError('Recovery is for live broker orders')
+            if o['status'] in TERMINAL:return dict(status=o['status'],message='Order is already terminal; clear the resolved halt if no other order is pending.')
+            p=self.rows('SELECT * FROM desk_positions WHERE id=?',(o['position_id'],))[0]
+            if body.get('action')=='verify-not-placed':
+                if body.get('ack') is not True:raise ValueError('Explicit confirmation of checking Kite Orders, Trades and Positions is required')
+                if o['side']!='BUY' or o['broker_id'] or o['filled'] or p['qty'] or o['status'] not in ('UNKNOWN','SUBMITTING'):raise ValueError('Only an unacknowledged zero-fill BUY can be verified as not placed')
+                age=(datetime.now(IST)-dt(o['ts'])).total_seconds()
+                if dt(o['ts']).date()!=datetime.now(IST).date() or age<120:raise ValueError('This check requires a same-day order at least two minutes old. Older records require broker evidence.')
+                for r in self.a.orders():
+                    if r.get('tag')==o['tag'] or (r.get('exchange')==p['exchange'] and r.get('tradingsymbol')==p['contract']):raise ValueError('A broker order exists for this contract. Reconcile its order ID instead.')
+                if any(r.get('exchange')==p['exchange'] and r.get('tradingsymbol')==p['contract'] for r in self.a.trades()):raise ValueError('Broker fills exist for this contract; cannot mark not placed')
+                if any(r.get('exchange')==p['exchange'] and r.get('tradingsymbol')==p['contract'] and int(r.get('quantity') or 0)!=0 for r in self.a.holdings()):raise ValueError('Broker position exists; cannot mark not placed')
+                # This is an explicit operator attestation supported by broker snapshots,
+                # not a fabricated broker cancellation. Keep the original row and audit log.
+                with self.db() as c:
+                    c.execute("UPDATE desk_orders SET status='REJECTED',error='Operator verified NOT PLACED; broker order/trade/position checks empty' WHERE id=?",(oid,))
+                    c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason='Verified not placed by operator' WHERE id=?",(p['id'],))
+                self.event('RECOVERY','Operator confirmed NOT PLACED after broker checks; local intent retired: '+oid,p['symbol'])
+                result=dict(status='NOT_PLACED',message='Local entry request retired after your confirmation and broker checks.')
+            else:
+                supplied=str(body.get('broker_id') or '').strip()
+                r=self.broker_match(o,self.a.orders(),supplied or None)
+                self.apply_order(oid,r)
+                if r['status'] not in TERMINAL:
+                    self.a.cancel(str(r['order_id']))
+                    # Cancellation acceptance is not final status. Re-read before closing.
+                    refreshed=self.rows('SELECT * FROM desk_orders WHERE id=?',(oid,))[0]
+                    r=self.broker_match(refreshed,self.a.orders())
+                    self.apply_order(oid,r)
+                self.event('RECOVERY','Cancel/reconcile requested for '+str(r['order_id']),p['symbol'])
+                result=dict(status=r['status'],message='Broker status reconciled. Filled quantity remains owned; only the unfilled remainder is cancelled.')
+            remaining=self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
+            self.verify_positions()
+            halt=self.get('halt') or ''
+            if not remaining and not self.mismatches and any(halt.startswith(x) for x in ('Unresolved broker order','Order submission uncertain','Broker reconciliation:')):
+                self.put('halt',None);result['message']+=' Order block cleared. Entries remain disarmed; re-arm when ready.'
+            else:result['message']+=' Any remaining order or risk block still needs resolution.'
+            return result
         def reconcile(self):
             pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
             if not pending:return
             book=self.a.orders()
             for o in pending:
-                matches=[r for r in book if (o['broker_id'] and str(r.get('order_id'))==o['broker_id']) or r.get('tag')==o['tag']]
-                if len(matches)!=1:
-                    self.put('halt','Unresolved broker order · reconcile before entries');continue
-                r=matches[0];self.apply_order(o['id'],r)
-                if r['status'] not in TERMINAL and (datetime.now(IST)-dt(o['ts'])).total_seconds()>45:
-                    self.a.cancel(str(r['order_id'])) # Confirm the resulting status on a subsequent poll.
-            # Clearing a halt is explicit; successful reconciliation alone cannot re-arm entries.
+                try:
+                    r=self.broker_match(o,book);self.apply_order(o['id'],r)
+                    if r['status'] not in TERMINAL and (datetime.now(IST)-dt(o['ts'])).total_seconds()>45:self.a.cancel(str(r['order_id']))
+                except Exception as e:
+                    # One unresolved order must not abort supervision of other positions.
+                    self.put('halt','Broker reconciliation: '+str(e))
+                    with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
+            # A remaining uncertainty blocks entries, while verified positions are managed.
         def verify_positions(self):
             live=[p for p in self.active() if p['mode']=='live']
             self.mismatches=set()
@@ -12450,6 +12512,8 @@ class DeskAdapter:
             transaction_type=side,quantity=int(qty),product="MIS",order_type="LIMIT",
             validity="DAY",price=float(price),tag=tag)
     def orders(self):return kite.orders()
+    def order_history(self,order_id):return kite.order_history(order_id)
+    def trades(self):return kite.trades()
     def holdings(self):return kite.positions().get("net",[])
     def cancel(self,order_id):return kite.cancel_order(variety="regular",order_id=order_id)
     def legacy_open(self):
@@ -13239,6 +13303,22 @@ def cas_ai_control(action):
         if action=='train':return jsonify(ok=True,started=CAS_DESK.train())
         return jsonify(ok=True,config=CAS_DESK.control(action,body))
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+
+@app.route('/api/order-recovery/<desk>/<oid>',methods=['POST'])
+def recover_desk_order(desk,oid):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+    if engine is None:return jsonify(error='Unknown desk'),404
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict) or body.get('action') not in ('cancel','verify-not-placed'):return jsonify(error='Valid recovery action required'),400
+    lock=getattr(engine,'risk_lock',engine.lock)
+    if not lock.acquire(False):return jsonify(error='Order supervision is running; retry shortly'),409
+    try:
+        if hasattr(engine,'last_verify'):engine.last_verify=0.
+        return jsonify(ok=True,**engine.recover_order(oid,body))
+    except Exception as e:return jsonify(error=str(e)),409
+    finally:lock.release()
 
 
 def start_application_workers():
