@@ -4,11 +4,13 @@
 <style>
 html.website-checking body { display:none !important; }
 html.website-checking { background:#0b1220; }
+html.website-connection-warning:not(.website-checking)::after { content:'Connection interrupted — displayed data may be stale'; position:fixed; bottom:12px; right:12px; z-index:10000; padding:8px 12px; background:#593c13; color:#fff2d5; border-radius:8px; font:13px system-ui; pointer-events:none; }
 html.website-checking::before { content:'Checking website access…'; display:block; padding:48px; color:#edf3fa; font:18px system-ui; }
 </style>
 <script>
 const websiteFetch = window.fetch.bind(window);
 let websiteRevoked=false, websiteStatusBusy=false, websiteCsrf='', websiteLockBusy=false;
+let websiteVerified=false, websiteNextCheck=0, websiteFailures=0;
 function websiteHide(){document.documentElement.classList.add('website-checking')}
 function websiteSignOut(){
   websiteRevoked=true;websiteHide();window.location.replace('/website-login');
@@ -24,8 +26,8 @@ window.fetch = async (...args) => {
   }
   return response;
 };
-async function websiteCheck(){
-  if(websiteStatusBusy||websiteRevoked||websiteLockBusy)return;
+async function websiteCheck(force=false){
+  if(websiteStatusBusy||websiteRevoked||websiteLockBusy||document.hidden||(!force&&Date.now()<websiteNextCheck))return;
   websiteStatusBusy=true;
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
   try{
@@ -34,9 +36,14 @@ async function websiteCheck(){
     if(!response.ok)throw Error('Access check failed');
     const data=await response.json();
     if(data.authenticated!==true||!data.csrf)throw Error('Access check failed');
-    websiteCsrf=data.csrf;
+    websiteCsrf=data.csrf;websiteVerified=true;websiteFailures=0;websiteNextCheck=Date.now()+15000;
+    document.documentElement.classList.remove('website-connection-warning');
     if(!websiteRevoked&&!websiteLockBusy&&!document.hidden)document.documentElement.classList.remove('website-checking');
-  }catch{websiteHide()}finally{clearTimeout(timer);websiteStatusBusy=false}
+  }catch{
+    websiteFailures++;websiteNextCheck=Date.now()+Math.min(30000,5000*2**Math.min(websiteFailures-1,3));
+    if(!websiteVerified)websiteHide();
+    else if(!websiteRevoked&&!websiteLockBusy)document.documentElement.classList.add('website-connection-warning');
+  }finally{clearTimeout(timer);websiteStatusBusy=false}
 }
 async function websiteLockAll(event){
   event.preventDefault();
@@ -56,15 +63,14 @@ async function websiteLockAll(event){
     websiteSignOut();
   }catch{
     alert('Could not confirm that all devices are locked. Check your connection and try Lock all devices again.');
-  }finally{clearTimeout(timer);websiteLockBusy=false;if(!websiteRevoked)websiteCheck()}
+  }finally{clearTimeout(timer);websiteLockBusy=false;if(!websiteRevoked){if(websiteVerified)document.documentElement.classList.remove('website-checking');websiteCheck(true)}}
 }
-window.addEventListener('offline',websiteHide);
-window.addEventListener('online',websiteCheck);
-window.addEventListener('focus',()=>{websiteHide();websiteCheck()});
-window.addEventListener('pagehide',websiteHide);
-window.addEventListener('pageshow',()=>{websiteHide();websiteCheck()});
-document.addEventListener('visibilitychange',()=>{websiteHide();if(!document.hidden)websiteCheck()});
-setInterval(websiteCheck,2000);
+window.addEventListener('offline',()=>{if(websiteVerified)document.documentElement.classList.add('website-connection-warning')});
+window.addEventListener('online',()=>websiteCheck(true));
+window.addEventListener('focus',()=>websiteCheck());
+window.addEventListener('pageshow',()=>websiteCheck());
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)websiteCheck()});
+setInterval(()=>websiteCheck(),5000);
 websiteCheck();
 </script>
 <meta charset="UTF-8">
@@ -1046,7 +1052,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
     <section class="dk-panel"><div class="dk-title"><h2>Live readiness</h2><span id="dkLiveLock" class="dk-badge">Locked</span></div><div id="dkGates"></div><button id="dkLiveOverride" type="button">Enable manual override</button><p class="dk-footnote">Only forward paper trades count toward automatic eligibility. Manual override unlocks live selection; all other trading controls still apply.</p></section></aside></div>
   </section>
   <section class="dk-view" data-pane="learning" hidden><div class="dk-section-intro"><div><p class="dk-eyebrow">LEARNING LAB</p><h2>Three kinds of evidence. One clear record.</h2><p>Learn from the archive, measure unseen predictions, then validate trading outcomes.</p></div><div class="dk-actions"><button id="dkSync">Sync recent history</button><button id="dkTrain" class="dk-primary">Train historical model</button></div></div><section class="dk-panel"><div class="dk-title"><h2 id="dkTrainingState">Learning job · idle</h2><span id="dkTrainingPct">0%</span></div><div class="dk-progress"><i id="dkTrainingFill"></i></div><p id="dkTrainingError" class="dk-footnote"></p></section><div class="dk-learning-grid"><section class="dk-panel"><span class="dk-step">01 / HISTORICAL</span><h2>Learn the patterns</h2><p class="dk-muted">Regularized direction model · shared historical and current-market features.</p><div id="dkHistorical"></div></section><section class="dk-panel"><span class="dk-step">02 / FORWARD PREDICTIONS</span><h2>Learn as the market moves</h2><p class="dk-muted">Each new candle creates a prediction. Its actual outcome is checked later, even without a trade.</p><div id="dkOnline"></div></section><section class="dk-panel"><span class="dk-step">03 / PAPER EXECUTION</span><h2>Prove the trading result</h2><p class="dk-muted">Simulated fills use current bid/ask, visible depth, adverse slippage and estimated order costs.</p><div id="dkPaperLearning"></div></section></div><section class="dk-panel"><div class="dk-title"><h2>Historical coverage</h2><span class="dk-muted">Actual stored data · no synthetic history</span></div><div id="dkCoverage" class="dk-table-wrap"></div><p class="dk-footnote">Training uses up to 20,000 recent stored candles per index. The final 20% by time is reserved for validation, with overlapping label horizons removed from training. Validation results are predictive diagnostics, not a historical options-profit backtest.</p></section></section>
-  <section class="dk-view" data-pane="journal" hidden><div class="dk-section-intro"><div><p class="dk-eyebrow">TRADE JOURNAL</p><h2>The execution record</h2><p>Paper and live trades retain their mode, fills, fees and exit reasons.</p></div><button id="dkExport">Export trade CSV</button></div><section class="dk-panel"><div class="dk-title"><h2>Forward paper equity</h2><span class="dk-muted">After estimated costs</span></div><div id="dkEquity" class="dk-chart"></div></section><section class="dk-panel"><h2>Trades</h2><div id="dkTrades" class="dk-table-wrap"></div></section><section class="dk-panel"><h2>Order reconciliation</h2><p class="dk-muted">Submitted, partially filled, completed and rejected are distinct states. Uncertain submissions block new entries.</p><div id="dkOrders" class="dk-table-wrap"></div></section></section>
+  <section class="dk-view" data-pane="journal" hidden><div class="dk-section-intro"><div><p class="dk-eyebrow">TRADE JOURNAL</p><h2>The execution record</h2><p>Paper and live trades retain their mode, fills, fees and exit reasons.</p></div><button id="dkExport">Export trade CSV</button></div><section class="dk-panel"><div class="dk-title"><h2>Forward paper equity</h2><span class="dk-muted">After estimated costs</span></div><div id="dkEquity" class="dk-chart"></div></section><section class="dk-panel"><h2>Trades</h2><div id="dkTrades" class="dk-table-wrap"></div></section><section class="dk-panel"><h2>Order reconciliation</h2><p class="dk-muted">Submitted, partially filled, completed and rejected are distinct states. Uncertain submissions block new entries.</p><div id="dkOrders" class="dk-table-wrap"></div><h3>Resolve a pending order</h3><p class="dk-muted">Cancel the unfilled remainder or supply its exact Kite order ID. Filled quantities remain positions. Entries stay disarmed after recovery.</p><div id="dkRecovery"></div></section></section>
   <section class="dk-view" data-pane="risk" hidden><div class="dk-section-intro"><div><p class="dk-eyebrow">RISK & CONTROLS</p><h2>Define the boundaries before entry.</h2><p>Saving settings does not arm the engine or change execution mode.</p></div></div><form id="dkSettings" class="dk-panel"><div class="dk-settings" id="dkSettingsFields"></div><div class="dk-title"><p class="dk-footnote">Risk is estimated from the planned stop. Gaps, costs and unfilled exits can produce larger losses.</p><button type="submit" class="dk-primary">Save risk settings</button></div></form><section class="dk-panel"><h2>Execution recovery</h2><p id="dkHalt" class="dk-muted">No unresolved order reported.</p><button id="dkClear">Clear resolved halt</button><p class="dk-footnote">Orders must reconcile before a halt can clear. Entries stay disarmed until you explicitly re-arm them.</p><div id="dkLegacy"></div></section><section class="dk-panel"><h2>How this desk operates</h2><div class="dk-rules"><p><strong>Paper first.</strong> The live gate requires 60 closed paper trades, a 10-day record, at least 42% wins, 0.05R net expectancy and a 1.2 profit factor. Manual override can bypass this paper-readiness gate.</p><p><strong>Confirmed fills.</strong> Live orders are price-bounded limits. Only broker-confirmed filled quantities change positions. Unfilled orders are cancelled after 45 seconds and rechecked.</p><p><strong>Continuous supervision.</strong> Stops, partial profit-taking, targets, time exits and reversal checks run in the backend. A profitable trim moves the remaining stop to entry. Keep the process and connection running; these are not exchange-hosted protective stops.</p><p><strong>Honest learning.</strong> Direction predicts index movement, not profit certainty. The online model joins at 20% weight only after its own forward validation passes the minimum AUC.</p></div></section></section>
   <footer class="dk-footer"><span>AI DESK / V2</span><span>Market timestamps in IST · 15-second engine cycle</span><span id="dkUpdated">Not yet connected</span></footer>
   <dialog id="dkDialog"><form method="dialog"><p class="dk-eyebrow">EXECUTION CONTROL</p><h2 id="dkDialogTitle"></h2><p id="dkDialogText"></p><div class="dk-actions"><button value="cancel">Cancel</button><button id="dkDialogConfirm" value="confirm" class="dk-primary">Confirm</button></div></form></dialog>
@@ -2723,6 +2729,7 @@ function dkRender(s){
   dkHTML('dkEquity',dkLineChart(ev.equity,'pnl','Close at least two paper trades to draw the equity curve.'));
   dkHTML('dkTrades',dkTable(['Opened','Index','Mode','Contract','Entry','Status','Realized','Est. costs','Exit reason'],(s.trades||[]).map(p=>[dkDate(p.ts),p.symbol,p.mode,p.contract,dkNum(p.entry),p.status,dkMoney(p.pnl),dkMoney(p.fees),p.exit_reason||'—'])));
   dkHTML('dkOrders',dkTable(['Time','Side','Mode','Requested / filled','Status','Broker ID','Reason'],(s.orders||[]).map(o=>[dkTime(o.ts),o.side,o.mode,o.qty+' / '+o.filled,o.status,o.broker_id||'Awaiting acknowledgement',o.error||o.reason])));
+  renderIndexRecovery(s.orders||[]);
   if(!deskDirty)dkFields.forEach(([k])=>{const input=dkEl('dkSettings')?.elements.namedItem(k);if(input)input.value=cfg[k]});
   dkText('dkHalt',s.halt||'No unresolved order reported.');dkEl('dkClear').disabled=!s.halt;
   dkHTML('dkLegacy',(s.legacy||[]).length?`<p class="dk-footnote negative">${s.legacy.length} legacy position(s) remain open. Reconcile and close those positions in the previous controls/broker before enabling new entries.</p>`:'');
@@ -3446,6 +3453,34 @@ function renderStockRecovery(orders){
   row.append(label,input,cancel);
   if(!o.broker_id&&!o.filled&&o.side==='BUY'&&['UNKNOWN','SUBMITTING'].includes(o.status)){
    const absent=document.createElement('button');absent.textContent='Verify not placed';absent.onclick=()=>recoverStockOrder(o.id,'verify-not-placed','');row.append(absent);
+  }
+  host.append(row);
+ }
+}
+
+</script>
+<script>
+async function recoverIndexOrder(oid,action,brokerId){
+ const note=action==='verify-not-placed'?'I checked Kite Orders, Trades and Positions: this entry was NOT placed. Retire the local request only if the automated broker checks also find no order, fill or holding?':'Cancel the unfilled remainder and reconcile this order with Kite? Any filled quantity will remain a position. New entries will be disarmed.';
+ if(!confirm(note))return;
+ try{
+  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),30000);let r,d;
+  try{r=await fetch('/api/order-recovery/index/'+encodeURIComponent(oid),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,broker_id:brokerId||'',ack:action==='verify-not-placed'}),signal:ctl.signal});d=await r.json()}finally{clearTimeout(timer)}
+  if(!r.ok)throw Error(d.error||'Recovery failed');await refreshAutoTradeAI();dkNotice(d.message);
+ }catch(e){dkNotice(e.name==='AbortError'?'Recovery response timed out. Refresh the journal and check Kite before retrying.':e.message,true)}
+}
+function renderIndexRecovery(orders){
+ const host=document.getElementById('dkRecovery');host.replaceChildren();
+ const pending=orders.filter(o=>o.mode==='live'&&!['COMPLETE','CANCELLED','REJECTED'].includes(o.status));
+ if(!pending.length){host.textContent='No pending live orders.';return}
+ for(const o of pending){
+  const row=document.createElement('div');row.style.cssText='margin:14px 0;padding:14px;border:1px solid #455268;border-radius:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:center';
+  const label=document.createElement('span');label.textContent=o.side+' · '+o.status+' · '+o.qty+' requested / '+o.filled+' filled · '+o.id.slice(0,8);
+  const input=document.createElement('input');input.placeholder='Kite order ID (if missing)';input.value=o.broker_id||'';input.setAttribute('aria-label','Exact Kite order ID');
+  const cancel=document.createElement('button');cancel.textContent='Cancel / reconcile';cancel.onclick=()=>recoverIndexOrder(o.id,'cancel',input.value);
+  row.append(label,input,cancel);
+  if(!o.broker_id&&!o.filled&&o.side==='BUY'&&['UNKNOWN','SUBMITTING'].includes(o.status)){
+   const absent=document.createElement('button');absent.textContent='Verify not placed';absent.onclick=()=>recoverIndexOrder(o.id,'verify-not-placed','');row.append(absent);
   }
   host.append(row);
  }
