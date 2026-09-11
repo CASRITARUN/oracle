@@ -11965,6 +11965,7 @@ def _build_desk_engine_class():
         def __init__(self, adapter):
             self.a=adapter;self.lock=threading.RLock();self.train_lock=threading.Lock()
             self.signals={};self.health={};self.mismatches=set();self.training=dict(status='IDLE',progress=0)
+            self.record_cache={};self.recorder_error=None
             self.last_cycle=None;self.stop_event=threading.Event();self.started=False
             self.init_db()
             # A process restart must never silently re-arm real trading.
@@ -11975,10 +11976,15 @@ def _build_desk_engine_class():
                 c.execute("UPDATE desk_positions SET status='CANCELLED' WHERE status='ENTRY_PENDING' AND qty=0 AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=desk_positions.id)")
             for order in self.rows("SELECT * FROM desk_orders WHERE mode='paper' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
                 self.apply_order(order['id'],dict(status='CANCELLED',filled_quantity=order['filled'],average_price=order['notional']/order['filled'] if order['filled'] else 0))
+            for position in self.active():
+                self.record_trade(position['id'],'RESTART_GAP',dict(note='Process restarted; observations during downtime are unavailable.'))
         def db(self):return self.a.db()
         def init_db(self):
             with self.db() as c:
                 c.executescript('''
+                CREATE TABLE IF NOT EXISTS desk_trade_events(id INTEGER PRIMARY KEY,position_id TEXT,ts TEXT,kind TEXT,payload TEXT);
+                CREATE INDEX IF NOT EXISTS desk_trade_events_position ON desk_trade_events(position_id,id);
+                CREATE TABLE IF NOT EXISTS desk_exit_reviews(id INTEGER PRIMARY KEY,position_id TEXT,ts TEXT,payload TEXT);
                 CREATE TABLE IF NOT EXISTS desk_meta(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS desk_models(id TEXT PRIMARY KEY,ts TEXT,payload TEXT);
                 CREATE TABLE IF NOT EXISTS desk_events(id INTEGER PRIMARY KEY,ts TEXT,kind TEXT,symbol TEXT,detail TEXT);
@@ -12001,6 +12007,41 @@ def _build_desk_engine_class():
             with self.db() as c:c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',(key,json.dumps(value)))
         def event(self,kind,detail,symbol=''):
             with self.db() as c:c.execute('INSERT INTO desk_events VALUES(NULL,?,?,?,?)',(stamp(),kind,symbol,str(detail)))
+        def record_trade(self,pid,kind,payload):
+            # Recorder failures must not prevent broker reconciliation or protective exits.
+            try:
+                with self.db() as c:
+                    if self.recorder_error:
+                        c.execute('INSERT INTO desk_trade_events(position_id,ts,kind,payload) VALUES(?,?,?,?)',
+                            (pid,stamp(),'RECORDER_GAP',json.dumps(dict(note=self.recorder_error))))
+                    c.execute('INSERT INTO desk_trade_events(position_id,ts,kind,payload) VALUES(?,?,?,?)',
+                        (pid,stamp(),kind,json.dumps(payload,default=str)))
+                self.recorder_error=None
+                return True
+            except Exception:
+                self.recorder_error='Some events could not be saved; recording is incomplete.'
+                return False
+        def record_observation(self,p,q=None,error=None,decision=None):
+            now=time.monotonic();prev=self.record_cache.get(p['id'],{})
+            sig=self.signals.get(p['symbol'],{})
+            signal={k:sig.get(k) for k in ('direction','confidence','spot','bar_ts','ts','bar_age','model_id')}
+            key=(error,decision,signal.get('direction'),signal.get('bar_ts'),p.get('stop'),p.get('target'))
+            # At most one routine sample per second, plus decision / signal / gap changes.
+            if prev.get('key')==key and now-prev.get('at',0)<1:return
+            if error and prev.get('key')==key and now-prev.get('at',0)<30:return
+            payload=dict(signal=signal,stop=p.get('stop'),target=p.get('target'),remaining_qty=p['qty'],decision=decision,
+                seconds_since_previous=round(now-prev['at'],3) if prev else None)
+            if error:payload['error']=str(error)
+            else:
+                payload['quote']={k:q.get(k) for k in ('bid','ask','spread_pct','bid_qty','ask_qty','volume','oi','quote_ts','exchange_ts','source')}
+                payload['open_pnl_at_bid']=(q['bid']-p['entry'])*p['qty']
+                payload['net_total_at_bid']=payload['open_pnl_at_bid']+p['pnl']-p['fees']
+            if self.record_trade(p['id'],'DATA_GAP' if error else 'OBSERVATION',payload):
+                self.record_cache[p['id']]=dict(at=now,key=key)
+        def trade_timeline(self,pid,after=0,limit=200):
+            rows=self.rows('SELECT * FROM desk_trade_events WHERE position_id=? AND id>? ORDER BY id LIMIT ?', (pid,after,limit+1))
+            return dict(events=[dict(id=r['id'],ts=r['ts'],kind=r['kind'],data=json.loads(r['payload'])) for r in rows[:limit]],
+                next_after=rows[limit-1]['id'] if len(rows)>limit else None)
         def config(self):return {**DEFAULTS,**self.get('config',{})}
         def rows(self,sql,args=()):
             with self.db() as c:return [dict(r) for r in c.execute(sql,args).fetchall()]
@@ -12189,14 +12230,20 @@ def _build_desk_engine_class():
                 c.execute('INSERT INTO desk_orders(id,ts,position_id,side,qty,mode,tag,status,limit_price,reason) VALUES(?,?,?,?,?,?,?,?,?,?)',
                     (oid,stamp(),p['id'],side,qty,p['mode'],tag,'SUBMITTING',price,reason))
                 c.execute('UPDATE desk_positions SET status=? WHERE id=?',('ENTRY_PENDING' if side=='BUY' else 'EXIT_PENDING',p['id']))
+                if side=='SELL':
+                    snapshot=dict(reason=reason,limit_price=price,requested_qty=qty,observed_bid=self.health.get(p['id'],{}).get('bid'),stop=p.get('stop'),target=p.get('target'),signal={k:self.signals.get(p['symbol'],{}).get(k) for k in ('direction','confidence','spot','bar_ts','ts')},risk_config=self.config())
+                    c.execute('INSERT INTO desk_exit_reviews(position_id,ts,payload) VALUES(?,?,?)',(p['id'],stamp(),json.dumps(snapshot)))
+            self.record_trade(p['id'],'ORDER_INTENT',dict(order_id=oid,side=side,qty=qty,limit_price=price,reason=reason,mode=p['mode'],stop=p.get('stop'),target=p.get('target'),signal=self.signals.get(p['symbol'],{})))
             if p['mode']=='paper':
                 self.apply_order(oid,dict(status='COMPLETE',filled_quantity=qty,average_price=price,order_id='PAPER-'+oid));return
             try:
                 broker_id=self.a.place(p['exchange'],p['contract'],side,qty,price,tag)
                 with self.db() as c:c.execute("UPDATE desk_orders SET broker_id=?,status='OPEN' WHERE id=?",(str(broker_id),oid))
+                self.record_trade(p['id'],'BROKER_ACK',dict(order_id=oid,broker_id=str(broker_id),side=side))
                 self.event('ORDER',f'{side} submitted; awaiting confirmed fill',p['symbol'])
             except Exception as e:
                 with self.db() as c:c.execute("UPDATE desk_orders SET status='UNKNOWN',error=? WHERE id=?",(str(e),oid))
+                self.record_trade(p['id'],'SUBMISSION_UNCERTAIN',dict(order_id=oid,error=str(e)))
                 self.put('halt','Order submission uncertain · inspect broker orders');self.event('ERROR','Submission uncertain: '+str(e),p['symbol'])
         def apply_order(self,oid,update):
             with self.db() as c:
@@ -12221,6 +12268,9 @@ def _build_desk_engine_class():
                     row=c.execute('SELECT qty FROM desk_positions WHERE id=?',(p['id'],)).fetchone();qty=row[0]
                     closed=qty==0 and o['side']=='SELL';new='CLOSED' if closed else 'OPEN' if qty else 'CANCELLED'
                     c.execute('UPDATE desk_positions SET status=?,exit_ts=? WHERE id=?',(new,stamp() if closed else None,p['id']))
+            if delta or status!=o['status'] or notional!=o['notional']:
+                self.record_trade(p['id'],'FILL' if delta else 'ORDER_STATUS',dict(order_id=oid,side=o['side'],status=status,filled_total=filled,fill_delta=delta,average_price=avg,incremental_fill_price=delta_value/delta if delta else None,broker_id=update.get('order_id') or o['broker_id'],broker_timestamp=update.get('exchange_update_timestamp') or update.get('order_timestamp'),reason=o['reason'],error=update.get('status_message')))
+            if status in TERMINAL and not self.rows("SELECT id FROM desk_positions WHERE id=? AND status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING')",(p['id'],)):self.record_cache.pop(p['id'],None)
             if delta:self.event('FILL',f"{o['side']} {delta} units confirmed at cumulative average {avg:.2f}",p['symbol'])
             if status in ('REJECTED','CANCELLED'):self.event(status,update.get('status_message') or status,p['symbol'])
         def broker_match(self,o,book,manual_id=None):
@@ -12283,6 +12333,7 @@ def _build_desk_engine_class():
             if not remaining and not self.mismatches and any(halt.startswith(x) for x in ('Unresolved broker order','Order submission uncertain','Broker reconciliation:')):
                 self.put('halt',None);result['message']+=' Order block cleared. Entries remain disarmed; re-arm when ready.'
             else:result['message']+=' Any remaining order or risk block still needs resolution.'
+            self.record_trade(p['id'],'OPERATOR_RECOVERY',dict(order_id=oid,action=body.get('action'),result=result))
             return result
         def reconcile(self):
             pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
@@ -12330,18 +12381,23 @@ def _build_desk_engine_class():
             if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
             recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
             if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
+            s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
             pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
             with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
             p=self.rows('SELECT * FROM desk_positions WHERE id=?',(pid,))[0]
+            self.record_trade(pid,'ENTRY_PLAN',s)
             limit=math.ceil(entry/s.get('tick',.05))*s.get('tick',.05)
             self.submit(p,'BUY',qty,round(limit,2),'Qualified direction and risk checks')
         def manage(self,close_all=False):
             cfg=self.config()
             for p in self.active():
-                if p['qty']<=0 or p['id'] in self.mismatches:continue
+                if p['qty']<=0:continue
+                if p['id'] in self.mismatches:
+                    self.record_observation(p,error='Broker quantity mismatch; automated exit suspended');continue
                 q,err=self.a.quote(p['exchange'],p['contract'])
-                if err:self.health[p['id']]={'reason':err};continue
+                if err:
+                    self.health[p['id']]={'reason':err};self.record_observation(p,error=err);continue
                 bid=q['bid'];self.health[p['id']]=dict(bid=bid,reason='HOLD · within plan')
                 setup=json.loads(p['setup']);sig=self.signals.get(p['symbol'],{})
                 reason=None
@@ -12353,6 +12409,7 @@ def _build_desk_engine_class():
                 elif self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
                 elif sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
                 elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-p['stop'])*cfg['partial_take_r']:reason='Partial profit at planned R'
+                self.record_observation(p,q,decision=reason or 'HOLD')
                 if reason:
                     self.health[p['id']]['reason']=reason
                     if p['status']!='OPEN':
@@ -12449,6 +12506,47 @@ def _build_desk_engine_class():
                     self.put('halt',None);cfg['armed']=False
                 else:raise ValueError('Unknown action')
                 self.put('config',cfg);self.event('CONTROL',action);return cfg
+        def trade_review(self,pid):
+            rows=self.rows('SELECT * FROM desk_positions WHERE id=?',(pid,))
+            if not rows:raise ValueError('Trade not found')
+            p=rows[0];setup=json.loads(p.get('setup') or '{}')
+            orders=self.rows('SELECT * FROM desk_orders WHERE position_id=? ORDER BY ts,id',(pid,))
+            bought=sum(o['filled'] for o in orders if o['side']=='BUY');sold=sum(o['filled'] for o in orders if o['side']=='SELL')
+            buy_value=sum(o['notional'] for o in orders if o['side']=='BUY');sell_value=sum(o['notional'] for o in orders if o['side']=='SELL')
+            entry=buy_value/bought if bought else None;exit_price=sell_value/sold if sold else None
+            explanations=[]
+            if p['mode']=='paper':explanations.append('Paper trade: fills and P&L are simulated, not broker executions.')
+            if not bought:explanations.append('No entry fill is recorded; this is an unfilled request, not a completed losing trade.')
+            elif sold:
+                change=(exit_price/entry-1)*100
+                explanations.append(f'Average option exit premium was {change:+.2f}% relative to average entry. Realized P&L is derived from confirmed fills; estimated fees are deducted separately.')
+            explanations.append('Recorded exit trigger: '+str(p.get('exit_reason') or 'Position remains open / no exit recorded'))
+            explanations.append('The model estimates underlying direction, not the probability of an option trade being profitable.')
+            counts=self.rows('SELECT kind,COUNT(*) n FROM desk_trade_events WHERE position_id=? GROUP BY kind',(pid,))
+            coverage={r['kind']:r['n'] for r in counts}
+            limitation='Recorded observations are samples from existing supervision, not every exchange tick. Underlying signal prices may be from older candles (see bar_ts). News, continuous IV and auction imbalance are not recorded; market causes cannot be proven. Offline periods and gaps cannot be reconstructed. This recorder does not automatically retrain the trading models from profits or losses.'
+            if not coverage.get('ENTRY_PLAN'):limitation+=' Historical trade: no event recorder entry record; only previously stored evidence is available.'
+            if self.recorder_error:limitation+=' '+self.recorder_error
+            observations=self.rows("SELECT MIN(CAST(json_extract(payload,'$.quote.bid') AS REAL)) low, MAX(CAST(json_extract(payload,'$.quote.bid') AS REAL)) high, MAX(CAST(json_extract(payload,'$.quote.spread_pct') AS REAL)) widest_spread FROM desk_trade_events WHERE position_id=? AND kind='OBSERVATION'",(pid,))[0]
+            drop=self.rows("""WITH samples AS (SELECT ts,CAST(json_extract(payload,'$.quote.bid') AS REAL) bid,
+                LAG(CAST(json_extract(payload,'$.quote.bid') AS REAL)) OVER (ORDER BY id) previous_bid,
+                LAG(ts) OVER (ORDER BY id) previous_ts FROM desk_trade_events WHERE position_id=? AND kind='OBSERVATION')
+                SELECT ts,previous_ts,bid,previous_bid,bid-previous_bid change FROM samples WHERE previous_bid>0 ORDER BY change LIMIT 1""",(pid,))
+            opposite=self.rows("SELECT ts,json_extract(payload,'$.signal.direction') direction,json_extract(payload,'$.signal.bar_ts') bar_ts FROM desk_trade_events WHERE position_id=? AND kind='OBSERVATION' AND json_extract(payload,'$.signal.direction') IS NOT NULL AND json_extract(payload,'$.signal.direction')!=? ORDER BY id LIMIT 1",(pid,setup.get('direction','')))
+            changes=dict(largest_sampled_bid_drop=drop[0] if drop and drop[0]['change']<0 else None,first_signal_different_from_entry=opposite[0] if opposite else None)
+            if changes['largest_sampled_bid_drop']:
+                v=changes['largest_sampled_bid_drop'];explanations.append(f"Largest recorded bid decline between samples: {v['previous_bid']:.2f} to {v['bid']:.2f}, between {v['previous_ts']} and {v['ts']}. Unobserved moves between samples are unknown.")
+            if opposite:explanations.append('A monitored direction signal differed from the entry plan at '+opposite[0]['ts']+'; its source candle time is recorded separately. This alone does not establish the cause of loss.')
+            if observations['low'] is not None:
+                explanations.append(f"Observed option bids ranged from {observations['low']:.2f} to {observations['high']:.2f}; these are sampled prices, not guaranteed intratrade extremes.")
+            if not setup.get('risk_config_at_entry'):limitation+=' Historical risk settings were not captured for this trade; current settings must not be substituted.'
+            return dict(position={k:v for k,v in p.items() if k!='setup'},
+                entry_plan={k:setup.get(k) for k in ('ts','bar_ts','bar_age','direction','p_up','confidence','model_id','regime','spot','contract','entry','stop','target','qty','lots','max_lots','requested_lots','spread','reason','risk_config_at_entry')},
+                outcome=dict(bought=bought,sold=sold,remaining=p['qty'],average_entry=entry,average_exit=exit_price,
+                    realized=p['pnl'],estimated_costs=p['fees'],net_realized=p['pnl']-p['fees']),
+                explanations=explanations,limitations=limitation,coverage=coverage,observed_range=observations,observed_changes=changes,timeline=self.trade_timeline(pid),recorder_error=self.recorder_error,
+                orders=[{k:o.get(k) for k in ('ts','side','qty','filled','notional','limit_price','status','broker_id','reason','error')} for o in orders],
+                exit_observations=[dict(ts=r['ts'],snapshot=json.loads(r['payload'])) for r in self.rows('SELECT ts,payload FROM desk_exit_reviews WHERE position_id=? ORDER BY id',(pid,))])
         def state(self):
             cfg=self.config();model=self.model();evidence=self.evidence();active=self.active()
             for p in active:
@@ -12460,7 +12558,7 @@ def _build_desk_engine_class():
             if model:model={k:v for k,v in model.items() if k not in ('mu','sd','w','bias')}
             online=self.get('online_model');online={k:online[k] for k in ('samples','accuracy','auc','ts')} if online else None
             trades=self.rows("SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100")
-            return dict(version='2.0',timestamp=stamp(),connected=self.a.connected(),market_open=self.a.market_open(),config=cfg,
+            return dict(version='2.0',recorder_error=self.recorder_error,timestamp=stamp(),connected=self.a.connected(),market_open=self.a.market_open(),config=cfg,
                 block=self.block(),last_cycle=self.last_cycle,training=self.training,model=model,online=online,evidence=evidence,
                 observations=obs,signals=signals,positions=active,trades=trades,
                 orders=self.rows('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60'),
@@ -12504,6 +12602,7 @@ class DeskAdapter:
             st=quote_stats(q)
             if not st.get("bid") or not st.get("ask") or st["bid"]>st["ask"]:return None,"No executable bid/ask"
             if not all(math.isfinite(float(st[k])) for k in ("bid","ask")):return None,"Invalid option prices"
+            st.update(quote_ts=ts.isoformat(),source="Kite REST; timestamp IST")
             return st,None
         except Exception as e:return None,str(e)
     def place(self,exchange,contract,side,qty,price,tag):
@@ -12823,6 +12922,7 @@ class CASAdapter(DeskAdapter):
         self.stream_lock=threading.RLock();self.wake=threading.Event();self.stream_quotes={};self.stream_queue=deque()
         self.stream_signatures={};self.stream_generation=0;self.seen_generation=0;self.wanted_tokens=set();self.token_keys={}
         self.last_subscription=0.;self.last_tick_mono=0.;self.order_dirty=False;self.exit_quotes={}
+        self.last_connect_attempt=0.;self.stream_retry_needed=False;self.stream_error_code=None
     @contextmanager
     def db(self):
         c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'cas_options_ai.db'),timeout=10)
@@ -12852,7 +12952,7 @@ class CASAdapter(DeskAdapter):
         if ws is not self.stream:return
         self._invalidate_stream(ws,'CONNECTED · warming fresh ticks')
         with self.stream_lock:
-            self.stream_connected=True;tokens=list(self.wanted_tokens)
+            self.stream_connected=True;self.stream_retry_needed=False;self.stream_error_code=None;tokens=list(self.wanted_tokens)
         if tokens:ws.subscribe(tokens);ws.set_mode(ws.MODE_FULL,tokens)
         self.wake.set()
     def _on_ticks(self,ws,ticks):
@@ -12883,7 +12983,23 @@ class CASAdapter(DeskAdapter):
         self.wake.set()
     def _on_order(self,ws,data):
         if ws is self.stream:self.order_dirty=True;self.wake.set()
+    def request_stream_reconnect(self):
+        self.stream_retry_needed=True;self.last_connect_attempt=0.;self.wake.set()
+    def _on_stream_error(self,ws,code,reason):
+        if ws is not self.stream:return
+        self.stream_error_code=str(code)
+        self._invalidate_stream(ws,'STREAM ERROR · code '+str(code))
+        self.stream_retry_needed=True
+    def _on_stream_exhausted(self,ws):
+        if ws is not self.stream:return
+        self._invalidate_stream(ws,'RECONNECT EXHAUSTED · retry scheduled');self.stream_retry_needed=True
     def ensure_stream(self):
+        try:self._ensure_stream()
+        except Exception as e:
+            if self.stream:self._invalidate_stream(self.stream,'CONNECT FAILED · '+type(e).__name__)
+            else:self.stream_status='CONNECT FAILED · '+type(e).__name__
+            self.stream_retry_needed=True
+    def _ensure_stream(self):
         token=SESSION.get('access_token')
         if not token:
             if self.stream:
@@ -12892,18 +13008,20 @@ class CASAdapter(DeskAdapter):
                 from twisted.internet import reactor
                 reactor.callFromThread(old.close)
             self.stream_token=None;return
-        if self.stream and token==self.stream_token:return
+        if self.stream and token==self.stream_token and not self.stream_retry_needed:return
+        if time.monotonic()-self.last_connect_attempt<10:return
+        self.last_connect_attempt=time.monotonic()
         from kiteconnect import KiteTicker
         from twisted.internet import reactor
         if self.stream:
             old=self.stream;self._invalidate_stream(old,'SESSION CHANGED');reactor.callFromThread(old.close)
         self.stream=KiteTicker(API_KEY,token,reconnect=True,reconnect_max_tries=50,reconnect_max_delay=10)
-        self.stream_token=token;ws=self.stream;self.stream_status='CONNECTING'
+        self.stream_token=token;ws=self.stream;self.stream_retry_needed=False;self.stream_status='CONNECTING'
         ws.on_connect=self._on_connect;ws.on_ticks=self._on_ticks;ws.on_order_update=self._on_order
         ws.on_close=lambda w,c,r:self._invalidate_stream(w,'DISCONNECTED · reconnecting')
-        ws.on_error=lambda w,c,r:self._invalidate_stream(w,'STREAM ERROR · reconnecting')
+        ws.on_error=self._on_stream_error
         ws.on_reconnect=lambda w,n:self._invalidate_stream(w,'RECONNECTING')
-        ws.on_noreconnect=lambda w:self._invalidate_stream(w,'RECONNECT EXHAUSTED · reconnect Kite')
+        ws.on_noreconnect=self._on_stream_exhausted
         ws.connect(threaded=True)
     def update_subscriptions(self):
         if time.monotonic()-self.last_subscription<3:return
@@ -12947,6 +13065,7 @@ class CASAdapter(DeskAdapter):
         with self.stream_lock:
             pending=list(self.stream_queue);self.stream_queue.clear();snapshot=dict(self.stream_quotes);generation=self.stream_generation
         if generation!=self.seen_generation:
+            for p in self.engine.active():self.engine.record_trade(p['id'],'STREAM_RESET',dict(note='Stream generation changed: reconnect, invalidation or queue overflow. Price continuity is not guaranteed.',generation=generation))
             self.engine.ticks.clear();self.engine.option_ticks.clear();self.engine.confirm.clear();self.seen_generation=generation
         # Drain every received update into history, not merely the last snapshot.
         for key,q in pending:
@@ -12962,7 +13081,7 @@ class CASAdapter(DeskAdapter):
         with self.stream_lock:
             return dict(connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
                 last_tick_age_seconds=round(time.monotonic()-self.last_tick_mono,2) if self.last_tick_mono else None,
-                source='KiteTicker FULL · event-driven',exit_fallback='REST only when streaming is disconnected')
+                source='KiteTicker FULL · event-driven',error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
     def fresh(self,key):
         q=self.quotes.get(key)
         if not q:raise ValueError('Missing quote: '+key)
@@ -12981,7 +13100,7 @@ class CASAdapter(DeskAdapter):
         try:
             raw,ts=self.fresh(exchange+':'+contract);q=quote_stats(raw)
             if not all(isinstance(q.get(k),(int,float)) and math.isfinite(q[k]) and q[k]>0 for k in ('bid','ask')) or q['ask']<q['bid']:raise ValueError('No executable option book')
-            q['quote_ts']=ts.isoformat();return q,None
+            q['quote_ts']=ts.isoformat();q['source']='Kite stream; receipt timestamp' if '_received_mono' in raw else 'Kite REST fallback; exchange timestamp';q['exchange_ts']=str(raw.get('_exchange_ts') or raw.get('timestamp'));return q,None
         except Exception as e:return None,str(e)
     def place(self,exchange,contract,side,qty,price,tag):
         with self.db() as c:
@@ -13240,7 +13359,8 @@ class CASEngine(DeskEngine):
             self.reconcile();self.verify_positions();cfg=self.config();hhmm=now_ist().strftime('%H:%M')
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
             if not self.a.market_open():return
-            if hhmm<cfg['entry_start'] and not self.active():return
+            warm_start=(datetime.strptime(cfg['entry_start'],'%H:%M')-timedelta(minutes=2)).strftime('%H:%M')
+            if hhmm<warm_start and not self.active():return
             if hhmm>=cfg['square_off'] and not self.active():return
             try:self.a.batch()
             except Exception:
@@ -13298,6 +13418,8 @@ def cas_ai_control(action):
     body=request.get_json(silent=True) or {}
     if not isinstance(body,dict):return jsonify(error='JSON object required'),400
     try:
+        if action=='reconnect':
+            CAS_DESK.a.request_stream_reconnect();return jsonify(ok=True,message='Reconnect requested; trading gates still apply')
         if action=='scan':
             threading.Thread(target=CAS_DESK.cycle,daemon=True,name='cas-manual-scan').start();return jsonify(ok=True)
         if action=='train':return jsonify(ok=True,started=CAS_DESK.train())
@@ -13319,6 +13441,112 @@ def recover_desk_order(desk,oid):
         return jsonify(ok=True,**engine.recover_order(oid,body))
     except Exception as e:return jsonify(error=str(e)),409
     finally:lock.release()
+
+
+@app.route('/api/trade-review/<desk>/<pid>')
+def desk_trade_review(desk,pid):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+    if engine is None:return jsonify(error='Unknown desk'),404
+    try:return jsonify(engine.trade_review(pid))
+    except ValueError as e:return jsonify(error=str(e)),404
+
+
+def _review_engine(desk):
+    return {'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+
+
+def _review_filter():
+    date=request.args.get('date','')
+    if date:
+        from datetime import datetime as date_parser
+        if date_parser.strptime(date,'%Y-%m-%d').strftime('%Y-%m-%d')!=date:raise ValueError('Use YYYY-MM-DD')
+    return date
+
+
+@app.route('/api/trade-history/<desk>')
+def desk_trade_history(desk):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    engine=_review_engine(desk)
+    if engine is None:return jsonify(error='Unknown desk'),404
+    try:
+        date=_review_filter();before=int(request.args.get('before','9223372036854775807'))
+        rows=engine.rows("SELECT rowid cursor,id,ts,contract,status,mode FROM desk_positions WHERE rowid<? AND (?='' OR substr(ts,1,10)=?) ORDER BY rowid DESC LIMIT 101",(before,date,date))
+        return jsonify(trades=rows[:100],next_before=rows[99]['cursor'] if len(rows)>100 else None,recorder_error=engine.recorder_error)
+    except ValueError as e:return jsonify(error=str(e)),400
+
+
+@app.route('/api/trade-timeline/<desk>/<pid>')
+def desk_trade_timeline(desk,pid):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    engine=_review_engine(desk)
+    if engine is None:return jsonify(error='Unknown desk'),404
+    try:return jsonify(engine.trade_timeline(pid,max(0,int(request.args.get('after','0')))))
+    except ValueError:return jsonify(error='Invalid cursor'),400
+
+
+def _review_csv_cell(value):
+    # Do not allow text supplied by broker / instrument metadata to become Excel formulas.
+    if isinstance(value,str) and value.lstrip().startswith(('=','+','-','@')):return "'"+value
+    return value
+
+
+@app.route('/api/trade-review-export/<desk>')
+def desk_trade_review_export(desk):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    engine=_review_engine(desk)
+    if engine is None:return jsonify(error='Unknown desk'),404
+    try:date=_review_filter()
+    except ValueError:return jsonify(error='Use YYYY-MM-DD'),400
+    pid=request.args.get('pid','');fmt=request.args.get('format','csv')
+    if fmt not in ('csv','json'):return jsonify(error='Use csv or json'),400
+    if pid and not engine.rows('SELECT id FROM desk_positions WHERE id=?',(pid,)):return jsonify(error='Trade not found'),404
+    # Capture an upper bound, so new entries cannot extend a running export indefinitely.
+    upper=engine.rows('SELECT COALESCE(MAX(rowid),0) n FROM desk_positions')[0]['n']
+    from flask import Response,stream_with_context
+    import csv,io,json as export_json
+    def reviews():
+        cursor=0
+        while True:
+            batch=engine.rows("SELECT rowid cursor,id FROM desk_positions WHERE rowid>? AND rowid<=? AND (?='' OR id=?) AND (?='' OR substr(ts,1,10)=?) ORDER BY rowid LIMIT 50",(cursor,upper,pid,pid,date,date))
+            if not batch:break
+            for row in batch:
+                review=engine.trade_review(row['id']);review.pop('timeline',None)
+                yield row['id'],review
+            cursor=batch[-1]['cursor']
+    def events(trade_id):
+        after=0
+        upper_event=engine.rows('SELECT COALESCE(MAX(id),0) n FROM desk_trade_events WHERE position_id=?',(trade_id,))[0]['n']
+        while True:
+            batch=engine.rows('SELECT id,ts,kind,payload FROM desk_trade_events WHERE position_id=? AND id>? AND id<=? ORDER BY id LIMIT 500',(trade_id,after,upper_event))
+            if not batch:break
+            for e in batch:yield dict(id=e['id'],ts=e['ts'],kind=e['kind'],data=export_json.loads(e['payload']))
+            after=batch[-1]['id']
+    def generate():
+        if fmt=='json':
+            yield '{"note":"Export of retained local evidence. Active trades can change during export. Dates filter entry day in IST.","trades":['
+            first=True
+            for trade_id,review in reviews():
+                if not first:yield ','
+                first=False;yield '{"review":'+export_json.dumps(review,default=str)+',"events":['
+                first_event=True
+                for event in events(trade_id):
+                    if not first_event:yield ','
+                    first_event=False;yield export_json.dumps(event,default=str)
+                yield ']}'
+            yield ']}'
+        else:
+            buf=io.StringIO();writer=csv.writer(buf)
+            def line(values):
+                buf.seek(0);buf.truncate(0);writer.writerow([_review_csv_cell(v) for v in values]);return buf.getvalue()
+            yield '\ufeff'+line(['trade_id','contract','mode','trade_status','record_time_IST','record_type','expected_direction','net_realized_estimated_fees','observed_bid','observed_ask','signal_direction','exit_reason','explanation','evidence_json'])
+            for trade_id,r in reviews():
+                p=r['position'];base=[trade_id,p['contract'],p['mode'],p['status']]
+                yield line(base+[p['ts'],'REVIEW',r['entry_plan'].get('direction'),r['outcome']['net_realized'],'','','',p.get('exit_reason'),' '.join(r['explanations'])+' '+r['limitations'],export_json.dumps(r,default=str)])
+                for e in events(trade_id):
+                    data=e['data'];q=data.get('quote') or {};signal=data.get('signal') or {}
+                    yield line(base+[e['ts'],e['kind'],r['entry_plan'].get('direction'),'',q.get('bid'),q.get('ask'),signal.get('direction'),data.get('reason') or data.get('decision'),'Recorded observation; does not prove market causation',export_json.dumps(data,default=str)])
+    return Response(stream_with_context(generate()),mimetype='application/json' if fmt=='json' else 'text/csv',headers={'Content-Disposition':f'attachment; filename="{desk}-trade-evidence.{fmt}"','Cache-Control':'no-store'})
 
 
 def start_application_workers():
