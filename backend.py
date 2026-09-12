@@ -12158,8 +12158,14 @@ def _build_desk_engine_class():
                 m=fit([json.loads(r['features']) for r in train],[r['label'] for r in train]);p=predict(m,[json.loads(r['features']) for r in val]);y=np.array([r['label'] for r in val])
                 m.update(samples=n,accuracy=float(((p>=.5)==y).mean()*100),auc=auc(y,p),ts=stamp())
                 self.put('online_model',m);self.put('online_trained_count',n);self.put('online_last_sample',evidence[-1]['ts']);self.put('online_trained_at',stamp())
-        def inspect(self,symbol):
-            self.a.refresh(symbol)
+        def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=15):
+            """Run the common directional model without touching an option chain.
+
+            Stock AI uses this as its cheap first-stage full-universe scan.  The normal
+            index desk still calls inspect(), which asks for a refresh and then performs
+            the same option-chain/execution checks as before.
+            """
+            if refresh:self.a.refresh(symbol)
             bars=self.a.bars(symbol,260)
             now=datetime.now(IST)
             bars=[r for r in bars if dt(r['ts'])+timedelta(minutes=5)<=now]
@@ -12179,18 +12185,24 @@ def _build_desk_engine_class():
                 regime='UPTREND' if f['ema_gap_20_50']>.05 else 'DOWNTREND' if f['ema_gap_20_50']<-.05 else 'RANGE',
                 direction='UP' if p>=.5 else 'DOWN',confidence=max(p,1-p))
             s['factors']=sorted([dict(name=FEATURES[i],impact=float(v)) for i,v in enumerate(np.clip((np.array(x)-m['mu'])/m['sd'],-6,6)*m['w'])],key=lambda d:abs(d['impact']),reverse=True)[:4]
-            if age<0 or age>15:s['reason']='Stale index candles';return s
+            if age<0 or age>max_bar_age:s['reason']='Stale index candles';return s
             # Forward labels accrue without requiring a trade, breaking the no-trades/no-learning loop.
             target=dt(last['ts'])+timedelta(minutes=15)
-            if self.a.market_open() and target.date()==dt(last['ts']).date() and target.strftime('%H:%M')<='15:25':
+            if record_observation and self.a.market_open() and target.date()==dt(last['ts']).date() and target.strftime('%H:%M')<='15:25':
                 key=symbol+dt(last['ts']).isoformat()
                 with self.db() as c:c.execute('INSERT OR IGNORE INTO desk_observations VALUES(?,?,?,?,?,?,?,?,NULL,NULL)',
                     (key,symbol,dt(last['ts']).isoformat(),target.isoformat(),float(last['close']),json.dumps(x),m['id'],p))
             cfg=self.config()
             if not self.a.market_open():s['reason']='Market closed · historical prediction only';return s
             if s['confidence']<cfg['confidence']:s['reason']='Direction below confidence threshold';return s
+            s.update(decision='CANDIDATE',reason='Direction qualifies for option-liquidity check')
+            return s
+        def inspect(self,symbol):
+            s=self.direction_snapshot(symbol,refresh=True,record_observation=True,max_bar_age=15)
+            if s.get('decision')!='CANDIDATE':return s
+            cfg=self.config();p=s['p_up']
             data,err=self.a.chain(symbol)
-            if err:s['reason']='Option chain: '+str(err);return s
+            if err:s.update(decision='WAIT',reason='Option chain: '+str(err));return s
             typ='CE' if p>.5 else 'PE';candidates=[]
             for o in data.get('chain',[]):
                 if o.get('instrument_type')!=typ or not finite(o.get('delta')):continue
@@ -12199,23 +12211,23 @@ def _build_desk_engine_class():
                 spread=(ask-bid)/((ask+bid)/2)*100
                 if spread>cfg['max_spread'] or not .3<=abs(o['delta'])<=.7:continue
                 candidates.append((abs(abs(o['delta'])-.5)+spread/10,o))
-            if not candidates:s['reason']='No liquid CE/PE contract within spread limit';return s
+            if not candidates:s.update(decision='WAIT',reason='No liquid CE/PE contract within spread limit');return s
             o=min(candidates,key=lambda r:r[0])[1];s.update(contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
                lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),option_type=typ)
             q,why=self.a.quote(s['exchange'],s['contract'])
-            if why:s['reason']=why;return s
+            if why:s.update(decision='WAIT',reason=why);return s
             s.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'],depth_qty=q['ask_qty'])
-            if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:s['reason']='Option spread widened';return s
-            if s['lot']<=0:s['reason']='Invalid contract lot size';return s
+            if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:s.update(decision='WAIT',reason='Option spread widened');return s
+            if s['lot']<=0:s.update(decision='WAIT',reason='Invalid contract lot size');return s
             entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/s['tick'])*s['tick'],2);risk=entry*cfg['stop_pct']/100
             max_lots=max(0,int(min(cfg['capital']/entry,cfg['risk']/risk,q['ask_qty'])//s['lot']))
             lots=cfg['lots'] or max_lots
             s.update(requested_lots=cfg['lots'],max_lots=max_lots,lots=lots)
             if lots>max_lots:
-                s['qty']=0;s['reason']=f'Requested {lots} lots exceed capital, risk or visible depth limit ({max_lots} lots)';return s
+                s['qty']=0;s.update(decision='WAIT',reason=f'Requested {lots} lots exceed capital, risk or visible depth limit ({max_lots} lots)');return s
             qty=lots*s['lot']
             s.update(entry=entry,stop=entry-risk,target=entry+risk*cfg['reward_r'],qty=qty)
-            if qty<=0:s['reason']='Budget or visible ask depth cannot fund one lot';return s
+            if qty<=0:s.update(decision='WAIT',reason='Budget or visible ask depth cannot fund one lot');return s
             s.update(decision='READY',reason=f'{typ} qualifies: direction, quote freshness, spread and size passed')
             return s
         def evidence(self):
@@ -12258,6 +12270,10 @@ def _build_desk_engine_class():
         def submit(self,p,side,qty,price,reason):
             oid=uuid.uuid4().hex;tag='DSK'+oid[:17];cfg=self.config()
             if qty<=0:return
+            if side=='BUY' and self.get('close_requested'):
+                with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason='Close requested before submission' WHERE id=? AND qty=0",(p['id'],))
+                self.record_trade(p['id'],'ENTRY_CANCELLED_BEFORE_SUBMISSION',dict(reason='Close requested; no broker request sent'))
+                return
             if side=='BUY' and hasattr(self,'shared_risk'):
                 try:shared=self.shared_risk.snapshot(p['mode'])
                 except Exception:
@@ -12831,10 +12847,16 @@ def desk_legacy_close_route():
 
 # ===========================================================================
 # STOCK OPTIONS AI — isolated ledger/models; same validated desk execution core.
-# Broad cash-turnover shortlist, then directional and executable-option ranking.
+# Full F&O directional monitoring, then bounded deep option-chain/liquidity checks.
 # API reference: https://kite.trade/docs/connect/v3/market-quotes/
 # API reference: https://kite.trade/docs/connect/v3/historical/
 # ===========================================================================
+STOCK_FULL_SCAN_DEEP_N = 24
+STOCK_FULL_REFRESH_BATCH = 28
+STOCK_HISTORY_REFRESH_SECONDS = 210
+STOCK_HISTORY_PACE_SECONDS = 0.36
+STOCK_FULL_SCAN_BAR_MAX_AGE = 15
+
 class StockDeskAdapter(DeskAdapter):
     def __init__(self):
         self.symbols=()
@@ -12852,9 +12874,10 @@ class StockDeskAdapter(DeskAdapter):
             c.rollback();raise
         finally:c.close()
     def refresh(self,symbol):
-        # Reuse the canonical five-minute archive, never an index model/ledger.
+        # Full-universe mode rotates recent-history refreshes.  A ~3.5 minute TTL keeps
+        # ~200 symbols current without firing ~200 historical requests every scan cycle.
         with self.history_lock:
-            if time.monotonic()-self.refreshed.get(symbol,-1e9)<60:return
+            if time.monotonic()-self.refreshed.get(symbol,-1e9)<STOCK_HISTORY_REFRESH_SECONDS:return
             token,err=resolve_token_for_symbol(symbol)
             if err:raise ValueError(err)
             end=now_ist()
@@ -12870,8 +12893,8 @@ class StockDeskAdapter(DeskAdapter):
     def chain(self,symbol):
         exchange,opts=get_option_instruments_for_symbol(symbol)
         today=now_ist().date()
-        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=max(4,MIN_DAYS_TO_EXPIRY)})
-        if not expiries:return None,'No stock expiry at least four calendar days away'
+        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=MIN_DAYS_TO_EXPIRY})
+        if not expiries:return None,f'No stock expiry at least {MIN_DAYS_TO_EXPIRY} calendar days away'
         data,err=get_chain_for_symbol(symbol,str(expiries[0]))
         if err:return None,err
         data=dict(data)
@@ -12882,9 +12905,13 @@ class StockDeskEngine(DeskEngine):
     def __init__(self,adapter):
         super().__init__(adapter)
         self.a.symbols=tuple(self.get('stock_universe',[]))
-        self.scan_status={'status':'IDLE','completed':0,'total':0}
+        self.scan_status={'status':'IDLE','completed':0,'total':0,'deep_total':0,'deep_completed':0}
         self.ban_checked=0;self.banned=None;self.ban_error='Ban list not checked yet'
-        self.risk_lock=threading.Lock()
+        self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
+        self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
+        self.execution_status={'status':'IDLE'};self.refresh_cursor=0
+    def _full_mode(self):
+        return self.get('stock_universe_info',{}).get('mode')!='Custom watchlist'
     def select_universe(self,body=None):
         body=body or {}
         if self.config()['armed']:raise ValueError('Disarm entries before changing the scan universe')
@@ -12893,66 +12920,166 @@ class StockDeskEngine(DeskEngine):
         if not isinstance(selected,list) or any(not isinstance(x,str) for x in selected):raise ValueError('symbols must be a list of stock symbols')
         if selected:
             selected=list(dict.fromkeys(x.strip().upper() for x in selected if x.strip()))
-            if not 1<=len(selected)<=30 or any(x not in universe for x in selected):raise ValueError('Choose 1–30 current F&O stocks; indices are excluded')
-            mode='Custom watchlist';quoted=len(selected)
+            if not 1<=len(selected)<=60 or any(x not in universe for x in selected):raise ValueError('Choose 1–60 current F&O stocks; indices are excluded')
+            mode='Custom watchlist'
         else:
-            quotes=kite_quote_bulk(['NSE:'+s for s in universe],chunk_size=500,force_refresh=True)
-            liquid=[]
-            for symbol in universe:
-                q=quotes.get('NSE:'+symbol,{})
-                price=float(q.get('last_price') or 0);volume=float(q.get('volume') or 0)
-                if price>0 and volume>0 and math.isfinite(price*volume):liquid.append((price*volume,symbol))
-            liquid.sort(reverse=True)
-            selected=[s for _,s in liquid[:20]];quoted=len(liquid)
-            if not selected:raise ValueError('No valid stock turnover quotes. Connect Kite and retry during/after a session.')
-            mode='Top 20 by cash turnover'
+            selected=list(universe);mode='Full F&O universe'
+        if not selected:raise ValueError('No current F&O stocks found. Connect Kite and refresh instruments.')
         self.a.symbols=tuple(selected)
         self.put('stock_universe',selected)
-        self.put('stock_universe_info',dict(mode=mode,total_fo=len(universe),quoted=quoted,selected=len(selected),updated=now_ist().isoformat()))
+        self.put('stock_universe_info',dict(mode=mode,total_fo=len(universe),selected=len(selected),deep_check=STOCK_FULL_SCAN_DEEP_N,
+            refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat()))
         self.signals={k:v for k,v in self.signals.items() if k in selected}
-        self.event('UNIVERSE',f'{mode}: {len(selected)} stocks; {len(universe)} F&O universe')
+        self.refresh_cursor=0
+        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} stocks; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
         return selected
+    def _sync_full_universe_membership(self):
+        if not self._full_mode():return
+        universe=fo_stock_universe()
+        if tuple(universe)==tuple(self.a.symbols):return
+        self.a.symbols=tuple(universe);self.put('stock_universe',universe)
+        info=self.get('stock_universe_info',{});info.update(mode='Full F&O universe',total_fo=len(universe),selected=len(universe),
+            deep_check=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat())
+        self.put('stock_universe_info',info);self.signals={k:v for k,v in self.signals.items() if k in universe}
+        self.event('UNIVERSE',f'F&O membership refreshed: {len(universe)} stocks')
     @staticmethod
     def rank_signal(s,max_spread):
-        if s.get('decision')!='READY':return 0.
+        # Direction confidence is intentionally dominant: every F&O stock competes on
+        # model probability first.  Executable option quality then decides whether the
+        # stock is actually READY for entry.
         confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
+        base=100*confidence
+        if s.get('decision')!='READY':return round(base,2) if s.get('p_up') is not None else 0.
         spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
         depth=min(1.,float(s.get('depth_qty') or 0)/max(1,float(s.get('qty') or 1))/3)
-        return round(70*confidence+20*spread+10*depth,2)
+        return round(90*confidence+7*spread+3*depth,2)
+    def _screen_direction(self,symbol):
+        s=self.direction_snapshot(symbol,refresh=False,record_observation=True,max_bar_age=STOCK_FULL_SCAN_BAR_MAX_AGE)
+        s['reason']=s.get('reason','').replace('index candles','stock candles')
+        if self.banned is not None and symbol in self.banned:s.update(decision='WAIT',reason='Stock in F&O ban list; new entries excluded')
+        if self.config()['mode']=='live' and self.banned is None:s.update(decision='WAIT',reason='Daily F&O ban list unavailable; live entries paused')
+        if s.get('decision')=='CANDIDATE':s['reason']='Full-universe ML direction qualified · awaiting deep option check'
+        s['scan_stage']='UNIVERSE';s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        return s
     def inspect(self,symbol):
         s=super().inspect(symbol)
         s['reason']=s.get('reason','').replace('index candles','stock candles')
         if self.banned is not None and symbol in self.banned:s.update(decision='WAIT',reason='Stock in F&O ban list; new entries excluded')
         if self.config()['mode']=='live' and self.banned is None:s.update(decision='WAIT',reason='Daily F&O ban list unavailable; live entries paused')
-        s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        s['scan_stage']='DEEP';s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
         return s
+    def _refresh_batch(self,names,screened):
+        if not names:return []
+        # Stale/missing symbols get first claim on the refresh budget; the rotating
+        # cursor then guarantees the rest of the universe is revisited continuously.
+        stale=[s for s in names if screened.get(s,{}).get('bar_age') is None or screened.get(s,{}).get('bar_age',999)>STOCK_FULL_SCAN_BAR_MAX_AGE]
+        chosen=[]
+        for s in stale:
+            if s not in chosen:chosen.append(s)
+            if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
+        if len(chosen)<STOCK_FULL_REFRESH_BATCH:
+            total=len(names);start=self.refresh_cursor%total
+            for step in range(total):
+                s=names[(start+step)%total]
+                if s not in chosen:chosen.append(s)
+                if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
+            self.refresh_cursor=(start+STOCK_FULL_REFRESH_BATCH)%total
+        # Always keep owned positions fresh even if they fall outside this cycle's batch.
+        for p in self.active():
+            if p['symbol'] in names and p['symbol'] not in chosen:chosen.append(p['symbol'])
+        return chosen
     def enter(self,s):
-        # Reprice after the full scan: a high rank never permits stale fills.
-        if s.get('decision')!='READY' or self.block():return
+        # Reprice/revalidate immediately before the order.  A high universe rank never
+        # permits a stale option fill or bypasses the normal desk/shared risk gates.
+        # This method is called by the dedicated execution thread, never by the broad
+        # universe scanner, so slow scanning cannot hold up broker execution/supervision.
+        if s.get('decision')!='READY' or self.block() or self.get('close_requested'):return
         fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
+        if fresh.get('decision')!='READY' or self.get('close_requested'):return
         return super().enter(fresh)
+    def _publish_execution_candidates(self,ranked):
+        ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('symbol') in self.a.symbols]
+        with self.candidate_lock:
+            self.execution_generation+=1
+            self.execution_candidates=ready
+            self.execution_status=dict(status='CANDIDATES READY' if ready else 'NO READY CANDIDATE',generation=self.execution_generation,
+                count=len(ready),best=ready[0]['symbol'] if ready else None,updated=now_ist().isoformat())
+        if ready:self.execution_event.set()
+    def execute_candidates(self):
+        # Entry execution is serialized independently of both the scanner and the risk
+        # supervisor.  Existing positions/exits never wait for this entry lock.
+        if not self.entry_lock.acquire(False):return
+        try:
+            if not self.a.connected() or not self.a.market_open() or self.get('close_requested'):return
+            with self.candidate_lock:
+                candidates=[dict(s) for s in self.execution_candidates]
+                generation=self.execution_generation
+            if not candidates:return
+            self.execution_status=dict(status='EXECUTING',generation=generation,count=len(candidates),updated=now_ist().isoformat())
+            for seed in candidates:
+                if self.get('close_requested') or not self.config()['armed']:break
+                if self.block():break
+                try:self.enter(seed)
+                except Exception as e:self.event('ERROR','Stock execution: '+str(e),seed.get('symbol',''))
+                # Re-evaluate limits after each admitted attempt.  If more positions are
+                # allowed, the next-ranked READY candidate may be considered.
+                if len(self.active())>=self.config()['max_positions']:break
+            self.execution_status=dict(status='IDLE',generation=generation,count=len(candidates),updated=now_ist().isoformat())
+        finally:self.entry_lock.release()
     def cycle(self):
         if not self.lock.acquire(False):return
         try:
             self.last_cycle=now_ist().isoformat()
             if not self.a.connected():return
             if not self.a.symbols:self.select_universe()
+            else:self._sync_full_universe_membership()
             if time.monotonic()-self.ban_checked>1800:
                 self.banned,self.ban_error=get_fo_ban_list();self.ban_checked=time.monotonic()
             self.supervise()
             names=list(dict.fromkeys(list(self.a.symbols)+[p['symbol'] for p in self.active()]))
-            self.scan_status=dict(status='SCANNING',completed=0,total=len(names),started=now_ist().isoformat())
+            if not self.a.market_open():
+                self.scan_status=dict(status='MARKET CLOSED',phase='Full F&O scan resumes during market hours',completed=0,total=len(names),
+                    deep_completed=0,deep_total=0,finished=now_ist().isoformat())
+                self.settle_observations();self.maybe_train();return
+            self.scan_status=dict(status='SCANNING FULL F&O',phase='ML universe pass',completed=0,total=len(names),
+                deep_completed=0,deep_total=0,started=now_ist().isoformat())
+            screened={}
+            # Cheap pass: no option chain and no per-symbol history request.  This lets
+            # every F&O stock compete on the same model probability each cycle.
             for i,symbol in enumerate(names):
-                try:self.signals[symbol]=self.inspect(symbol)
-                except Exception as e:self.signals[symbol]=dict(symbol=symbol,ts=now_ist().isoformat(),decision='WAIT',reason=str(e),rank_score=0)
-                self.scan_status.update(completed=i+1,symbol=symbol)
+                try:screened[symbol]=self._screen_direction(symbol)
+                except Exception as e:screened[symbol]=dict(symbol=symbol,ts=now_ist().isoformat(),decision='WAIT',reason=str(e),rank_score=0,scan_stage='UNIVERSE')
+                if i%25==0:self.scan_status.update(completed=i+1,symbol=symbol)
+            # Rotate recent-history refreshes so the whole universe stays within the
+            # freshness window without a burst of ~200 historical-data requests.
+            refresh_names=self._refresh_batch(names,screened)
+            self.scan_status.update(phase='Refreshing market history',refreshing=len(refresh_names),completed=len(names))
+            for j,symbol in enumerate(refresh_names):
+                try:
+                    self.a.refresh(symbol);screened[symbol]=self._screen_direction(symbol)
+                except Exception as e:
+                    prior=screened.get(symbol,dict(symbol=symbol));prior.update(decision='WAIT',reason='History refresh: '+str(e),rank_score=0,scan_stage='UNIVERSE');screened[symbol]=prior
                 self.supervise()
-            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',s.get('rank_score',0)),reverse=True)
-            for signal in ranked:
-                if signal['symbol'] in self.a.symbols:
-                    with self.risk_lock:self.enter(signal)
+                if j+1<len(refresh_names):time.sleep(STOCK_HISTORY_PACE_SECONDS)
+            # Deep checks are deliberately limited to the strongest model candidates.
+            directional=[s for s in screened.values() if s.get('decision')=='CANDIDATE']
+            directional.sort(key=lambda s:(float(s.get('confidence') or 0),float(s.get('rank_score') or 0)),reverse=True)
+            shortlist=directional[:min(STOCK_FULL_SCAN_DEEP_N,len(directional))]
+            self.signals=dict(screened)
+            self.scan_status.update(phase='Deep option checks',deep_total=len(shortlist),deep_completed=0,
+                directional_candidates=len(directional),fresh_universe=sum(1 for s in screened.values() if s.get('bar_age') is not None and s.get('bar_age')<=STOCK_FULL_SCAN_BAR_MAX_AGE))
+            for i,seed in enumerate(shortlist):
+                symbol=seed['symbol']
+                try:self.signals[symbol]=self.inspect(symbol)
+                except Exception as e:self.signals[symbol]=dict(seed,decision='WAIT',reason='Deep check: '+str(e),scan_stage='DEEP')
+                self.scan_status.update(deep_completed=i+1,symbol=symbol)
+                self.supervise()
+            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',float(s.get('rank_score') or 0)),reverse=True)
+            # Scanner only publishes the ranked READY list.  A dedicated execution
+            # thread performs fresh pre-entry validation and broker submission.
+            self._publish_execution_candidates(ranked)
             self.settle_observations();self.maybe_train()
-            self.scan_status.update(status='COMPLETE',finished=now_ist().isoformat())
+            self.scan_status.update(status='COMPLETE',phase='Complete',completed=len(names),ready=sum(1 for s in self.signals.values() if s.get('decision')=='READY'),finished=now_ist().isoformat())
             self.last_cycle=now_ist().isoformat()
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
         except Exception as e:
@@ -12962,6 +13089,14 @@ class StockDeskEngine(DeskEngine):
         if not self.risk_lock.acquire(False):return
         try:
             self.reconcile();self.verify_positions()
+            # Close requests have priority over scanning and new entries.  Cancel live
+            # BUYs that are still pending so a manual close cannot be followed by a
+            # late entry fill.  Filled quantity remains owned and is managed below.
+            if self.get('close_requested'):
+                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                    if o.get('broker_id'):
+                        try:self.a.cancel(o['broker_id'])
+                        except Exception as e:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(e)))
             if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
         except Exception as e:
             self.put('halt','Position supervision error: '+str(e));self.event('ERROR',str(e))
@@ -12974,22 +13109,38 @@ class StockDeskEngine(DeskEngine):
         def risk_loop():
             while not self.stop_event.wait(5):
                 if self.a.connected():self.supervise()
+        def execution_loop():
+            while not self.stop_event.is_set():
+                self.execution_event.wait(1)
+                if self.stop_event.is_set():break
+                if not self.execution_event.is_set():continue
+                self.execution_event.clear()
+                self.execute_candidates()
         threading.Thread(target=scan_loop,daemon=True,name='stock-ai-scan').start()
         threading.Thread(target=risk_loop,daemon=True,name='stock-ai-risk').start()
+        threading.Thread(target=execution_loop,daemon=True,name='stock-ai-execution').start()
     def state(self):
         s=super().state()
-        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('rank_score',0)),reverse=True)
+        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        s.update(universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols))
+        s.update(universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+            full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
+            execution=dict(self.execution_status))
         return s
     def control(self,action,body):
         # Disarming is immediate even while a broad scan is running.
         if action in ('disarm','close'):
             with self.risk_lock:
                 cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-                if action=='close':self.put('close_requested',True)
+                if action=='close':
+                    self.put('close_requested',True)
+                    # Drop queued entries immediately; the risk thread performs broker
+                    # cancellation/reconciliation independently of the scan thread.
+                    with self.candidate_lock:self.execution_candidates=[]
+                    self.execution_event.clear()
                 self.event('CONTROL',action)
-                return cfg
+            if action=='close' and self.a.connected():self.supervise()
+            return cfg
         if not self.lock.acquire(False):raise ValueError('Scan in progress; retry after completion')
         try:
             with self.risk_lock:return super().control(action,body)
