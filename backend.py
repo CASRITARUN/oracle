@@ -308,51 +308,29 @@ def _quote_cache_get(keys):
 
 
 def kite_quote_bulk(keys, *, chunk_size=500, retries=1, force_refresh=False):
-    """Rate-limited, cached wrapper around Kite's /quote endpoint.
-
-    Kite supports up to 500 instruments per /quote call, but the endpoint is limited to
-    1 request/sec. A 429 is followed by a cooldown before retrying. This function is
-    intentionally used by the screeners so one scan cannot DOS its own API session.
-    """
-    global _QUOTE_LAST_AT, _QUOTE_COOLDOWN_UNTIL
-    keys = list(dict.fromkeys(k for k in keys if k))
-    if not keys:
-        return {}
-    result = {} if force_refresh else _quote_cache_get(keys)
-    missing = list(keys) if force_refresh else [k for k in keys if k not in result]
-    if not missing:
-        return result
-
-    for start in range(0, len(missing), max(1, min(int(chunk_size), 500))):
-        chunk = missing[start:start + max(1, min(int(chunk_size), 500))]
-        attempt = 0
-        while True:
-            with _QUOTE_LOCK:
-                now = time.monotonic()
-                wait_for = max(_QUOTE_LAST_AT + _QUOTE_MIN_INTERVAL - now,
-                               _QUOTE_COOLDOWN_UNTIL - now, 0.0)
-                if wait_for > 0:
-                    time.sleep(wait_for)
-                try:
-                    raw = kite.quote(chunk)
-                    _QUOTE_LAST_AT = time.monotonic()
-                    raw = raw or {}
-                    for k, q in raw.items():
-                        _QUOTE_CACHE[k] = {"quote": q, "ts": time.monotonic()}
-                        result[k] = q
-                    break
-                except Exception as e:
-                    msg = str(e).lower()
-                    is_429 = "too many requests" in msg or getattr(e, "code", None) == 429
-                    _QUOTE_LAST_AT = time.monotonic()
-                    if is_429 and attempt < retries:
-                        _QUOTE_COOLDOWN_UNTIL = time.monotonic() + _QUOTE_429_COOLDOWN
-                        attempt += 1
-                        logger.warning("Kite quote rate limit hit; cooling down %.1fs before retry", _QUOTE_429_COOLDOWN)
-                        time.sleep(_QUOTE_429_COOLDOWN)
-                        continue
-                    logger.warning("Kite quote batch failed (%d instruments): %s", len(chunk), e)
-                    break
+    """All HTTP calls pass the shared broker gate. Never sleep/retry a 429 here."""
+    keys=list(dict.fromkeys(k for k in keys if k))
+    if not keys:return {}
+    now=time.monotonic();ttl=min(_QUOTE_CACHE_TTL,.9 if force_refresh else _QUOTE_CACHE_TTL)
+    result={k:_QUOTE_CACHE[k]['quote'] for k in keys if k in _QUOTE_CACHE and now-_QUOTE_CACHE[k]['ts']<=ttl}
+    missing=[k for k in keys if k not in result]
+    # Include owned options in scanner batches so their supervision can reuse fresh books.
+    owned=[]
+    guard=globals().get('SHARED_RISK')
+    if guard:
+        for engine in guard.engines.values():
+            owned.extend(p['exchange']+':'+p['contract'] for p in engine.active() if p['qty']>0)
+    size=max(1,min(int(chunk_size),max(1,500-len(set(owned)))))
+    for start in range(0,len(missing),size):
+        chunk=list(dict.fromkeys(owned+missing[start:start+size]))[:500]
+        try:
+            raw=kite.quote(chunk) or {}
+            for k,q in raw.items():_QUOTE_CACHE[k]={'quote':q,'ts':time.monotonic()}
+            result.update({k:q for k,q in raw.items() if k in keys})
+        except BrokerDeferred:
+            break
+        except Exception as e:
+            logger.warning('Quote request failed: %s',e);break
     return result
 
 
@@ -602,7 +580,60 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("kite_dashboard")
-kite = KiteConnect(api_key=API_KEY)
+class BrokerDeferred(RuntimeError):
+    """Local scheduling refused a call before any request was sent to Kite."""
+
+
+class BrokerRequestGate:
+    # Conservative spacing, below Kite's documented endpoint and mutation limits.
+    def __init__(self):
+        self.lock=threading.Lock();self.next_at={};self.cool_until=0.;self.failures=0;self.cache={};self.generation=0
+        self.intervals={'quote':1.05,'history':.36,'write':.20,'read':.13}
+    def status(self):
+        with self.lock:return dict(cooldown_seconds=round(max(0.,self.cool_until-time.monotonic()),1),rate_limit_hits=self.failures)
+    def call(self,fn,route,method,*args,**kwargs):
+        bucket='write' if method.upper() not in ('GET','HEAD') else 'quote' if route.startswith('market.quote') else 'history' if 'historical' in route else 'read'
+        # Only share short-lived read-only account snapshots; never share order mutations.
+        cacheable=method.upper()=='GET' and route in ('orders','trades','portfolio.positions')
+        key=(route,json.dumps([args,kwargs],sort_keys=True,default=str))
+        deadline=time.monotonic()+1.5
+        while True:
+            with self.lock:
+                now=time.monotonic()
+                cached=self.cache.get(key)
+                if cacheable and cached and now-cached[0]<.5:
+                    import copy
+                    return copy.deepcopy(cached[1])
+                delay=max(self.cool_until-now,self.next_at.get(bucket,0)-now,0.)
+                if delay<=0:
+                    self.next_at[bucket]=now+self.intervals[bucket]
+                    if bucket=='write':self.generation+=1;self.cache.clear()
+                    generation=self.generation;break
+                if self.cool_until>now or now+delay>deadline:raise BrokerDeferred('Broker request deferred locally; supervision will retry. No request was sent.')
+            time.sleep(min(delay,.05))
+        try:result=fn(route,method,*args,**kwargs)
+        except Exception as e:
+            if getattr(e,'code',None)==429 or 'too many requests' in str(e).lower():
+                with self.lock:
+                    self.failures+=1;self.cool_until=time.monotonic()+min(60.,10.*(2**min(self.failures-1,3)));self.cache.clear()
+            raise  # Never automatically repeat an order whose outcome may be uncertain.
+        with self.lock:
+            if bucket=='write':self.generation+=1;self.cache.clear()
+            elif cacheable and generation==self.generation:
+                import copy
+                self.cache[key]=(time.monotonic(),copy.deepcopy(result))
+        return result
+
+
+BROKER_GATE=BrokerRequestGate()
+
+
+class GovernedKiteConnect(KiteConnect):
+    def _request(self,route,method,*args,**kwargs):
+        return BROKER_GATE.call(super()._request,route,method,*args,**kwargs)
+
+
+kite = GovernedKiteConnect(api_key=API_KEY)
 
 # Zerodha Quote API protection. Quote is limited to 1 request/second and a maximum of
 # 500 instruments per request. Keep one process-wide gate so Screen 1, Screen 2 and
@@ -12211,6 +12242,9 @@ def _build_desk_engine_class():
             if self.train_lock.locked():return 'Model training · new entries paused'
             if cfg['mode']=='live' and not (cfg.get('live_override') is True or self.evidence()['ready']):return 'Live locked · build the forward paper record'
             if self.get('close_requested'):return 'Close requested · waiting for all exits'
+            if hasattr(self,'shared_risk'):
+                shared=self.shared_risk.snapshot(cfg['mode'])
+                if shared['entry_block']:return shared['entry_block']
             if self.day_pnl(cfg['mode'])<=-cfg['daily_loss']:return 'Daily loss limit reached'
             return None
         def day_pnl(self,mode):
@@ -12224,6 +12258,16 @@ def _build_desk_engine_class():
         def submit(self,p,side,qty,price,reason):
             oid=uuid.uuid4().hex;tag='DSK'+oid[:17];cfg=self.config()
             if qty<=0:return
+            if side=='BUY' and hasattr(self,'shared_risk'):
+                try:shared=self.shared_risk.snapshot(p['mode'])
+                except Exception:
+                    with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason='Shared risk unavailable before submission' WHERE id=? AND qty=0",(p['id'],))
+                    self.record_trade(p['id'],'ENTRY_CANCELLED_BEFORE_SUBMISSION',dict(reason='Shared risk unavailable; no broker request sent'))
+                    return
+                if shared['liquidate']:
+                    with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0",(shared['reason'],p['id']))
+                    self.record_trade(p['id'],'ENTRY_CANCELLED_BEFORE_SUBMISSION',dict(reason=shared['reason']))
+                    return
             if self.rows("SELECT id FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')",(p['id'],)):return
             # Intent is durable before contacting the broker. Unknown submissions are never blindly retried.
             with self.db() as c:
@@ -12242,10 +12286,17 @@ def _build_desk_engine_class():
                 self.record_trade(p['id'],'BROKER_ACK',dict(order_id=oid,broker_id=str(broker_id),side=side))
                 self.event('ORDER',f'{side} submitted; awaiting confirmed fill',p['symbol'])
             except Exception as e:
+                if type(e).__name__=='BrokerDeferred':
+                    self.apply_order(oid,dict(status='REJECTED',filled_quantity=0,average_price=0,status_message=str(e)))
+                    return
                 with self.db() as c:c.execute("UPDATE desk_orders SET status='UNKNOWN',error=? WHERE id=?",(str(e),oid))
                 self.record_trade(p['id'],'SUBMISSION_UNCERTAIN',dict(order_id=oid,error=str(e)))
                 self.put('halt','Order submission uncertain · inspect broker orders');self.event('ERROR','Submission uncertain: '+str(e),p['symbol'])
         def apply_order(self,oid,update):
+            guard=getattr(self,'shared_risk',None)
+            with guard.lock if guard else self.lock:
+                return self._apply_order_locked(oid,update)
+        def _apply_order_locked(self,oid,update):
             with self.db() as c:
                 o=dict(c.execute('SELECT * FROM desk_orders WHERE id=?',(oid,)).fetchone());p=dict(c.execute('SELECT * FROM desk_positions WHERE id=?',(o['position_id'],)).fetchone())
                 filled=int(update.get('filled_quantity') or 0);avg=float(update.get('average_price') or 0);status=str(update.get('status') or 'OPEN')
@@ -12338,25 +12389,30 @@ def _build_desk_engine_class():
         def reconcile(self):
             pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
             if not pending:return
-            book=self.a.orders()
+            try:book=self.a.orders()
+            except Exception as e:
+                if type(e).__name__=='BrokerDeferred':return
+                raise
             for o in pending:
                 try:
                     r=self.broker_match(o,book);self.apply_order(o['id'],r)
                     if r['status'] not in TERMINAL and (datetime.now(IST)-dt(o['ts'])).total_seconds()>45:self.a.cancel(str(r['order_id']))
                 except Exception as e:
                     # One unresolved order must not abort supervision of other positions.
+                    if type(e).__name__=='BrokerDeferred':continue
                     self.put('halt','Broker reconciliation: '+str(e))
                     with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
             # A remaining uncertainty blocks entries, while verified positions are managed.
         def verify_positions(self):
             live=[p for p in self.active() if p['mode']=='live']
-            self.mismatches=set()
-            if not live:return
+            if not live:self.mismatches=set();return
             actual={}
             try:holdings=self.a.holdings()
-            except Exception:
+            except Exception as e:
+                if type(e).__name__=='BrokerDeferred':return
                 self.mismatches={p['id'] for p in live}
                 raise
+            self.mismatches=set()
             for p in holdings:
                 if p.get('product')=='MIS':
                     key=(p.get('exchange'),p.get('tradingsymbol'))
@@ -12377,20 +12433,40 @@ def _build_desk_engine_class():
             if cfg['mode']=='live':
                 if any(p.get('exchange')==s['exchange'] and p.get('tradingsymbol')==s['contract'] and int(p.get('quantity') or 0)!=0 for p in self.a.holdings()):
                     self.event('WAIT','Existing broker position in this contract; no entry',s['symbol']);return
-            active=self.active()
-            if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
-            recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
-            if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
-            s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
-            pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
-            with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
+            guard=getattr(self,'shared_risk',None)
+            with guard.lock if guard else self.lock:
+                cfg=self.config()
+                if not cfg['armed']:return
+                s=dict(s)
+                if guard:
+                    reason=guard.admit(self,s)
+                    if reason:
+                        self.signals[s['symbol']]=dict(s,decision='WAIT',reason=reason)
+                        return
+                active=self.active()
+                if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
+                recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
+                if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
+                s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
+                pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
+                with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
+                if guard and guard.config()['one_trade_per_arm']:
+                    cfg['armed']=False;self.put('config',cfg)
+                    self.event('CONTROL','One entry attempt used; entries disarmed',s['symbol'])
             p=self.rows('SELECT * FROM desk_positions WHERE id=?',(pid,))[0]
             self.record_trade(pid,'ENTRY_PLAN',s)
             limit=math.ceil(entry/s.get('tick',.05))*s.get('tick',.05)
             self.submit(p,'BUY',qty,round(limit,2),'Qualified direction and risk checks')
         def manage(self,close_all=False):
             cfg=self.config()
+            if hasattr(self,'shared_risk'):
+                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                    try:liquidate=self.shared_risk.snapshot('live')['liquidate']
+                    except Exception:liquidate=False
+                    if liquidate and o['broker_id']:
+                        try:self.a.cancel(o['broker_id'])
+                        except Exception as e:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(e)))
             for p in self.active():
                 if p['qty']<=0:continue
                 if p['id'] in self.mismatches:
@@ -12398,10 +12474,15 @@ def _build_desk_engine_class():
                 q,err=self.a.quote(p['exchange'],p['contract'])
                 if err:
                     self.health[p['id']]={'reason':err};self.record_observation(p,error=err);continue
-                bid=q['bid'];self.health[p['id']]=dict(bid=bid,reason='HOLD · within plan')
+                bid=q['bid'];quote_age=max(0.,(datetime.now(IST)-dt(q['quote_ts'])).total_seconds()) if q.get('quote_ts') else 0.
+                self.health[p['id']]=dict(bid=bid,observed_mono=time.monotonic()-quote_age,reason='HOLD · within plan')
                 setup=json.loads(p['setup']);sig=self.signals.get(p['symbol'],{})
                 reason=None
-                if close_all:reason='Manual close all'
+                try:shared=self.shared_risk.snapshot(p['mode']) if hasattr(self,'shared_risk') else {}
+                except Exception:
+                    shared={};self.record_trade(p['id'],'RISK_DATA_GAP',dict(note='Shared risk calculation unavailable; local stop/target supervision continues.'))
+                if shared.get('liquidate'):reason=shared['reason']
+                elif close_all:reason='Manual close all'
                 elif bid<=p['stop']:reason='Stop reached'
                 elif bid>=p['target']:reason='Target reached'
                 elif datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
@@ -12483,6 +12564,9 @@ def _build_desk_engine_class():
                     if body['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live requires paper evidence or manual override, and explicit acknowledgement')
                     cfg.update(mode=body['mode'],armed=False)
                 elif action=='arm':
+                    if hasattr(self,'shared_risk'):
+                        blocked=self.shared_risk.snapshot(cfg['mode'])['entry_block']
+                        if blocked:raise ValueError(blocked)
                     if not self.a.connected():raise ValueError('Connect Kite first')
                     if self.get('halt'):raise ValueError(self.get('halt'))
                     if not self.model():raise ValueError('Train a model first')
@@ -12513,14 +12597,20 @@ def _build_desk_engine_class():
             orders=self.rows('SELECT * FROM desk_orders WHERE position_id=? ORDER BY ts,id',(pid,))
             bought=sum(o['filled'] for o in orders if o['side']=='BUY');sold=sum(o['filled'] for o in orders if o['side']=='SELL')
             buy_value=sum(o['notional'] for o in orders if o['side']=='BUY');sell_value=sum(o['notional'] for o in orders if o['side']=='SELL')
-            entry=buy_value/bought if bought else None;exit_price=sell_value/sold if sold else None
+            entry=buy_value/bought if bought else (p.get('entry') or None);exit_price=sell_value/sold if sold else None
+            stored_entry_only=not bought and bool(entry)
+            exit_record=self.rows('SELECT ts,payload FROM desk_exit_reviews WHERE position_id=? ORDER BY id DESC LIMIT 1',(pid,))
+            recorded_reason=p.get('exit_reason') or next((o.get('reason') for o in reversed(orders) if o['side']=='SELL' and o['filled'] and o.get('reason')),None)
+            if not recorded_reason and exit_record:recorded_reason=json.loads(exit_record[0]['payload']).get('reason')
+            if not recorded_reason:recorded_reason='Exit reason was not saved in this historical record' if p['status']=='CLOSED' else 'No completed exit recorded'
             explanations=[]
             if p['mode']=='paper':explanations.append('Paper trade: fills and P&L are simulated, not broker executions.')
-            if not bought:explanations.append('No entry fill is recorded; this is an unfilled request, not a completed losing trade.')
-            elif sold:
+            if stored_entry_only:explanations.append('A stored entry price and position result exist, but entry-order fills are missing. This trade cannot be reconciled to broker fills from this database alone.')
+            elif not bought:explanations.append('No entry fill is recorded; this is an unfilled request, not a completed losing trade.')
+            if sold and entry:
                 change=(exit_price/entry-1)*100
                 explanations.append(f'Average option exit premium was {change:+.2f}% relative to average entry. Realized P&L is derived from confirmed fills; estimated fees are deducted separately.')
-            explanations.append('Recorded exit trigger: '+str(p.get('exit_reason') or 'Position remains open / no exit recorded'))
+            explanations.append('Recorded exit trigger: '+recorded_reason)
             explanations.append('The model estimates underlying direction, not the probability of an option trade being profitable.')
             counts=self.rows('SELECT kind,COUNT(*) n FROM desk_trade_events WHERE position_id=? GROUP BY kind',(pid,))
             coverage={r['kind']:r['n'] for r in counts}
@@ -12540,11 +12630,41 @@ def _build_desk_engine_class():
             if observations['low'] is not None:
                 explanations.append(f"Observed option bids ranged from {observations['low']:.2f} to {observations['high']:.2f}; these are sampled prices, not guaranteed intratrade extremes.")
             if not setup.get('risk_config_at_entry'):limitation+=' Historical risk settings were not captured for this trade; current settings must not be substituted.'
+            direction=setup.get('direction')
+            if direction:
+                expected='The saved signal expected the underlying to move '+str(direction)+'. This was a direction forecast, not a guarantee of option profit.'
+            elif str(p.get('contract','')).endswith('PE'):
+                expected='The recorded contract is a put: the position has bearish exposure. This is inferred from the contract; the original model forecast was not saved.'
+            elif str(p.get('contract','')).endswith('CE'):
+                expected='The recorded contract is a call: the position has bullish exposure. This is inferred from the contract; the original model forecast was not saved.'
+            else:expected='The original entry thesis was not saved in this historical record.'
+            if setup.get('entry') is not None:expected+=f" Planned premium {setup['entry']}; planned stop {setup.get('stop','not recorded')}; planned target {setup.get('target','not recorded')}."
+            net=p['pnl']-p['fees']
+            actual=f"Stored realized result: {p['pnl']:+.2f}; estimated costs: {p['fees']:.2f}; net realized: {net:+.2f}. Status: {p['status']}."
+            if entry:actual+=f" Average entry premium available: {entry:.2f}"+(' (position ledger only).' if stored_entry_only else ' (order fills).')
+            if exit_price:actual+=f" Average exit premium: {exit_price:.2f}."
+            interpretations={'Stop reached':'The engine recorded its stop condition. This explains the exit decision; it does not establish whether the underlying, volatility or liquidity caused the premium decline.',
+                'Target reached':'The engine recorded its target condition and requested an exit.',
+                'Maximum holding time':'The holding-time setting triggered the exit. A timed exit can close either a profit or a loss.',
+                'Intraday square-off':'The configured square-off time triggered the exit; this was not necessarily a stop or target.',
+                'Manual close all':'A manual close-all request triggered the exit.',
+                'Direction reversed':'The monitored direction signal changed enough to meet the reversal-exit rule.',
+                'Partial profit at planned R':'The engine requested a partial profit exit; remaining quantity is recorded separately.'}
+            why=interpretations.get(recorded_reason,recorded_reason)
+            changed=' '.join(x for x in explanations if x.startswith(('Largest recorded','A monitored direction')))
+            if not changed:changed='No recorded price/signal transition establishes what suddenly changed.'+(' No during-trade observations were saved for this historical trade.' if not coverage.get('OBSERVATION') else ' Available samples cannot establish the market cause.')
+            summary=dict(expected=expected,actual=actual,exit_decision=why,what_changed=changed,
+                evidence_quality='Recorded entry and sampled observations available' if coverage.get('ENTRY_PLAN') and coverage.get('OBSERVATION') else 'Partial historical evidence; unavailable fields are marked Not recorded',
+                learning='Review records do not automatically retrain the model from this trade’s profit or loss.')
+            explanations=[expected,actual,why,changed]+explanations
+            timeline=self.trade_timeline(pid)
+            if not timeline['events'] and orders:
+                timeline=dict(events=[dict(id='legacy-'+str(i),ts=o['ts'],kind='LEGACY_ORDER_RECORD',data=dict(side=o['side'],qty=o['qty'],filled=o['filled'],status=o['status'],reason=o.get('reason') or 'Not recorded',note='Historical order snapshot. This timestamp is the submission time, not a reconstructed fill timestamp.')) for i,o in enumerate(orders)],next_after=None)
             return dict(position={k:v for k,v in p.items() if k!='setup'},
-                entry_plan={k:setup.get(k) for k in ('ts','bar_ts','bar_age','direction','p_up','confidence','model_id','regime','spot','contract','entry','stop','target','qty','lots','max_lots','requested_lots','spread','reason','risk_config_at_entry')},
+                entry_plan={k:setup.get(k) for k in ('ts','bar_ts','bar_age','direction','p_up','confidence','model_id','regime','spot','contract','entry','stop','target','qty','lots','max_lots','requested_lots','spread','reason','risk_config_at_entry','shared_signal_key','shared_risk_at_entry')},
                 outcome=dict(bought=bought,sold=sold,remaining=p['qty'],average_entry=entry,average_exit=exit_price,
                     realized=p['pnl'],estimated_costs=p['fees'],net_realized=p['pnl']-p['fees']),
-                explanations=explanations,limitations=limitation,coverage=coverage,observed_range=observations,observed_changes=changes,timeline=self.trade_timeline(pid),recorder_error=self.recorder_error,
+                review_summary=summary,recorded_exit_reason=recorded_reason,explanations=explanations,limitations=limitation,coverage=coverage,observed_range=observations,observed_changes=changes,timeline=timeline,recorder_error=self.recorder_error,
                 orders=[{k:o.get(k) for k in ('ts','side','qty','filled','notional','limit_price','status','broker_id','reason','error')} for o in orders],
                 exit_observations=[dict(ts=r['ts'],snapshot=json.loads(r['payload'])) for r in self.rows('SELECT ts,payload FROM desk_exit_reviews WHERE position_id=? ORDER BY id',(pid,))])
         def state(self):
@@ -12558,6 +12678,10 @@ def _build_desk_engine_class():
             if model:model={k:v for k,v in model.items() if k not in ('mu','sd','w','bias')}
             online=self.get('online_model');online={k:online[k] for k in ('samples','accuracy','auc','ts')} if online else None
             trades=self.rows("SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100")
+            for trade in trades:
+                if not trade.get('exit_reason'):
+                    last=self.rows("SELECT reason FROM desk_orders WHERE position_id=? AND side='SELL' AND filled>0 AND reason IS NOT NULL ORDER BY ts DESC LIMIT 1",(trade['id'],))
+                    trade['exit_reason']=last[0]['reason'] if last else ('Not recorded · open Trade review' if trade['status']=='CLOSED' else 'No completed exit recorded')
             return dict(version='2.0',recorder_error=self.recorder_error,timestamp=stamp(),connected=self.a.connected(),market_open=self.a.market_open(),config=cfg,
                 block=self.block(),last_cycle=self.last_cycle,training=self.training,model=model,online=online,evidence=evidence,
                 observations=obs,signals=signals,positions=active,trades=trades,
@@ -12638,6 +12762,28 @@ def acquire_desk_process_lock():
 
 if os.environ.get("AI_START_WORKERS","1")=="1":acquire_desk_process_lock()
 if AI_HIST_INTERVAL != "5minute":raise RuntimeError("AI Desk v2 requires AI_HIST_INTERVAL=5minute")
+# Prevent separate worker processes from independently spending the same risk budget
+# and each issuing a full allocation of Kite requests against the same ledgers.
+def _claim_ai_worker_lease():
+    if os.environ.get('AI_START_WORKERS','1')!='1':return None
+    path=os.path.abspath(AI_DB_FILE)+'.worker.lock'
+    handle=open(path,'a+b')
+    try:
+        if os.name=='nt':
+            import msvcrt
+            handle.seek(0,2)
+            if handle.tell()==0:handle.write(b'0');handle.flush()
+            handle.seek(0);msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        raise SystemExit('Another AI backend worker owns these ledgers. Run one backend process; shared risk and broker throttling require a single owner.')
+
+_AI_WORKER_LEASE=_claim_ai_worker_lease()
+
 DESK = DeskEngine(DeskAdapter())
 
 @app.route('/api/ai-desk/state')
@@ -12922,7 +13068,7 @@ class CASAdapter(DeskAdapter):
         self.stream_lock=threading.RLock();self.wake=threading.Event();self.stream_quotes={};self.stream_queue=deque()
         self.stream_signatures={};self.stream_generation=0;self.seen_generation=0;self.wanted_tokens=set();self.token_keys={}
         self.last_subscription=0.;self.last_tick_mono=0.;self.order_dirty=False;self.exit_quotes={}
-        self.last_connect_attempt=0.;self.stream_retry_needed=False;self.stream_error_code=None
+        self.last_connect_attempt=0.;self.stream_retry_needed=False;self.stream_error_code=None;self.stream_error_detail=''
     @contextmanager
     def db(self):
         c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'cas_options_ai.db'),timeout=10)
@@ -12985,9 +13131,21 @@ class CASAdapter(DeskAdapter):
         if ws is self.stream:self.order_dirty=True;self.wake.set()
     def request_stream_reconnect(self):
         self.stream_retry_needed=True;self.last_connect_attempt=0.;self.wake.set()
+    def _safe_stream_error(self,reason):
+        import re
+        value=str(reason)
+        for secret in (globals().get('API_KEY'),self.stream_token,(globals().get('SESSION') or {}).get('access_token')):
+            if secret:value=value.replace(str(secret),'[redacted]')
+        value=re.sub(r'(?:https?|wss?)://[^\s]+','[connection endpoint]',value)
+        value=re.sub(r'(?i)(access_token|api_key|api_secret)\s*[=:]\s*[^\s&,]+',r'\1=[redacted]',value)
+        return value[:350]
+    def _on_stream_close(self,ws,code,reason):
+        if ws is not self.stream:return
+        self.stream_error_code=str(code);self.stream_error_detail=self._safe_stream_error(reason)
+        self._invalidate_stream(ws,'DISCONNECTED · reconnect scheduled');self.stream_retry_needed=True
     def _on_stream_error(self,ws,code,reason):
         if ws is not self.stream:return
-        self.stream_error_code=str(code)
+        self.stream_error_code=str(code);self.stream_error_detail=self._safe_stream_error(reason)
         self._invalidate_stream(ws,'STREAM ERROR · code '+str(code))
         self.stream_retry_needed=True
     def _on_stream_exhausted(self,ws):
@@ -12996,6 +13154,7 @@ class CASAdapter(DeskAdapter):
     def ensure_stream(self):
         try:self._ensure_stream()
         except Exception as e:
+            self.stream_error_detail=self._safe_stream_error(e)
             if self.stream:self._invalidate_stream(self.stream,'CONNECT FAILED · '+type(e).__name__)
             else:self.stream_status='CONNECT FAILED · '+type(e).__name__
             self.stream_retry_needed=True
@@ -13008,7 +13167,13 @@ class CASAdapter(DeskAdapter):
                 from twisted.internet import reactor
                 reactor.callFromThread(old.close)
             self.stream_token=None;return
-        if self.stream and token==self.stream_token and not self.stream_retry_needed:return
+        if self.stream and token==self.stream_token and not self.stream_retry_needed:
+            elapsed=time.monotonic()-self.last_connect_attempt
+            stalled=not self.stream_connected and elapsed>25
+            silent=self.stream_connected and self.wanted_tokens and self.market_open() and time.monotonic()-max(self.last_tick_mono,self.last_connect_attempt)>30
+            if not (stalled or silent):return
+            self.stream_error_detail='Connection handshake timed out' if stalled else 'No stream arrivals for 30 seconds during configured market hours'
+            self._invalidate_stream(self.stream,'STREAM WATCHDOG · retry scheduled');self.stream_retry_needed=True
         if time.monotonic()-self.last_connect_attempt<10:return
         self.last_connect_attempt=time.monotonic()
         from kiteconnect import KiteTicker
@@ -13018,7 +13183,7 @@ class CASAdapter(DeskAdapter):
         self.stream=KiteTicker(API_KEY,token,reconnect=True,reconnect_max_tries=50,reconnect_max_delay=10)
         self.stream_token=token;ws=self.stream;self.stream_retry_needed=False;self.stream_status='CONNECTING'
         ws.on_connect=self._on_connect;ws.on_ticks=self._on_ticks;ws.on_order_update=self._on_order
-        ws.on_close=lambda w,c,r:self._invalidate_stream(w,'DISCONNECTED · reconnecting')
+        ws.on_close=self._on_stream_close
         ws.on_error=self._on_stream_error
         ws.on_reconnect=lambda w,n:self._invalidate_stream(w,'RECONNECTING')
         ws.on_noreconnect=self._on_stream_exhausted
@@ -13081,7 +13246,7 @@ class CASAdapter(DeskAdapter):
         with self.stream_lock:
             return dict(connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
                 last_tick_age_seconds=round(time.monotonic()-self.last_tick_mono,2) if self.last_tick_mono else None,
-                source='KiteTicker FULL · event-driven',error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
+                source='KiteTicker FULL · event-driven',error_detail=getattr(self,'stream_error_detail',''),error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
     def fresh(self,key):
         q=self.quotes.get(key)
         if not q:raise ValueError('Missing quote: '+key)
@@ -13146,12 +13311,13 @@ class CASEngine(DeskEngine):
     def verify_positions(self):
         if time.monotonic()-self.last_verify<1:return
         self.last_verify=time.monotonic()
-        live=[p for p in self.active() if p['mode']=='live'];self.mismatches=set()
-        if not live:return
+        live=[p for p in self.active() if p['mode']=='live']
+        if not live:self.mismatches=set();return
         try:book=self.a.holdings()
-        except Exception:
+        except Exception as e:
+            if type(e).__name__=='BrokerDeferred':return
             self.mismatches={p['id'] for p in live};raise
-        actual={};expected={}
+        self.mismatches=set();actual={};expected={}
         for p in book:
             key=(p.get('exchange'),p.get('tradingsymbol'),p.get('product'))
             actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
@@ -13342,6 +13508,9 @@ class CASEngine(DeskEngine):
                 if body.get('ack') is not True:raise ValueError('Confirm today is a trading day and the configured NFO/BFO/NRML cutoffs are supported')
                 cfg.update(verified_date=now_ist().date().isoformat(),armed=False);self.put('config',cfg);return cfg
             if action=='arm' and cfg['mode']=='paper':
+                if hasattr(self,'shared_risk'):
+                    blocked=self.shared_risk.snapshot('paper')['entry_block']
+                    if blocked:raise ValueError(blocked)
                 if not self.a.connected():raise ValueError('Connect Kite first')
                 if self.get('halt') or self.get('close_requested'):raise ValueError('Resolve halt/close request first')
                 cfg['armed']=True;self.put('config',cfg);return cfg
@@ -13366,6 +13535,10 @@ class CASEngine(DeskEngine):
             except Exception:
                 self.a.quotes={};self.confirm.clear();raise
             self.collect()
+            halt=self.get('halt') or ''
+            if halt.startswith('CAS cycle error:') and not self.mismatches and not self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                self.put('halt',None);cfg=self.config();cfg['armed']=False;self.put('config',cfg)
+                self.event('RECOVERED','CAS cycle recovered; entries remain disarmed. Review readiness and arm again.')
             # Manage owned positions before scanning for another entry.
             self.manage(bool(self.get('close_requested')))
             for symbol in self.a.symbols:
@@ -13381,9 +13554,34 @@ class CASEngine(DeskEngine):
         except Exception as e:
             self.put('halt','CAS cycle error: '+str(e));self.event('ERROR',str(e))
         finally:self.lock.release()
+    def live_readiness(self,s):
+        cfg=s['config'];stream=s['stream'];today=now_ist().date().isoformat();hhmm=now_ist().strftime('%H:%M')
+        checks=[]
+        def add(name,ok,detail):checks.append(dict(check=name,passed=bool(ok),detail=detail))
+        add('Kite login',s['connected'],'Connect or renew the Kite session if disconnected.')
+        add('Configured trading day and hours',self.a.market_open(),'Weekday schedule and saved market hours apply; exchange holidays still require verification.')
+        add('CAS entry window',cfg['entry_start']<=hhmm<cfg['entry_end'],cfg['entry_start']+'–'+cfg['entry_end']+' IST. Outside this window, no new CAS entries are permitted.')
+        add('Streaming connection',stream['connected'],stream['status']+'; '+(stream.get('error_detail') or 'No connection error detail recorded.'))
+        add('Instrument subscriptions',stream['subscriptions']>len(self.a.symbols),str(stream['subscriptions'])+' subscriptions. Use Prepare CAS feed; option subscriptions populate after index ticks arrive.')
+        age=stream.get('last_tick_age_seconds')
+        add('Recent stream arrivals',age is not None and age<=cfg['max_quote_age'],'Arrival age: '+(str(age)+' seconds' if age is not None else 'not received')+'. Every entry also requires fresh exchange timestamps and an executable option book.')
+        add('Validated CAS model',bool(s.get('model')),str(s['observations'].get('settled') or 0)+' settled CAS observations available. At least 300 and a passing validation result are required; use paper collection then Train CAS model.')
+        add('Today’s session verification',cfg.get('verified_date')==today,'Verify today’s exchange hours and broker NRML cutoff after saving settings.')
+        add('Paper performance gate',cfg.get('live_override') is True or s['evidence']['ready'],'The existing paper-evidence override bypasses only this gate, never model validation or risk controls.')
+        others=DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed') or bool(self.a.legacy_open())
+        add('Other desks idle',not others,'Disarm the other AI desks and reconcile/close their positions before CAS entries.')
+        shared=self.shared_risk.snapshot('live')['entry_block'] if hasattr(self,'shared_risk') else None
+        add('Shared live risk',not shared,shared or 'Shared live risk checks clear.')
+        add('CAS error state',not s.get('halt'),s.get('halt') or 'No retained CAS halt.')
+        add('Live mode selected',cfg['mode']=='live','Select Live after the required model, performance and verification gates pass.')
+        add('Entries armed',cfg['armed'],'Arm live execution explicitly. One-attempt mode disarms after its entry request.')
+        qualified=any(x.get('decision')=='READY' for x in s['signals'])
+        add('Qualifying signal',qualified,'At least one fresh signal must meet spike, confirmation, option momentum, spread, depth and risk checks; see each index’s signal reason.')
+        return checks
     def state(self):
         s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=2')[0]
-        s.update(version='CAS-3',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
+        s.update(version='CAS-4',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
+        s['live_readiness']=self.live_readiness(s)
         return s
     def start(self):
         if self.started:return
@@ -13398,6 +13596,155 @@ class CASEngine(DeskEngine):
         threading.Thread(target=run,daemon=True,name='cas-options').start()
 
 CAS_DESK=CASEngine(CASAdapter())
+
+class SharedAIRisk:
+    """One backend process, three AI ledgers; manual/other-app trades are outside this budget."""
+    DEFAULTS=dict(daily_loss=7500.,profit_activation=3000.,profit_giveback=1500.,profit_protection_enabled=True,
+        symbol_losses=2,max_trades=10,max_positions=3,one_trade_per_arm=False,same_signal_lock=True,
+        symbol_loss_limit_enabled=True,trade_limit_enabled=True,position_limit_enabled=True)
+    def __init__(self,engines):
+        self.engines=engines;self.owner=engines['index'];self.lock=threading.RLock()
+        for name,engine in engines.items():engine.shared_risk=self;engine.desk_name=name
+        if not self.owner.get('optional_risk_controls_v1',False):
+            cfg=self.config();cfg.pop('loss_streak',None);cfg['one_trade_per_arm']=False
+            self.owner.put('shared_risk_config',cfg);self.owner.put('optional_risk_controls_v1',True)
+            self.owner.event('SHARED_RISK','Consecutive-loss stop removed; one-entry-per-arm disabled. Optional protection switches available.')
+    def config(self):
+        cfg={**self.DEFAULTS,**self.owner.get('shared_risk_config',{})};cfg.pop('loss_streak',None);return cfg
+    def save(self,body):
+        with self.lock:
+            if any(e.config()['armed'] or e.active() for e in self.engines.values()):raise ValueError('Disarm all three desks and close/reconcile positions before changing shared risk settings')
+            cfg=self.config()
+            bounds=dict(daily_loss=(100,1000000),profit_activation=(100,1000000),profit_giveback=(100,1000000),symbol_losses=(1,20),max_trades=(1,100),max_positions=(1,10))
+            for key,value in body.items():
+                if key in ('one_trade_per_arm','same_signal_lock','profit_protection_enabled','symbol_loss_limit_enabled','trade_limit_enabled','position_limit_enabled'):
+                    if not isinstance(value,bool):raise ValueError('Expected checkbox: '+key)
+                    cfg[key]=value
+                elif key in bounds:
+                    if isinstance(value,bool):raise ValueError('Invalid '+key)
+                    v=float(value);lo,hi=bounds[key]
+                    if not math.isfinite(v) or not lo<=v<=hi:raise ValueError('Out of range: '+key)
+                    if key in ('symbol_losses','max_trades','max_positions'):
+                        if not v.is_integer():raise ValueError('Whole number required: '+key)
+                        v=int(v)
+                    cfg[key]=v
+                else:raise ValueError('Unknown shared setting: '+key)
+            if cfg['profit_protection_enabled'] and cfg['profit_giveback']>=cfg['profit_activation']:raise ValueError('Giveback must be below profit activation')
+            self.owner.put('shared_risk_config',cfg)
+            self.owner.event('SHARED_RISK','Shared limits updated; existing daily latches retained')
+            return cfg
+    def snapshot(self,mode):
+        with self.lock:
+            cfg=self.config();today=now_ist().date().isoformat();now=time.monotonic()
+            key='shared_risk_day:'+mode+':'+today;state=self.owner.get(key,{})
+            total=0.;reserved=0.;active=[];closed=[];attempts=0;missing=[];pending=[];desk_totals={};desk_reserved={}
+            for name,e in self.engines.items():
+                rows=e.rows("SELECT * FROM desk_positions WHERE mode=? AND (ts LIKE ? OR exit_ts LIKE ? OR status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING'))",(mode,today+'%',today+'%'))
+                subtotal=0.;reserved_before=reserved
+                for p in rows:
+                    if p['ts'].startswith(today):attempts+=1
+                    if p['status']=='CLOSED' and (p.get('exit_ts') or '').startswith(today):closed.append(dict(p,desk=name))
+                    # Retained carry positions are included; dashboard explicitly discloses ledger basis.
+                    subtotal+=p['pnl']-p['fees']
+                    if p['status'] not in ('OPEN','ENTRY_PENDING','EXIT_PENDING'):continue
+                    active.append((name,p))
+                    if p['status'] in ('ENTRY_PENDING','EXIT_PENDING'):pending.append(p['id'])
+                    health=e.health.get(p['id'],{});bid=health.get('bid');fresh=bid is not None and now-health.get('observed_mono',0)<= (3 if name=='cas' else 15)
+                    if p['qty']>0:
+                        if not fresh:missing.append(p['contract']);bid=p['entry']
+                        subtotal+=(bid-p['entry'])*p['qty']
+                        reserved+=max(0.,bid-p['stop'])*p['qty']+e.config()['fee_per_order']
+                    if p['status']=='ENTRY_PENDING':
+                        # Reserve the unfilled part, including intents not yet submitted.
+                        setup=json.loads(p.get('setup') or '{}');wanted=int(setup.get('qty') or 0)
+                        reserved+=max(0,wanted-p['qty'])*max(0.,float(setup.get('entry') or 0)-p['stop'])+e.config()['fee_per_order']
+                desk_totals[name]=subtotal;desk_reserved[name]=reserved-reserved_before;total+=subtotal
+            closed.sort(key=lambda p:(p['exit_ts'],p['id']))
+            running=0.;historical_peak=0.
+            for p in closed:
+                running+=p['pnl']-p['fees'];historical_peak=max(historical_peak,running)
+            peak=max(float(state.get('peak',0)),historical_peak,total if not missing else 0.)
+            streak=0
+            for p in reversed(closed):
+                if p['pnl']-p['fees']>=0:break
+                streak+=1
+            reason=state.get('reason');liquidate=bool(state.get('liquidate'))
+            # Clear only the removed/disabled rule's own old latch. Financial loss
+            # limits are evaluated again below and cannot be cleared by these switches.
+            if (reason=='Combined AI consecutive-loss limit reached' or
+                reason=='Combined AI profit giveback limit reached' and not cfg['profit_protection_enabled'] or
+                reason=='Combined AI daily entry-attempt limit reached' and not cfg['trade_limit_enabled']):
+                reason=None;liquidate=False
+            # Financial stops take precedence over entry-only latches.
+            financial=None
+            if total<=-cfg['daily_loss']:financial='Combined AI daily loss limit reached'
+            elif cfg['profit_protection_enabled'] and not missing and peak>=cfg['profit_activation'] and peak-total>=cfg['profit_giveback']:financial='Combined AI profit giveback limit reached'
+            # Also retain each desk's tighter daily stop; no same-day clear-halt bypass.
+            for name,e in self.engines.items():
+                if desk_totals[name]<=-e.config()['daily_loss']:financial=name+' daily loss limit reached'
+            if financial:reason=financial;liquidate=True
+            if not reason and cfg['trade_limit_enabled'] and attempts>=cfg['max_trades']:reason='Combined AI daily entry-attempt limit reached'
+            new=dict(peak=peak,reason=reason,liquidate=liquidate)
+            if new!=state:self.owner.put(key,new)
+            blocker=reason
+            if not blocker and missing:blocker='Fresh position quotes required: '+', '.join(missing)
+            if not blocker and pending:blocker='Unresolved entry/exit order in another or this AI desk'
+            if not blocker and any(e.mismatches for e in self.engines.values()):blocker='Broker quantity verification required before new entries'
+            if not blocker and cfg['position_limit_enabled'] and len(active)>=cfg['max_positions']:blocker='Combined AI open-position limit reached'
+            if not blocker and globals().get('BROKER_GATE') and BROKER_GATE.status()['cooldown_seconds']>0:blocker='Broker rate-limit cooldown; new entries paused'
+            floor=max(-cfg['daily_loss'],peak-cfg['profit_giveback']) if cfg['profit_protection_enabled'] and peak>=cfg['profit_activation'] else -cfg['daily_loss']
+            return dict(mode=mode,date=today,net=round(total,2),peak=round(peak,2),reserved=round(reserved,2),
+                remaining=round(max(0.,total-reserved-floor),2),reason=reason,entry_block=blocker,liquidate=liquidate,
+                attempts=attempts,loss_streak=streak,positions=len(active),missing_quotes=missing,closed=closed,config=cfg,desk_reserved=desk_reserved,desk_totals=desk_totals)
+    def signal_key(self,e,s):
+        if e.desk_name=='cas':
+            epoch=s.get('signal_epoch')
+            return str(int(float(epoch)//max(1.,e.config()['lookback_seconds']))) if epoch else None
+        return str(s['bar_ts']) if s.get('bar_ts') else None
+    def admit(self,e,s):
+        # Caller holds this lock through the durable position insert. No broker I/O here.
+        cfg=e.config();view=self.snapshot(cfg['mode']);limits=view['config']
+        if view['entry_block']:return view['entry_block']
+        losses=sum(1 for p in view['closed'] if p['symbol']==s['symbol'] and p['pnl']-p['fees']<0)
+        if limits['symbol_loss_limit_enabled'] and losses>=limits['symbol_losses']:return 'Daily losing-trade limit for '+s['symbol']
+        signal=self.signal_key(e,s)
+        if limits['same_signal_lock']:
+            if signal is None:return 'Signal timestamp missing; cannot establish fresh entry'
+            for other in self.engines.values():
+                for row in other.rows('SELECT setup FROM desk_positions WHERE mode=? AND symbol=? AND ts LIKE ?',(cfg['mode'],s['symbol'],view['date']+'%')):
+                    prior=json.loads(row['setup'] or '{}')
+                    prior_key=prior.get('shared_signal_key') or (str(prior.get('bar_ts')) if prior.get('bar_ts') else None)
+                    if prior_key==signal:return 'Signal already used; wait for a fresh signal'
+        required=(float(s['entry'])-float(s['stop']))*int(s['qty'])+2*cfg['fee_per_order']
+        if not math.isfinite(required) or required<=0:return 'Invalid planned entry risk'
+        if required>cfg['risk']+.01:return 'Planned loss including estimated fees exceeds per-trade risk'
+        floor=-limits['daily_loss']
+        if limits['profit_protection_enabled'] and view['peak']>=limits['profit_activation']:floor=max(floor,view['peak']-limits['profit_giveback'])
+        if required>view['net']-view['reserved']-floor:return 'Insufficient shared risk remaining for this entry'
+        if view['desk_totals'][e.desk_name]-view['desk_reserved'][e.desk_name]-required < -cfg['daily_loss']:return 'Insufficient desk daily risk remaining'
+        s['shared_signal_key']=signal;s['shared_risk_at_entry']={k:v for k,v in view.items() if k!='closed'}
+        return None
+
+
+SHARED_RISK=SharedAIRisk({'index':DESK,'stock':STOCK_DESK,'cas':CAS_DESK})
+
+
+@app.route('/api/shared-ai-risk',methods=['GET','POST'])
+def shared_ai_risk():
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    try:
+        if request.method=='POST':
+            body=request.get_json(silent=True)
+            if not isinstance(body,dict):raise ValueError('Settings object required')
+            SHARED_RISK.save(body)
+        states={}
+        for mode in ('paper','live'):
+            states[mode]=SHARED_RISK.snapshot(mode);states[mode].pop('closed',None)
+        return jsonify(config=SHARED_RISK.config(),states=states,broker=BROKER_GATE.status(),scope='Three AI desks in this backend process; excludes manual, legacy and other-app trades. Keep one backend worker process.')
+    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+
+
 
 @app.route('/api/cas-ai/state')
 def cas_ai_state():
@@ -13418,6 +13765,12 @@ def cas_ai_control(action):
     body=request.get_json(silent=True) or {}
     if not isinstance(body,dict):return jsonify(error='JSON object required'),400
     try:
+        if action=='prepare':
+            if not CAS_DESK.lock.acquire(False):return jsonify(error='CAS supervision is running; retry Prepare shortly'),409
+            try:
+                CAS_DESK.a.ensure_stream();CAS_DESK.a.last_subscription=0.;CAS_DESK.a.update_subscriptions()
+                return jsonify(ok=True,message='Subscriptions prepared. Readiness shows remaining live prerequisites; entries were not armed.')
+            finally:CAS_DESK.lock.release()
         if action=='reconnect':
             CAS_DESK.a.request_stream_reconnect();return jsonify(ok=True,message='Reconnect requested; trading gates still apply')
         if action=='scan':
@@ -13542,7 +13895,7 @@ def desk_trade_review_export(desk):
             yield '\ufeff'+line(['trade_id','contract','mode','trade_status','record_time_IST','record_type','expected_direction','net_realized_estimated_fees','observed_bid','observed_ask','signal_direction','exit_reason','explanation','evidence_json'])
             for trade_id,r in reviews():
                 p=r['position'];base=[trade_id,p['contract'],p['mode'],p['status']]
-                yield line(base+[p['ts'],'REVIEW',r['entry_plan'].get('direction'),r['outcome']['net_realized'],'','','',p.get('exit_reason'),' '.join(r['explanations'])+' '+r['limitations'],export_json.dumps(r,default=str)])
+                yield line(base+[p['ts'],'REVIEW',r['entry_plan'].get('direction'),r['outcome']['net_realized'],'','','',r.get('recorded_exit_reason') or p.get('exit_reason'),' '.join(r['explanations'])+' '+r['limitations'],export_json.dumps(r,default=str)])
                 for e in events(trade_id):
                     data=e['data'];q=data.get('quote') or {};signal=data.get('signal') or {}
                     yield line(base+[e['ts'],e['kind'],r['entry_plan'].get('direction'),'',q.get('bid'),q.get('ask'),signal.get('direction'),data.get('reason') or data.get('decision'),'Recorded observation; does not prove market causation',export_json.dumps(data,default=str)])
