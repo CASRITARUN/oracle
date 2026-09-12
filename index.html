@@ -1064,7 +1064,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <style>
 #casDesk{background:#0c1017;color:#edf2f8;padding:28px;border:1px solid #293443;border-radius:16px;font:14px/1.6 system-ui;max-width:1680px;margin:auto}#casDesk *{box-sizing:border-box}#casDesk h2,#casDesk h3,#casDesk p{margin:0 0 12px}#casDesk h2{font-size:27px}#casDesk small,#casDesk label{color:#a7b6ca}#casDesk .cas-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:space-between}#casDesk button,#casDesk select,#casDesk input{background:#1b2737;color:#edf2f8;border:1px solid #455268;border-radius:7px;padding:10px;font:inherit}#casDesk button{cursor:pointer}#casDesk button:disabled{opacity:.5;cursor:wait}#casDesk button:focus-visible,#casDesk input:focus-visible{outline:2px solid #b1ef65}#casDesk .primary{background:#b1ef65;color:#15200b;font-weight:700}#casDesk .danger{background:#44232c;color:#ffb8b4}#casDesk .cas-panel{padding:22px;background:#141c27;border:1px solid #293443;border-radius:10px;margin:18px 0;overflow:auto}#casDesk .cas-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}#casDesk .metric{padding:18px;background:#141c27;border:1px solid #293443;border-radius:9px}#casDesk .metric b{display:block;font:25px ui-monospace,monospace;margin-top:9px}#casDesk #casNotice{margin:18px 0;border-left:3px solid #8bb6ff;padding:12px;background:#1a2b40;white-space:pre-wrap}#casDesk table{border-collapse:collapse;min-width:650px;width:100%;font-size:12px;text-align:left}#casDesk th,#casDesk td{padding:12px;border-bottom:1px solid #334154;white-space:nowrap}#casDesk th{color:#a7b6ca}#casDesk label{display:flex;flex-direction:column;gap:6px}#casDesk .cas-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:17px;margin:18px 0}#casDesk input{width:100%}#casDesk .cas-events{max-height:220px;overflow:auto;white-space:pre-wrap;font:12px/1.8 ui-monospace,monospace}#casDesk a{color:#8bb6ff}@media(max-width:850px){#casDesk .cas-grid,#casDesk .cas-fields{grid-template-columns:repeat(2,minmax(0,1fr))}#casDesk{padding:15px}}@media(max-width:480px){#casDesk .cas-fields{grid-template-columns:1fr}}
 </style>
-<div id="casDesk">
+<div id="casDesk"><section class="cas-panel"><h3>CAS live readiness · why entries are blocked</h3><button data-cas-action="prepare">Prepare CAS feed</button> <button id="casDownloadDiagnostics">Download CAS diagnostics</button><div id="casReadiness"></div></section>
 <div class="cas-row"><div><small>CLOSING SESSION · INDEX OPTIONS</small><h2>CAS Fast Spike AI</h2><p>Confirm the move. Check the option. Execute within limits.</p></div><strong id="casHeartbeat">CONNECT KITE</strong></div>
 <div class="cas-row"><div class="cas-row"><select id="casMode" aria-label="CAS execution mode"><option value="paper">Paper trading</option><option value="live">Live trading</option></select><button class="primary" data-cas-action="arm">Arm entries</button><button data-cas-action="disarm">Disarm</button><button class="danger" data-cas-action="close">Close all CAS positions</button></div><button data-cas-action="scan">Scan now</button><button data-cas-action="reconnect">Reconnect stream</button></div>
 <p id="casFeed" role="status">Streaming feed: awaiting Kite login</p>
@@ -2682,7 +2682,7 @@ async function dkAction(action,body={}){
       if(body.enabled&&!await dkConfirm('Enable manual live override?','Allow live mode before the forward paper thresholds pass. Risk limits and all other trading conditions still apply. Entries will be disarmed; select Live and arm separately.'))return;
       body.ack=body.enabled;
     }
-    if(action==='arm'&&deskState?.config.mode==='live'){if(!await dkConfirm('Arm live execution?','The engine will automatically submit real index-option BUY and SELL orders to your connected Kite account until you disarm it.'))return;body.ack=true}
+    if(action==='arm'&&deskState?.config.mode==='live'){if(!await dkConfirm('Arm live execution?','The engine will automatically submit real index-option BUY and SELL orders to your connected Kite account subject to shared risk limits. With One entry attempt enabled, it disarms after that attempt.'))return;body.ack=true}
     if(action==='close'&&!await dkConfirm('Close all desk positions?','Disarm new entries and request exits for all v2 positions. Pending orders must reconcile; market closure or missing quotes can delay completion.'))return;
     await dkRequest('control/'+action,body);dkNotice(action==='train'?'Training started. Follow progress in Learning lab.':action==='sync'?'Recent-history sync started.':'Control accepted; refreshing state.');await refreshAutoTradeAI();
   }catch(e){dkNotice(e.message,true)}
@@ -2701,6 +2701,7 @@ function initAutoTradeAIUI(){
 }
 async function refreshAutoTradeAI(){if(deskBusy)return;deskBusy=true;try{deskState=await dkRequest('state');dkRender(deskState)}catch(e){dkNotice(e.name==='AbortError'?'Backend request timed out; displayed values may be stale.':e.message,true);dkText('dkPulse','OFFLINE');['dkArm','dkMode','dkLiveOverride'].forEach(id=>{if(dkEl(id))dkEl(id).disabled=true})}finally{deskBusy=false}}
 function dkRender(s){
+  renderSharedRisk('dk');
   const cfg=s.config||{},ev=s.evidence||{},model=s.model||{},obs=s.observations||{};
   const age=s.last_cycle?(Date.now()-new Date(s.last_cycle).getTime())/1000:Infinity;
   dkText('dkMarket',s.market_open?'MARKET OPEN':'MARKET CLOSED');dkEl('dkMarket').classList.toggle('good',s.market_open);
@@ -2771,7 +2772,7 @@ async function skAction(action,body={}){
       if(body.enabled&&!await skConfirm('Enable manual live override?','Allow live mode before the forward paper thresholds pass. Risk limits and all other trading conditions still apply. Entries will be disarmed; select Live and arm separately.'))return;
       body.ack=body.enabled;
     }
-    if(action==='arm'&&stockdeskState?.config.mode==='live'){if(!await skConfirm('Arm live execution?','The engine will automatically submit real stock-option BUY and SELL orders to your connected Kite account until you disarm it.'))return;body.ack=true}
+    if(action==='arm'&&stockdeskState?.config.mode==='live'){if(!await skConfirm('Arm live execution?','The engine will automatically submit real stock-option BUY and SELL orders to your connected Kite account subject to shared risk limits. With One entry attempt enabled, it disarms after that attempt.'))return;body.ack=true}
     if(action==='close'&&!await skConfirm('Close all stockdesk positions?','Disarm new entries and request exits for all v2 positions. Pending orders must reconcile; market closure or missing quotes can delay completion.'))return;
     await skRequest('control/'+action,body);skNotice(action==='train'?'Training started. Follow progress in Learning lab.':action==='sync'?'Recent-history sync started.':'Control accepted; refreshing state.');await refreshStockTradeAI();
   }catch(e){skNotice(e.message,true)}
@@ -2791,6 +2792,7 @@ function initStockTradeAIUI(){
 }
 async function refreshStockTradeAI(){if(stockdeskBusy)return;stockdeskBusy=true;try{stockdeskState=await skRequest('state');skRender(stockdeskState)}catch(e){skNotice(e.name==='AbortError'?'Backend request timed out; displayed values may be stale.':e.message,true);skText('skPulse','OFFLINE');['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true})}finally{stockdeskBusy=false}}
 function skRender(s){
+  renderSharedRisk('sk');
   if(!(s.signals||[]).some(x=>x.symbol===stockdeskSymbol))stockdeskSymbol=s.signals?.[0]?.symbol||'';
   skText('skScanStatus',`${s.universe?.mode||'Universe pending'} · ${s.universe?.total_fo||0} F&O stocks · ${s.watchlist?.length||0} selected · ${s.scan?.status||'IDLE'} ${s.scan?.completed||0}/${s.scan?.total||0} · ${s.ban_status||''}`);
   skHTML('skRanking',skTable(['Rank','Stock','Score / 100','CE / PE','Confidence','Spread','Entry','Stop','Target','Status / reason'],(s.signals||[]).map(x=>[x.rank,x.symbol,skNum(x.rank_score,1),x.option_type||'—',x.confidence==null?'—':skNum(x.confidence*100,1)+'%',x.spread==null?'—':skNum(x.spread)+'%',skMoney(x.entry),skMoney(x.stop),skMoney(x.target),x.decision+' · '+(x.reason||'')])));
@@ -3412,10 +3414,12 @@ function initCASUI(){if(casInitialized){casRefresh();return}casInitialized=true;
  casEl('casSettings').oninput=()=>casDirty=true;
  casEl('casSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=casFields.find(f=>f[0]===k)[2]==='time'?v:Number(v));await casRequest('config',body);casDirty=false;await casRefresh();casText('casNotice','CAS settings saved; session verification cleared.')}catch(e){casText('casNotice',e.message)}};
  casEl('casMode').onchange=async e=>{try{const mode=e.target.value;if(mode==='live'&&!confirm('Switch CAS to Live? Entries stay disarmed until you explicitly arm.')){e.target.value=casState?.config.mode||'paper';return}await casRequest('control/mode',{mode,ack:mode==='live'});await casRefresh()}catch(err){e.target.value=casState?.config.mode||'paper';casText('casNotice',err.message)}};
+ casEl('casDownloadDiagnostics').onclick=()=>{if(!casState)return;const data={timestamp:casState.timestamp,readiness:casState.live_readiness,stream:casState.stream,block:casState.block,halt:casState.halt,config:casState.config,training:casState.training,observations:casState.observations,signals:casState.signals};const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='cas-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
  casEl('casExport').onclick=()=>{if(!casState)return;const keys=['ts','symbol','mode','contract','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...casState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='cas-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
  casRefresh();setInterval(()=>{if(!document.hidden&&casEl('tabPageCAS').classList.contains('active'))casRefresh()},1000);
 }
 async function casRefresh(){if(casBusy)return;casBusy=true;try{const s=await casRequest('state');casState=s;const c=s.config,age=s.last_cycle?(Date.now()-new Date(s.last_cycle))/1000:Infinity;
+ casEl('casReadiness').innerHTML=casTable(['Check','Status','Explanation / next step'],(s.live_readiness||[]).map(x=>[x.check,x.passed?'PASS':'WAIT / BLOCKED',x.detail]));
  casText('casFeed',s.stream?.status+' · '+(s.stream?.subscriptions||0)+' instruments · latest arrival '+(s.stream?.last_tick_age_seconds??'—')+'s ago');
  casText('casHeartbeat',(age>20?'DELAYED · ':c.armed?'ARMED · ':'DISARMED · ')+c.mode.toUpperCase());casText('casNotice',s.halt||s.block||'Scanning within the configured CAS window');casEl('casMode').value=c.mode;
  document.querySelectorAll('[data-cas-action="arm"]').forEach(b=>b.disabled=age>20||!s.connected);
@@ -3426,6 +3430,7 @@ async function casRefresh(){if(casBusy)return;casBusy=true;try{const s=await cas
  casText('casLearning',`${s.model?'Model '+s.model.id+' · validation '+casNum(s.model.accuracy)+'% vs baseline '+casNum(s.model.baseline)+'%':'No validated model · rule-based paper bootstrap'} · ${s.training.status}${s.training.error?' · '+s.training.error:''}`);
  casText('casEvidence',(s.evidence.ready?'Paper gate PASSED':'Paper gate collecting')+' · '+s.evidence.checks.map(x=>x.name+': '+casNum(x.value)+' / '+x.required).join(' · '));
  casText('casOverride',c.live_override?'Disable paper-evidence override':'Enable paper-evidence override');casText('casVerified',c.verified_date?'Session verified: '+c.verified_date:'Session not verified for live trading.');
+ renderSharedRisk('cas');
  renderTradeReviewControls('cas','cas',s.trades||[],s.recorder_error);
  casEl('casTrades').innerHTML=casTable(['Entry time','Index','Mode','Contract','Entry','Status','Net P&L','Exit reason'],s.trades.map(p=>[p.ts,p.symbol,p.mode,p.contract,casNum(p.entry),p.status,casNum(p.pnl-p.fees),p.exit_reason]));
  casEl('casOrders').innerHTML=casTable(['Time','Side','Requested / filled','Status','Broker ID','Reason / error'],s.orders.map(o=>[o.ts,o.side,o.qty+' / '+o.filled,o.status,o.broker_id,o.error||o.reason]));
@@ -3511,18 +3516,50 @@ function renderTradeReviewControls(prefix,desk,trades,recorderError){
  review.onclick=async()=>{review.disabled=true;const pid=select.value;try{
   const d=await get('/api/trade-review/'+desk+'/'+encodeURIComponent(pid));out.replaceChildren();
   const title=document.createElement('h3');title.textContent=d.position.contract+' · '+d.position.status;out.append(title);
-  for(const sentence of [...d.explanations,d.limitations]){const p=document.createElement('p');p.textContent=sentence;out.append(p)}
+  for(const sentence of [...(d.review_summary?Object.entries(d.review_summary).map(([k,v])=>k.replaceAll('_',' ')+': '+v):d.explanations),d.limitations]){const p=document.createElement('p');p.textContent=sentence;out.append(p)}
   for(const [label,value] of [['Expected entry plan',d.entry_plan],['Actual result',d.outcome],['Recorder coverage',d.coverage],['Observed price and signal changes',d.observed_changes],['Broker orders',d.orders],['Exit decisions',d.exit_observations]]){
-   const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent=label;pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(value,null,2);details.append(summary,pre);out.append(details);
+   const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent=label;pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(value,(_key,v)=>v===null?'Not recorded':v,2);details.append(summary,pre);out.append(details);
   }
   const h=document.createElement('h4');h.textContent='Recorded timeline · local observation times (IST)';out.append(h);
   const timeline=document.createElement('div');out.append(timeline);
-  function events(items){for(const e of items){const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent=e.ts+' · '+e.kind+(e.data.decision?' · '+e.data.decision:'');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(e.data,null,2);details.append(summary,pre);timeline.append(details)}}
+  function events(items){for(const e of items){const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent=e.ts+' · '+e.kind+(e.data.decision?' · '+e.data.decision:'');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(e.data,(_key,v)=>v===null?'Not recorded':v,2);details.append(summary,pre);timeline.append(details)}}
   events(d.timeline.events);let after=d.timeline.next_after;
   const more=document.createElement('button');more.textContent='Load more events';more.hidden=after===null;out.append(more);
   more.onclick=async()=>{more.disabled=true;try{const page=await get('/api/trade-timeline/'+desk+'/'+encodeURIComponent(pid)+'?after='+after);events(page.events);after=page.next_after;more.hidden=after===null}catch(e){status.textContent=e.message}finally{more.disabled=false}};
  }catch(e){out.textContent=e.message}finally{review.disabled=!select.options.length}};
  host.replaceChildren(status,date,load,older,select,review,download('Selected trade CSV','csv',true),download('Selected trade JSON','json',true),download('All trades for date / all dates CSV','csv',false),download('All trades for date / all dates JSON','json',false));
+}
+
+</script>
+<script>
+const sharedRiskPanels=new Map();let sharedRiskBusy=false,sharedRiskLast=0;
+function renderSharedRisk(prefix){
+ if(!sharedRiskPanels.has(prefix)){
+  const root=document.getElementById(prefix==='dk'?'desk':prefix==='sk'?'stockdesk':'casDesk');
+  if(!root)return;
+  const panel=document.createElement('details');panel.style.cssText='margin:16px 0;padding:14px;border:1px solid #506078;border-radius:10px;background:#141d2a;color:#e7eef8';
+  const summary=document.createElement('summary');summary.textContent='Shared AI risk protections · Stock + Index + CAS';panel.append(summary);
+  const info=document.createElement('p');info.style.cssText='margin:10px 0;white-space:pre-wrap';info.textContent='Loading protection status…';panel.append(info);
+  const note=document.createElement('p');note.style.cssText='margin:10px 0';note.textContent='Paper and live budgets are separate. Daily stops remain locked until the next IST day, including after restart. Enabled financial stops request exits; the optional trade-count limit blocks new entries. There is no consecutive-loss pause. Switches control the shared limits across desks; each desk’s own position limit and CAS’s own daily attempt limit still apply. Disarm all desks and close/reconcile positions before saving changes. Existing stops remain active. Limits use sampled prices and estimated fees; fills can exceed planned loss. These limits cover the three AI desks, not manual or legacy positions. Run one backend process.';panel.append(note);
+  const form=document.createElement('form');form.style.cssText='display:flex;gap:12px;flex-wrap:wrap;align-items:end';
+  const fields=[['daily_loss','Combined daily loss ₹',100,1000000],['profit_activation','Activate profit protection at ₹',100,1000000],['profit_giveback','Maximum giveback from peak ₹',100,1000000],['symbol_losses','Losing trades per symbol / day',1,20],['max_trades','Total entry attempts / day',1,100],['max_positions','Open positions across desks',1,10]];
+  for(const [key,title,min,max] of fields){const label=document.createElement('label');label.textContent=title;label.style.cssText='display:flex;flex-direction:column;gap:5px;font-size:12px';const input=document.createElement('input');input.type='number';input.name=key;input.min=min;input.max=max;input.step=1;input.required=true;input.style.width='155px';label.append(input);form.append(label)}
+  for(const [key,title] of [['one_trade_per_arm','Enable one-entry-per-arm (off by default)'],['profit_protection_enabled','Enable profit / giveback protection'],['symbol_loss_limit_enabled','Enable repeated-symbol loss limit'],['trade_limit_enabled','Enable combined daily entry-attempt limit'],['position_limit_enabled','Enable combined open-position limit'],['same_signal_lock','Block reuse of the same signal']]){const label=document.createElement('label');const input=document.createElement('input');input.type='checkbox';input.name=key;label.append(input,document.createTextNode(' '+title));form.append(label)}
+  const save=document.createElement('button');save.type='submit';save.textContent='Save shared limits';form.append(save);
+  const message=document.createElement('p');message.style.marginTop='10px';panel.append(form,message);root.prepend(panel);
+  const item={info,form,message,loaded:false,dirty:false};sharedRiskPanels.set(prefix,item);form.oninput=()=>{item.dirty=true};
+  form.onsubmit=async event=>{event.preventDefault();save.disabled=true;message.textContent='Saving…';try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:Number(el.value);const r=await fetch('/api/shared-ai-risk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(15000)});const data=await r.json();if(!r.ok)throw Error(data.error||'Save failed');item.dirty=false;message.textContent='Saved. All desks remain disarmed. Existing daily risk stops remain in force.';sharedRiskLast=0;refreshSharedRisk()}catch(e){message.textContent=e.message}finally{save.disabled=false}};
+ }
+ refreshSharedRisk();
+}
+async function refreshSharedRisk(){
+ if(sharedRiskBusy||Date.now()-sharedRiskLast<5000)return;sharedRiskBusy=true;sharedRiskLast=Date.now();
+ try{const r=await fetch('/api/shared-ai-risk',{cache:'no-store',signal:AbortSignal.timeout(12000)});const d=await r.json();if(!r.ok)throw Error(d.error||'Shared risk status unavailable');
+  for(const p of sharedRiskPanels.values()){
+   p.info.textContent=['live','paper'].map(mode=>{const v=d.states[mode];return mode.toUpperCase()+': net ₹'+v.net+' · peak ₹'+v.peak+' · reserved risk ₹'+v.reserved+' · attempts '+v.attempts+'\n'+(v.entry_block||'Shared entry checks clear; desk conditions still apply')+(v.missing_quotes.length?' · P&L incomplete: missing fresh marks':'')}).join('\n\n')+'\nBroker cooldown: '+d.broker.cooldown_seconds+' seconds';
+   if(!p.loaded||!p.dirty){for(const el of p.form.elements)if(el.name&&el.name in d.config){if(el.type==='checkbox')el.checked=d.config[el.name];else el.value=d.config[el.name]}p.loaded=true}
+  }
+ }catch(e){for(const p of sharedRiskPanels.values())p.info.textContent='Shared risk status unavailable: '+e.message+' · previous displayed values must not be treated as current.'}finally{sharedRiskBusy=false}
 }
 
 </script>
