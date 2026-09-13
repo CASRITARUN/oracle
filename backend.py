@@ -12984,7 +12984,7 @@ class StockDeskAdapter(DeskAdapter):
         cursor_end=(first-timedelta(minutes=1)) if first else now
         if cursor_end<=target_start:
             return dict(symbol=symbol,status='COMPLETE',rows_added=0,chunks=0,bounds=bounds)
-        added_total=0;chunks=0;fetched_total=0;error=None
+        added_total=0;chunks=0;fetched_total=0;error=None;max_available=False
         while cursor_end>target_start:
             if pause_check:
                 reason=pause_check()
@@ -12996,6 +12996,17 @@ class StockDeskAdapter(DeskAdapter):
             candles,fetch_err=_hist_fetch_chunk(token,start,cursor_end)
             if fetch_err:
                 error=str(fetch_err);break
+            # A legal historical request that returns no candles immediately before an
+            # already-populated archive means Kite has no older data for this current
+            # instrument/symbol.  Treat that as MAX_AVAILABLE rather than retrying forever.
+            # We require an existing usable archive so a totally empty/mis-mapped symbol
+            # is still treated as an error and remains visible for investigation.
+            if not candles:
+                current=self.history_bounds(symbol)
+                if int(current.get('n') or 0)>=240 and current.get('first_ts'):
+                    max_available=True
+                    break
+                error='No historical candles returned for current instrument';break
             added=_hist_insert_candles(symbol,candles);added_total+=added;fetched_total+=len(candles);chunks+=1
             if progress:
                 try:progress(dict(symbol=symbol,start=str(start),end=str(cursor_end),rows_added=added_total,chunks=chunks))
@@ -13007,8 +13018,9 @@ class StockDeskAdapter(DeskAdapter):
         bounds=self.history_bounds(symbol)
         first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
         complete=bool(first and first<=target_start+timedelta(days=3))
-        return dict(symbol=symbol,status='COMPLETE' if complete else ('PARTIAL' if chunks else 'ERROR'),rows_added=added_total,
-            fetched=fetched_total,chunks=chunks,error=error,bounds=bounds,target_start=str(target_start))
+        status='COMPLETE' if complete else 'MAX_AVAILABLE' if max_available else ('PARTIAL' if chunks else 'ERROR')
+        return dict(symbol=symbol,status=status,rows_added=added_total,fetched=fetched_total,chunks=chunks,error=error,
+            bounds=bounds,target_start=str(target_start),available_from=str(first) if first else None)
     def chain(self,symbol):
         exchange,opts=get_option_instruments_for_symbol(symbol)
         today=now_ist().date()
@@ -13203,10 +13215,10 @@ class StockDeskEngine(DeskEngine):
         if not force and now-self.history_backfill_last_attempt<STOCK_HISTORY_BACKFILL_RETRY_SECONDS:return False
         self.history_backfill_last_attempt=now;self.history_backfill_universe=universe
         def job():
-            total=len(universe);added_total=0;errors=[];archive_complete=0
+            total=len(universe);added_total=0;errors=[];archive_complete=0;full_year=0;max_available=0;max_available_names=[]
             self.history_backfill_status=dict(status='BACKFILLING',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=total,
-                archive_complete_symbols=0,coverage_ratio=0.0,required_coverage=STOCK_HIST_MIN_ARCHIVE_COVERAGE,rows_added=0,
-                started=now_ist().isoformat(),symbol=None,pause_reason=None)
+                archive_complete_symbols=0,archive_full_year_symbols=0,archive_max_available_symbols=0,coverage_ratio=0.0,
+                required_coverage=STOCK_HIST_MIN_ARCHIVE_COVERAGE,rows_added=0,started=now_ist().isoformat(),symbol=None,pause_reason=None)
             for i,symbol in enumerate(universe):
                 if self.stop_event.is_set():break
                 if not self.a.connected():
@@ -13228,18 +13240,26 @@ class StockDeskEngine(DeskEngine):
                             completed=i,symbol=symbol,rows_added=added_total,archive_complete_symbols=archive_complete,
                             coverage_ratio=round(archive_complete/max(1,total),4),updated=now_ist().isoformat())
                         self.history_backfill_last_attempt=0.;return
-                    if r.get('status')=='COMPLETE':archive_complete+=1
-                    else:errors.append(symbol+': '+str(r.get('error') or r.get('status')))
+                    if r.get('status')=='COMPLETE':
+                        archive_complete+=1;full_year+=1
+                    elif r.get('status')=='MAX_AVAILABLE':
+                        # No older candles exist for the current instrument. This is a
+                        # resolved archive, not an error; use all genuine available data.
+                        archive_complete+=1;max_available+=1;max_available_names.append(symbol)
+                    else:
+                        errors.append(symbol+': '+str(r.get('error') or r.get('status')))
                 except Exception as e:
                     errors.append(symbol+': '+str(e))
                 self.history_backfill_status.update(completed=i+1,rows_added=added_total,last_symbol=symbol,error_count=len(errors),
-                    archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4))
+                    archive_complete_symbols=archive_complete,archive_full_year_symbols=full_year,archive_max_available_symbols=max_available,
+                    max_available_symbols=max_available_names[:20],coverage_ratio=round(archive_complete/max(1,total),4))
             complete=(not self.stop_event.is_set() and self.a.connected() and not errors and archive_complete==total)
             self.history_backfill_status.update(status='COMPLETE' if complete else 'PARTIAL · WILL RETRY',
                 completed=total if complete else self.history_backfill_status.get('completed',0),total=total,rows_added=added_total,
-                archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4),
+                archive_complete_symbols=archive_complete,archive_full_year_symbols=full_year,archive_max_available_symbols=max_available,
+                max_available_symbols=max_available_names[:20],coverage_ratio=round(archive_complete/max(1,total),4),
                 finished=now_ist().isoformat(),errors=errors[:8],pause_reason=None)
-            self.event('HISTORY_BACKFILL',f"{self.history_backfill_status['status']} · {STOCK_HISTORY_BACKFILL_DAYS}d · added {added_total} rows")
+            self.event('HISTORY_BACKFILL',f"{self.history_backfill_status['status']} · {archive_complete}/{total} resolved ({full_year} full-year + {max_available} max-available) · added {added_total} rows")
             if added_total>0 and not self.train_lock.locked() and not self._live_execution_priority_reason():self.train()
             if self._history_archive_coverage()['ready'] and not self._live_execution_priority_reason():self._ensure_historical_success_training(force=True)
         self.history_backfill_thread=threading.Thread(target=job,daemon=True,name='stock-ai-deep-history')
