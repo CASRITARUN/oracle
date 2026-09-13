@@ -1915,6 +1915,11 @@ def callback():
     SESSION["access_token"] = data["access_token"]
     SESSION["logged_in_at"] = now_ist().isoformat()
     kite.set_access_token(SESSION["access_token"])
+    # Do not wait for the next 30-second scanner tick: wake Stock AI immediately so
+    # full-F&O discovery and resumable deep-history collection begin after login.
+    try:
+        if 'STOCK_DESK' in globals():threading.Thread(target=STOCK_DESK.cycle,daemon=True,name='stock-ai-login-wake').start()
+    except Exception:pass
     return redirect("/")
 
 
@@ -12212,8 +12217,14 @@ def _build_desk_engine_class():
                 if spread>cfg['max_spread'] or not .3<=abs(o['delta'])<=.7:continue
                 candidates.append((abs(abs(o['delta'])-.5)+spread/10,o))
             if not candidates:s.update(decision='WAIT',reason='No liquid CE/PE contract within spread limit');return s
-            o=min(candidates,key=lambda r:r[0])[1];s.update(contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
-               lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),option_type=typ)
+            o=min(candidates,key=lambda r:r[0])[1]
+            expiry=o.get('expiry');dte=None
+            try:dte=(expiry-now_ist().date()).days if hasattr(expiry,'__sub__') else None
+            except Exception:dte=None
+            s.update(contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
+               lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),option_type=typ,
+               option_delta=float(o.get('delta') or 0),option_volume=float(o.get('volume') or 0),option_oi=float(o.get('oi') or 0),
+               option_expiry=str(expiry) if expiry is not None else None,dte=dte)
             q,why=self.a.quote(s['exchange'],s['contract'])
             if why:s.update(decision='WAIT',reason=why);return s
             s.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'],depth_qty=q['ask_qty'])
@@ -12855,7 +12866,68 @@ STOCK_FULL_SCAN_DEEP_N = 24
 STOCK_FULL_REFRESH_BATCH = 28
 STOCK_HISTORY_REFRESH_SECONDS = 210
 STOCK_HISTORY_PACE_SECONDS = 0.36
+# On the first Kite connection the Stock AI begins a resumable deep backfill in
+# the background. One calendar year is long enough to expose the directional and
+# setup-success models to multiple regimes while keeping the local archive and
+# broker request volume bounded. Override with STOCK_HISTORY_BACKFILL_DAYS if a
+# different retention target is required.
+STOCK_HISTORY_BACKFILL_DAYS = max(90, int(os.environ.get('STOCK_HISTORY_BACKFILL_DAYS', '365')))
+STOCK_HISTORY_BACKFILL_CHUNK_DAYS = max(15, min(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_CHUNK_DAYS', '60'))))
+STOCK_HISTORY_BACKFILL_PACE_SECONDS = max(0.36, float(os.environ.get('STOCK_HISTORY_BACKFILL_PACE_SECONDS', '0.40')))
+STOCK_HISTORY_BACKFILL_RETRY_SECONDS = max(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_RETRY_SECONDS', '900')))
 STOCK_FULL_SCAN_BAR_MAX_AGE = 15
+STOCK_SUCCESS_MIN_SAMPLES = 40
+STOCK_SUCCESS_MIN_AUC = 0.52
+STOCK_HIST_SUCCESS_MIN_SAMPLES = 300
+STOCK_HIST_SUCCESS_MIN_AUC = 0.52
+STOCK_HIST_SUCCESS_MAX_SAMPLES = 24000
+STOCK_HIST_SUCCESS_PER_SYMBOL = 160
+STOCK_HIST_SUCCESS_RETRY_SECONDS = 900
+STOCK_HIST_MIN_ARCHIVE_COVERAGE = max(0.50, min(1.0, float(os.environ.get('STOCK_HIST_MIN_ARCHIVE_COVERAGE', '0.70'))))
+STOCK_DIRECTION_FEATURES = ['ret_1','ret_3','ret_5','ret_10','ret_20','ema_gap_9_20',
+    'ema_gap_20_50','rsi14','volatility_10','range_20','volume_ratio','trend_score','momentum_score','time_sin','time_cos']
+STOCK_HIST_SUCCESS_FEATURES = [
+    'direction_confidence','ret_1_aligned','ret_3_aligned','ret_5_aligned','ret_20_aligned',
+    'ema_9_20_aligned','ema_20_50_aligned','rsi_alignment','trend_alignment','momentum_alignment',
+    'volatility_10','range_20','volume_ratio','time_sin','time_cos','stop_barrier_pct','reward_r'
+]
+STOCK_SUCCESS_FEATURES = [
+    'direction_confidence','historical_strength','online_strength','model_agreement',
+    'trend_score','momentum_score','volatility_10','range_20','volume_ratio','regime_alignment',
+    'spread_quality','depth_ratio','delta_quality','log_option_volume','log_option_oi',
+    'dte_scaled','bar_freshness','reward_r','stop_pct_scaled','cost_r'
+]
+
+def _stock_success_sigmoid(x):
+    return 1.0/(1.0+np.exp(-np.clip(x,-30,30)))
+
+def _stock_success_fit(X,Y):
+    X=np.asarray(X,float);Y=np.asarray(Y,float)
+    mu=X.mean(0);sd=np.maximum(X.std(0),1e-5);z=np.clip((X-mu)/sd,-6,6)
+    w=np.zeros(X.shape[1]);b=0.0
+    for _ in range(260):
+        err=_stock_success_sigmoid(z@w+b)-Y
+        w-=.05*(z.T@err/len(Y)+.03*w);b-=.05*err.mean()
+    return dict(mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b))
+
+def _stock_success_predict(model,X):
+    z=np.clip((np.asarray(X,float)-np.asarray(model['mu']))/np.asarray(model['sd']),-6,6)
+    return _stock_success_sigmoid(z@np.asarray(model['w'])+float(model['bias']))
+
+def _stock_direction_predict(model,X):
+    # Same standardized logistic form used by the shared directional desk model.
+    z=np.clip((np.asarray(X,float)-np.asarray(model['mu']))/np.asarray(model['sd']),-6,6)
+    return float(_stock_success_sigmoid(z@np.asarray(model['w'])+float(model['bias'])))
+
+def _stock_success_auc(y,p):
+    y=np.asarray(y,int);p=np.asarray(p,float);a=int(y.sum());b=len(y)-a
+    if not a or not b:return None
+    order=np.argsort(p);ranks=np.empty(len(p),float);i=0
+    while i<len(p):
+        j=i+1
+        while j<len(p) and p[order[j]]==p[order[i]]:j+=1
+        ranks[order[i:j]]=(i+1+j)/2;i=j
+    return float((ranks[y==1].sum()-a*(a+1)/2)/(a*b))
 
 class StockDeskAdapter(DeskAdapter):
     def __init__(self):
@@ -12874,8 +12946,9 @@ class StockDeskAdapter(DeskAdapter):
             c.rollback();raise
         finally:c.close()
     def refresh(self,symbol):
-        # Full-universe mode rotates recent-history refreshes.  A ~3.5 minute TTL keeps
-        # ~200 symbols current without firing ~200 historical requests every scan cycle.
+        # Fast tail refresh used by the live scanner. Deep history is collected by the
+        # independent resumable backfill worker below so a one-year archive never blocks
+        # entry execution or the 5-second position supervisor.
         with self.history_lock:
             if time.monotonic()-self.refreshed.get(symbol,-1e9)<STOCK_HISTORY_REFRESH_SECONDS:return
             token,err=resolve_token_for_symbol(symbol)
@@ -12890,6 +12963,52 @@ class StockDeskAdapter(DeskAdapter):
             if err:raise ValueError(str(err))
             _hist_insert_candles(symbol,candles)
             self.refreshed[symbol]=time.monotonic()
+    def history_bounds(self,symbol):
+        c=ai_db()
+        try:
+            r=c.execute("SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM ai_hist_candles WHERE symbol=? AND interval=?",(symbol,AI_HIST_INTERVAL)).fetchone()
+            return dict(n=int(r['n'] or 0),first_ts=r['first_ts'],last_ts=r['last_ts']) if r else dict(n=0,first_ts=None,last_ts=None)
+        finally:c.close()
+    def backfill_history(self,symbol,target_days=STOCK_HISTORY_BACKFILL_DAYS,progress=None,pause_check=None):
+        """Resumably fill older 5-minute stock history, newest missing chunk first.
+
+        This intentionally uses the shared historical-data request gate. It never holds
+        the live refresh lock across the long backfill and persists every successful chunk
+        immediately, so a disconnect/restart simply resumes from the oldest stored candle.
+        """
+        token,err=resolve_token_for_symbol(symbol)
+        if err:raise ValueError(err)
+        now=now_ist();target_start=now-timedelta(days=int(target_days));bounds=self.history_bounds(symbol)
+        first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
+        # Work backwards so the most recent missing months become usable first.
+        cursor_end=(first-timedelta(minutes=1)) if first else now
+        if cursor_end<=target_start:
+            return dict(symbol=symbol,status='COMPLETE',rows_added=0,chunks=0,bounds=bounds)
+        added_total=0;chunks=0;fetched_total=0;error=None
+        while cursor_end>target_start:
+            if pause_check:
+                reason=pause_check()
+                if reason:
+                    bounds=self.history_bounds(symbol)
+                    return dict(symbol=symbol,status='PAUSED_LIVE_PRIORITY',rows_added=added_total,fetched=fetched_total,
+                        chunks=chunks,error=None,bounds=bounds,target_start=str(target_start),pause_reason=str(reason))
+            start=max(target_start,cursor_end-timedelta(days=STOCK_HISTORY_BACKFILL_CHUNK_DAYS))
+            candles,fetch_err=_hist_fetch_chunk(token,start,cursor_end)
+            if fetch_err:
+                error=str(fetch_err);break
+            added=_hist_insert_candles(symbol,candles);added_total+=added;fetched_total+=len(candles);chunks+=1
+            if progress:
+                try:progress(dict(symbol=symbol,start=str(start),end=str(cursor_end),rows_added=added_total,chunks=chunks))
+                except Exception:pass
+            # Do not skip across a failed window: next run resumes exactly at the oldest
+            # successfully persisted boundary.
+            cursor_end=start-timedelta(seconds=1)
+            time.sleep(STOCK_HISTORY_BACKFILL_PACE_SECONDS)
+        bounds=self.history_bounds(symbol)
+        first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
+        complete=bool(first and first<=target_start+timedelta(days=3))
+        return dict(symbol=symbol,status='COMPLETE' if complete else ('PARTIAL' if chunks else 'ERROR'),rows_added=added_total,
+            fetched=fetched_total,chunks=chunks,error=error,bounds=bounds,target_start=str(target_start))
     def chain(self,symbol):
         exchange,opts=get_option_instruments_for_symbol(symbol)
         today=now_ist().date()
@@ -12910,6 +13029,11 @@ class StockDeskEngine(DeskEngine):
         self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
         self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
         self.execution_status={'status':'IDLE'};self.refresh_cursor=0
+        self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
+        self.hist_success_lock=threading.Lock();self.hist_success_model_cache=None;self.hist_success_model_cache_at=0.0
+        self.hist_success_thread=None;self.hist_success_last_attempt=0.0
+        self.history_backfill_thread=None;self.history_backfill_last_attempt=0.0;self.history_backfill_universe=()
+        self.history_backfill_status=dict(status='WAITING FOR KITE',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=0,rows_added=0)
     def _full_mode(self):
         return self.get('stock_universe_info',{}).get('mode')!='Custom watchlist'
     def select_universe(self,body=None):
@@ -12944,15 +13068,395 @@ class StockDeskEngine(DeskEngine):
         self.event('UNIVERSE',f'F&O membership refreshed: {len(universe)} stocks')
     @staticmethod
     def rank_signal(s,max_spread):
-        # Direction confidence is intentionally dominant: every F&O stock competes on
-        # model probability first.  Executable option quality then decides whether the
-        # stock is actually READY for entry.
         confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
         base=100*confidence
         if s.get('decision')!='READY':return round(base,2) if s.get('p_up') is not None else 0.
+        # Once the trade-success model is validated, learned probability dominates ranking.
+        if s.get('success_model_valid') and s.get('success_probability') is not None:
+            p=max(0.,min(1.,float(s['success_probability'])))
+            ev=float(s.get('expected_r') or 0)
+            ev_quality=max(0.,min(1.,(ev+0.5)/2.0))
+            spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
+            return round(85*p+10*ev_quality+5*spread,2)
         spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
         depth=min(1.,float(s.get('depth_qty') or 0)/max(1,float(s.get('qty') or 1))/3)
         return round(90*confidence+7*spread+3*depth,2)
+    def _success_vector(self,s):
+        feats=list(s.get('features') or [])
+        def fidx(i,default=0.):
+            try:return float(feats[i]) if math.isfinite(float(feats[i])) else default
+            except Exception:return default
+        conf=max(0.,min(1.,float(s.get('confidence') or 0)))
+        hp=s.get('historical_probability');op=s.get('online_probability')
+        hs=abs(float(hp)-.5)*2 if hp is not None else conf
+        os=abs(float(op)-.5)*2 if op is not None else 0.
+        agree=1. if hp is not None and op is not None and (float(hp)>=.5)==(float(op)>=.5) else 0.5 if op is None else 0.
+        direction=s.get('direction');reg=s.get('regime')
+        align=1. if (direction=='UP' and reg=='UPTREND') or (direction=='DOWN' and reg=='DOWNTREND') else .5 if reg=='RANGE' else 0.
+        spread=float(s.get('spread') or 99);max_spread=max(.01,float(self.config().get('max_spread') or 1.))
+        spreadq=max(0.,min(1.,1-spread/max_spread))
+        qty=max(1.,float(s.get('qty') or 1));depth=max(0.,min(5.,float(s.get('depth_qty') or 0)/qty))/5
+        delta=abs(float(s.get('option_delta') or .5));deltaq=max(0.,1-abs(delta-.5)/.2)
+        vol=np.log1p(max(0.,float(s.get('option_volume') or 0)))/15.
+        oi=np.log1p(max(0.,float(s.get('option_oi') or 0)))/18.
+        dte=max(0.,min(60.,float(s.get('dte') or 0)))/60.
+        fresh=max(0.,min(1.,1-float(s.get('bar_age') or 15)/15.))
+        cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);stop=float(cfg.get('stop_pct') or 12)/40.
+        planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1.,float(s.get('qty') or 1)))
+        cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
+        return [conf,hs,os,agree,fidx(11),fidx(12),fidx(8),fidx(9),fidx(10),align,spreadq,depth,deltaq,vol,oi,dte,fresh,reward,stop,cost_r]
+    def _historical_setup_vector_from_features(self,f,p,reward=None,stop_barrier=None):
+        direction=1. if float(p)>=.5 else -1.
+        conf=max(float(p),1-float(p))
+        reward=float(reward if reward is not None else self.config().get('reward_r',1.8))
+        if stop_barrier is None:
+            # This is an UNDERLYING-stock barrier, not an option-premium stop. It is
+            # deliberately volatility-scaled so historical candles can provide a
+            # useful setup prior without fabricating option-chain history.
+            vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0))
+            stop_barrier=max(.20,min(1.75,.55*vol+.35*rng))
+        return [
+            conf,
+            direction*float(f.get('ret_1') or 0),direction*float(f.get('ret_3') or 0),
+            direction*float(f.get('ret_5') or 0),direction*float(f.get('ret_20') or 0),
+            direction*float(f.get('ema_gap_9_20') or 0),direction*float(f.get('ema_gap_20_50') or 0),
+            direction*(float(f.get('rsi14') or 50)-50),
+            direction*(float(f.get('trend_score') or 12.5)-12.5),
+            direction*(float(f.get('momentum_score') or 12.5)-12.5),
+            float(f.get('volatility_10') or 0),float(f.get('range_20') or 0),float(f.get('volume_ratio') or 0),
+            float(f.get('time_sin') or 0),float(f.get('time_cos') or 0),float(stop_barrier),reward
+        ]
+    def _historical_setup_vector(self,s):
+        vals=list(s.get('features') or [])
+        f={name:(float(vals[i]) if i<len(vals) and math.isfinite(float(vals[i])) else 0.) for i,name in enumerate(STOCK_DIRECTION_FEATURES)}
+        p=s.get('p_up')
+        if p is None:return None
+        return self._historical_setup_vector_from_features(f,float(p))
+    @staticmethod
+    def _historical_barrier_outcome(rows,i,direction,stop_pct,target_pct,horizon_bars):
+        entry=float(rows[i]['close'] or 0)
+        if entry<=0:return None
+        stop=float(stop_pct)/100.;target=float(target_pct)/100.;end=min(len(rows)-1,i+int(horizon_bars))
+        for j in range(i+1,end+1):
+            hi=float(rows[j]['high'] or rows[j]['close'] or 0);lo=float(rows[j]['low'] or rows[j]['close'] or 0)
+            if direction>0:
+                fav=(hi/entry)-1;adv=1-(lo/entry)
+            else:
+                fav=1-(lo/entry);adv=(hi/entry)-1
+            hit_target=fav>=target;hit_stop=adv>=stop
+            # If both barriers occur inside the same five-minute candle, intrabar order
+            # is unknowable from OHLC. Count it conservatively as a failure.
+            if hit_target and hit_stop:return 0
+            if hit_stop:return 0
+            if hit_target:return 1
+        return None
+    def _live_execution_priority_reason(self):
+        """Heavy history work yields whenever any automated live desk may need Kite."""
+        try:
+            cfg=self.config()
+            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
+            if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
+                return 'Stock AI live order unresolved'
+        except Exception:
+            return 'Stock AI live-state check unavailable'
+        for name,label in (('DESK','Index AI'),('CAS_DESK','CAS AI')):
+            desk=globals().get(name)
+            if not desk or desk is self:continue
+            try:
+                cfg=desk.config()
+                if cfg.get('mode')=='live' and cfg.get('armed'):return label+' live entries armed'
+                if any(p.get('mode')=='live' for p in desk.active()):return label+' live position active'
+                if desk.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
+                    return label+' live order unresolved'
+            except Exception:
+                pass
+        try:
+            cfg=autotrade_ai_config()
+            if cfg.get('execution_mode')=='live' and cfg.get('armed'):return 'Auto Buy/Sell AI live entries armed'
+            if any(p.get('execution_mode')=='live' for p in autotrade_ai_open_positions()):
+                return 'Auto Buy/Sell AI live position active'
+        except Exception:
+            pass
+        return None
+    def _history_archive_coverage(self):
+        hb=self.history_backfill_status or {}
+        total=max(0,int(hb.get('total') or len(self.a.symbols) or 0))
+        complete=max(0,int(hb.get('archive_complete_symbols') or (total if hb.get('status')=='COMPLETE' else 0)))
+        ratio=(complete/total) if total else 0.0
+        return dict(complete=complete,total=total,ratio=ratio,ready=bool(total and ratio>=STOCK_HIST_MIN_ARCHIVE_COVERAGE),
+            required_ratio=STOCK_HIST_MIN_ARCHIVE_COVERAGE)
+    def _ensure_deep_history_backfill(self,force=False):
+        """Start/resume the one-year archive only when live execution has no priority."""
+        if not self.a.connected() or not self.a.symbols:return False
+        universe=tuple(self.a.symbols)
+        priority=self._live_execution_priority_reason()
+        if priority:
+            prior=self.history_backfill_status or {}
+            self.history_backfill_status={**prior,'status':'PAUSED · LIVE PRIORITY','pause_reason':priority,
+                'target_days':STOCK_HISTORY_BACKFILL_DAYS,'total':len(universe),'updated':now_ist().isoformat()}
+            self.history_backfill_last_attempt=0.
+            return False
+        if self.history_backfill_thread and self.history_backfill_thread.is_alive():return False
+        if not force and self.history_backfill_status.get('status')=='COMPLETE' and self.history_backfill_universe==universe:return False
+        now=time.monotonic()
+        if not force and now-self.history_backfill_last_attempt<STOCK_HISTORY_BACKFILL_RETRY_SECONDS:return False
+        self.history_backfill_last_attempt=now;self.history_backfill_universe=universe
+        def job():
+            total=len(universe);added_total=0;errors=[];archive_complete=0
+            self.history_backfill_status=dict(status='BACKFILLING',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=total,
+                archive_complete_symbols=0,coverage_ratio=0.0,required_coverage=STOCK_HIST_MIN_ARCHIVE_COVERAGE,rows_added=0,
+                started=now_ist().isoformat(),symbol=None,pause_reason=None)
+            for i,symbol in enumerate(universe):
+                if self.stop_event.is_set():break
+                if not self.a.connected():
+                    self.history_backfill_status.update(status='PAUSED · KITE DISCONNECTED',completed=i,symbol=symbol);self.history_backfill_last_attempt=0.;return
+                priority=self._live_execution_priority_reason()
+                if priority:
+                    self.history_backfill_status.update(status='PAUSED · LIVE PRIORITY',pause_reason=priority,completed=i,symbol=symbol,
+                        archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4),updated=now_ist().isoformat())
+                    self.history_backfill_last_attempt=0.;return
+                self.history_backfill_status.update(symbol=symbol,completed=i,pause_reason=None)
+                def chunk_progress(info):
+                    self.history_backfill_status.update(symbol=symbol,current_chunk=info.get('chunks'),chunk_start=info.get('start'),chunk_end=info.get('end'),
+                        rows_added=added_total+int(info.get('rows_added') or 0))
+                try:
+                    r=self.a.backfill_history(symbol,STOCK_HISTORY_BACKFILL_DAYS,chunk_progress,self._live_execution_priority_reason)
+                    added_total+=int(r.get('rows_added') or 0)
+                    if r.get('status')=='PAUSED_LIVE_PRIORITY':
+                        self.history_backfill_status.update(status='PAUSED · LIVE PRIORITY',pause_reason=r.get('pause_reason') or 'Live execution priority',
+                            completed=i,symbol=symbol,rows_added=added_total,archive_complete_symbols=archive_complete,
+                            coverage_ratio=round(archive_complete/max(1,total),4),updated=now_ist().isoformat())
+                        self.history_backfill_last_attempt=0.;return
+                    if r.get('status')=='COMPLETE':archive_complete+=1
+                    else:errors.append(symbol+': '+str(r.get('error') or r.get('status')))
+                except Exception as e:
+                    errors.append(symbol+': '+str(e))
+                self.history_backfill_status.update(completed=i+1,rows_added=added_total,last_symbol=symbol,error_count=len(errors),
+                    archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4))
+            complete=(not self.stop_event.is_set() and self.a.connected() and not errors and archive_complete==total)
+            self.history_backfill_status.update(status='COMPLETE' if complete else 'PARTIAL · WILL RETRY',
+                completed=total if complete else self.history_backfill_status.get('completed',0),total=total,rows_added=added_total,
+                archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4),
+                finished=now_ist().isoformat(),errors=errors[:8],pause_reason=None)
+            self.event('HISTORY_BACKFILL',f"{self.history_backfill_status['status']} · {STOCK_HISTORY_BACKFILL_DAYS}d · added {added_total} rows")
+            if added_total>0 and not self.train_lock.locked() and not self._live_execution_priority_reason():self.train()
+            if self._history_archive_coverage()['ready'] and not self._live_execution_priority_reason():self._ensure_historical_success_training(force=True)
+        self.history_backfill_thread=threading.Thread(target=job,daemon=True,name='stock-ai-deep-history')
+        self.history_backfill_thread.start();return True
+    def historical_success_model(self,force=False):
+        now=time.monotonic()
+        if not force and self.hist_success_model_cache is not None and now-self.hist_success_model_cache_at<30:return self.hist_success_model_cache
+        m=self.get('historical_setup_success_model')
+        self.hist_success_model_cache=m;self.hist_success_model_cache_at=now
+        return m
+    def train_historical_success_model(self,force=False):
+        if not self.hist_success_lock.acquire(False):return self.historical_success_model()
+        try:
+            direction_model=self.model()
+            if not direction_model or not direction_model.get('mu') or not direction_model.get('validation_start'):
+                m=dict(status='WAITING FOR DIRECTION MODEL',valid=False,samples=0,required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
+                    features=STOCK_HIST_SUCCESS_FEATURES,updated=now_ist().isoformat(),
+                    note='Train the stock directional model first; historical setup learning uses its unseen holdout period.')
+                self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic();return m
+            prior=self.historical_success_model();dm_id=direction_model.get('id')
+            if not force and prior and prior.get('direction_model_id')==dm_id and prior.get('valid'):
+                return prior
+            try:
+                holdout_start=datetime.fromisoformat(str(direction_model['validation_start']).replace('Z','+00:00'))
+                if holdout_start.tzinfo is None:holdout_start=holdout_start.replace(tzinfo=IST)
+                else:holdout_start=holdout_start.astimezone(IST)
+            except Exception:
+                holdout_start=None
+            if holdout_start is None:
+                raise ValueError('Directional model validation_start is missing or invalid')
+            cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);horizon=max(3,min(24,int(float(cfg.get('max_hold') or 90)//5)))
+            covered={str(r.get('symbol')) for r in (direction_model.get('coverage') or []) if int(r.get('bars') or 0)>=300}
+            train_symbols=[sym for sym in self.a.symbols if not covered or sym in covered]
+            samples=[];per_symbol={};coverage=[]
+            for n,symbol in enumerate(train_symbols):
+                rows=self.a.bars(symbol,20000)
+                if len(rows)<240:continue
+                arr={k:np.asarray([float(r[k] or 0) for r in rows],float) for k in ('close','high','low','volume')};arr['ts']=[str(r['ts']) for r in rows]
+                made=[]
+                for i in range(200,len(rows)-horizon,3):
+                    try:
+                        t=datetime.fromisoformat(str(rows[i]['ts']).replace('Z','+00:00'))
+                        if t.tzinfo is None:t=t.replace(tzinfo=IST)
+                        else:t=t.astimezone(IST)
+                    except Exception:continue
+                    if t<holdout_start:continue
+                    f=self.a.features(rows,i,arr);x=[f.get(k,0) for k in STOCK_DIRECTION_FEATURES]
+                    if len(x)!=len(direction_model.get('mu') or []) or not all(math.isfinite(float(v)) for v in x):continue
+                    p=_stock_direction_predict(direction_model,x);conf=max(p,1-p)
+                    if conf<.55:continue
+                    vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0))
+                    stop_barrier=max(.20,min(1.75,.55*vol+.35*rng));target_barrier=stop_barrier*reward
+                    direction=1 if p>=.5 else -1
+                    label=self._historical_barrier_outcome(rows,i,direction,stop_barrier,target_barrier,horizon)
+                    if label is None:continue
+                    hv=self._historical_setup_vector_from_features(f,p,reward,stop_barrier)
+                    if all(math.isfinite(float(v)) for v in hv):
+                        end_t=t+timedelta(minutes=5*horizon);made.append((t.timestamp(),end_t.timestamp(),hv,int(label),symbol))
+                if len(made)>STOCK_HIST_SUCCESS_PER_SYMBOL:
+                    # Keep each stock balanced while spreading its samples across the whole
+                    # available holdout instead of retaining only the most recent tail.
+                    keep=np.linspace(0,len(made)-1,STOCK_HIST_SUCCESS_PER_SYMBOL,dtype=int)
+                    made=[made[int(k)] for k in keep]
+                samples.extend(made);per_symbol[symbol]=len(made);coverage.append(dict(symbol=symbol,samples=len(made),bars=len(rows)))
+                if n%12==0:time.sleep(.01)
+            samples.sort(key=lambda r:r[0])
+            if len(samples)>STOCK_HIST_SUCCESS_MAX_SAMPLES:
+                # Deterministic evenly-spaced downsample preserves chronology and coverage.
+                idx=np.linspace(0,len(samples)-1,STOCK_HIST_SUCCESS_MAX_SAMPLES,dtype=int);samples=[samples[int(i)] for i in idx]
+            if len(samples)<STOCK_HIST_SUCCESS_MIN_SAMPLES or len({r[3] for r in samples})<2:
+                m=dict(status='LEARNING',valid=False,samples=len(samples),required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
+                    features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),
+                    per_symbol=per_symbol,updated=now_ist().isoformat(),
+                    note='Historical stock setup samples are still building. Full-F&O recent history is collected progressively.')
+            else:
+                split=int(len(samples)*.8);cut=samples[split][0]
+                train=[r for r in samples[:split] if r[1]<cut];val=[r for r in samples[split:] if r[0]>=cut]
+                if len(train)<200 or len(val)<60 or len({r[3] for r in train})<2 or len({r[3] for r in val})<2:
+                    m=dict(status='LEARNING',valid=False,samples=len(samples),required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
+                        train_samples=len(train),validation_samples=len(val),features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,
+                        holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),per_symbol=per_symbol,updated=now_ist().isoformat(),
+                        note='Need more chronological winners and failures for historical setup validation.')
+                else:
+                    X=[r[2] for r in train];Y=[r[3] for r in train];Xv=[r[2] for r in val];Yv=np.asarray([r[3] for r in val],int)
+                    m=_stock_success_fit(X,Y);pv=np.asarray(_stock_success_predict(m,Xv),float)
+                    aucv=_stock_success_auc(Yv,pv);acc=float(((pv>=.5)==Yv).mean()*100);baseline=float(max(Yv.mean(),1-Yv.mean())*100);brier=float(np.mean((pv-Yv)**2))
+                    valid=aucv is not None and aucv>=STOCK_HIST_SUCCESS_MIN_AUC and acc>=baseline-2
+                    m.update(status='VALIDATED' if valid else 'LEARNING',valid=bool(valid),samples=len(samples),train_samples=len(train),validation_samples=len(val),
+                        accuracy=acc,auc=aucv,brier=brier,baseline=baseline,features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,
+                        holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),horizon_minutes=horizon*5,reward_r=reward,
+                        label_definition='Underlying target-before-stop using volatility-scaled barriers on the directional model holdout; not an historical option-P&L backtest.',
+                        per_symbol=per_symbol,coverage=coverage,updated=now_ist().isoformat())
+            self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic()
+            self.event('HIST_SUCCESS_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}")
+            return m
+        except Exception as e:
+            m=dict(status='ERROR',valid=False,samples=0,required=STOCK_HIST_SUCCESS_MIN_SAMPLES,features=STOCK_HIST_SUCCESS_FEATURES,
+                error=str(e),updated=now_ist().isoformat())
+            self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic()
+            self.event('ERROR','Historical success model: '+str(e));return m
+        finally:self.hist_success_lock.release()
+    def _ensure_historical_success_training(self,force=False):
+        # Historical-success fitting is background research; live execution always wins.
+        if self._live_execution_priority_reason():return False
+        direction_model=self.model()
+        if not direction_model:return False
+        prior=self.historical_success_model()
+        same=prior and prior.get('direction_model_id')==direction_model.get('id')
+        if not force and same and prior.get('valid'):return False
+        if self.hist_success_thread and self.hist_success_thread.is_alive():return False
+        now=time.monotonic()
+        if not force and now-self.hist_success_last_attempt<STOCK_HIST_SUCCESS_RETRY_SECONDS:return False
+        self.hist_success_last_attempt=now
+        def job():self.train_historical_success_model(force=force)
+        self.hist_success_thread=threading.Thread(target=job,daemon=True,name='stock-ai-historical-success')
+        self.hist_success_thread.start();return True
+    def success_model(self,force=False):
+        now=time.monotonic()
+        if not force and self.success_model_cache is not None and now-self.success_model_cache_at<30:return self.success_model_cache
+        m=self.get('trade_success_model')
+        self.success_model_cache=m;self.success_model_cache_at=now
+        return m
+    def train_success_model(self,force=False):
+        if not self.success_lock.acquire(False):return self.success_model()
+        try:
+            rows=self.rows("SELECT id,exit_ts,pnl,fees,setup FROM desk_positions WHERE status='CLOSED' AND mode='paper' AND setup IS NOT NULL ORDER BY exit_ts,id")
+            stamp_key=rows[-1]['exit_ts'] if rows else None;prior=self.success_model()
+            if not force and prior and prior.get('last_exit_ts')==stamp_key:return prior
+            X=[];Y=[]
+            for r in rows:
+                try:
+                    s=json.loads(r['setup'] or '{}')
+                    if s.get('decision')!='READY':continue
+                    x=self._success_vector(s)
+                    if len(x)==len(STOCK_SUCCESS_FEATURES) and all(math.isfinite(float(v)) for v in x):
+                        X.append(x);Y.append(1 if float(r['pnl'] or 0)-float(r['fees'] or 0)>0 else 0)
+                except Exception:continue
+            if len(X)<STOCK_SUCCESS_MIN_SAMPLES or len(set(Y))<2:
+                m=dict(status='LEARNING',valid=False,samples=len(X),required=STOCK_SUCCESS_MIN_SAMPLES,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat())
+                self.put('trade_success_model',m);self.success_model_cache=m;self.success_model_cache_at=time.monotonic();return m
+            split=max(25,int(len(X)*.8));split=min(split,len(X)-10)
+            Xt,Yt=X[:split],Y[:split];Xv,Yv=X[split:],Y[split:]
+            if len(set(Yt))<2 or len(set(Yv))<2:
+                m=dict(status='LEARNING',valid=False,samples=len(X),required=STOCK_SUCCESS_MIN_SAMPLES,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat(),note='Need wins and losses in both chronological train and validation sets')
+            else:
+                m=_stock_success_fit(Xt,Yt);pv=np.asarray(_stock_success_predict(m,Xv),float);yv=np.asarray(Yv,int)
+                aucv=_stock_success_auc(yv,pv);acc=float(((pv>=.5)==yv).mean()*100);baseline=float(max(yv.mean(),1-yv.mean())*100);brier=float(np.mean((pv-yv)**2))
+                valid=aucv is not None and aucv>=STOCK_SUCCESS_MIN_AUC and acc>=baseline-2
+                m.update(status='VALIDATED' if valid else 'LEARNING',valid=bool(valid),samples=len(X),train_samples=len(Xt),validation_samples=len(Xv),accuracy=acc,auc=aucv,brier=brier,baseline=baseline,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat())
+            self.put('trade_success_model',m);self.success_model_cache=m;self.success_model_cache_at=time.monotonic()
+            self.event('SUCCESS_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}")
+            return m
+        finally:self.success_lock.release()
+    def _apply_success_intelligence(self,s):
+        if s.get('decision')!='READY':return s
+        live_model=self.success_model() or self.train_success_model()
+        hist_model=self.historical_success_model()
+        archive=self._history_archive_coverage()
+        live_valid=bool(live_model and live_model.get('valid') and live_model.get('w'))
+        hist_model_valid=bool(hist_model and hist_model.get('valid') and hist_model.get('w'))
+        hist_valid=bool(hist_model_valid and archive.get('ready'))
+        s['live_success_model_valid']=live_valid;s['historical_success_model_valid']=hist_valid
+        s['historical_success_model_trained']=hist_model_valid
+        s['historical_archive_coverage']=round(float(archive.get('ratio') or 0),4)
+        s['historical_archive_ready']=bool(archive.get('ready'))
+        cfg=self.config();planned=max(.01,(float(s['entry'])-float(s['stop']))*max(1,int(s['qty'])))
+        cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
+        hp=None;lp=None;raw_hist=None;raw_live=None
+        hv=self._historical_setup_vector(s)
+        if hist_valid and hv:
+            raw_hist=float(_stock_success_predict(hist_model,hv))
+            # Historical candles do not contain old option books. Treat the historical
+            # setup model as a conservative prior and shrink it toward 50%.
+            h_samples=float(hist_model.get('samples') or 0);h_auc=float(hist_model.get('auc') or .5)
+            coverage=float(archive.get('ratio') or 0)
+            coverage_factor=max(.50,min(1.,coverage))
+            h_shrink=min(.78,max(.30,.35+min(h_samples,6000)/6000*.25+max(0.,h_auc-.5)*1.2))*coverage_factor
+            hp=.5+(raw_hist-.5)*h_shrink
+            s['historical_setup_probability']=round(max(0.,min(1.,hp)),6)
+            s['historical_setup_probability_raw']=round(raw_hist,6)
+        else:
+            s['historical_setup_probability']=None
+            if hist_model_valid and not archive.get('ready'):
+                s['historical_setup_status']=f"WAITING FOR HISTORY COVERAGE · {float(archive.get('ratio') or 0)*100:.0f}% / {float(archive.get('required_ratio') or 0)*100:.0f}%"
+            elif not hist_model_valid:
+                s['historical_setup_status']='LEARNING'
+        if live_valid:
+            raw_live=float(_stock_success_predict(live_model,self._success_vector(s)))
+            l_samples=float(live_model.get('samples') or 0)
+            l_shrink=min(1.,max(.25,(l_samples-STOCK_SUCCESS_MIN_SAMPLES)/160.0+.25))
+            lp=.5+(raw_live-.5)*l_shrink
+            s['live_success_probability']=round(max(0.,min(1.,lp)),6)
+            s['live_success_probability_raw']=round(raw_live,6)
+        else:s['live_success_probability']=None
+        if hp is not None and lp is not None:
+            # Forward executable option outcomes gain authority as evidence accumulates.
+            live_weight=min(.75,max(.25,.25+(float(live_model.get('samples') or 0)-STOCK_SUCCESS_MIN_SAMPLES)/460*.50))
+            p=(1-live_weight)*hp+live_weight*lp
+            s['success_blend']=dict(historical_weight=round(1-live_weight,3),live_weight=round(live_weight,3))
+            s['selection_basis']=f"Historical setup + live option-success ML ({int(round((1-live_weight)*100))}/{int(round(live_weight*100))})"
+        elif hp is not None:
+            p=hp;s['success_blend']=dict(historical_weight=1.0,live_weight=0.0)
+            s['selection_basis']='Historical setup bootstrap · live option-success ML still learning'
+        elif lp is not None:
+            p=lp;s['success_blend']=dict(historical_weight=0.0,live_weight=1.0)
+            s['selection_basis']='Validated live option-success ML'
+        else:
+            p=None;s['success_blend']=None
+            s['selection_basis']='Directional-confidence fallback while success models learn'
+        s['success_model_valid']=p is not None
+        if p is not None:
+            s['success_probability']=round(max(0.,min(1.,p)),6)
+            s['expected_r']=round(p*float(cfg['reward_r'])-(1-p)-cost_r,4)
+        else:
+            s['success_probability']=None;s['expected_r']=None
+        s['rank_score']=self.rank_signal(s,cfg['max_spread'])
+        return s
     def _screen_direction(self,symbol):
         s=self.direction_snapshot(symbol,refresh=False,record_observation=True,max_bar_age=STOCK_FULL_SCAN_BAR_MAX_AGE)
         s['reason']=s.get('reason','').replace('index candles','stock candles')
@@ -12966,7 +13470,9 @@ class StockDeskEngine(DeskEngine):
         s['reason']=s.get('reason','').replace('index candles','stock candles')
         if self.banned is not None and symbol in self.banned:s.update(decision='WAIT',reason='Stock in F&O ban list; new entries excluded')
         if self.config()['mode']=='live' and self.banned is None:s.update(decision='WAIT',reason='Daily F&O ban list unavailable; live entries paused')
-        s['scan_stage']='DEEP';s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        s['scan_stage']='DEEP'
+        if s.get('decision')=='READY':self._apply_success_intelligence(s)
+        else:s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
         return s
     def _refresh_batch(self,names,screened):
         if not names:return []
@@ -13003,7 +13509,9 @@ class StockDeskEngine(DeskEngine):
             self.execution_generation+=1
             self.execution_candidates=ready
             self.execution_status=dict(status='CANDIDATES READY' if ready else 'NO READY CANDIDATE',generation=self.execution_generation,
-                count=len(ready),best=ready[0]['symbol'] if ready else None,updated=now_ist().isoformat())
+                count=len(ready),best=ready[0]['symbol'] if ready else None,
+                best_success_probability=ready[0].get('success_probability') if ready else None,best_expected_r=ready[0].get('expected_r') if ready else None,
+                updated=now_ist().isoformat())
         if ready:self.execution_event.set()
     def execute_candidates(self):
         # Entry execution is serialized independently of both the scanner and the risk
@@ -13033,6 +13541,9 @@ class StockDeskEngine(DeskEngine):
             if not self.a.connected():return
             if not self.a.symbols:self.select_universe()
             else:self._sync_full_universe_membership()
+            # First successful Kite connection immediately starts/resumes the deep
+            # historical archive in a separate thread. Normal scan/execution continues.
+            self._ensure_deep_history_backfill()
             if time.monotonic()-self.ban_checked>1800:
                 self.banned,self.ban_error=get_fo_ban_list();self.ban_checked=time.monotonic()
             self.supervise()
@@ -13040,7 +13551,7 @@ class StockDeskEngine(DeskEngine):
             if not self.a.market_open():
                 self.scan_status=dict(status='MARKET CLOSED',phase='Full F&O scan resumes during market hours',completed=0,total=len(names),
                     deep_completed=0,deep_total=0,finished=now_ist().isoformat())
-                self.settle_observations();self.maybe_train();return
+                self.settle_observations();self.maybe_train();self._ensure_historical_success_training();return
             self.scan_status=dict(status='SCANNING FULL F&O',phase='ML universe pass',completed=0,total=len(names),
                 deep_completed=0,deep_total=0,started=now_ist().isoformat())
             screened={}
@@ -13074,11 +13585,11 @@ class StockDeskEngine(DeskEngine):
                 except Exception as e:self.signals[symbol]=dict(seed,decision='WAIT',reason='Deep check: '+str(e),scan_stage='DEEP')
                 self.scan_status.update(deep_completed=i+1,symbol=symbol)
                 self.supervise()
-            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',float(s.get('rank_score') or 0)),reverse=True)
+            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',s.get('success_probability') is not None,float(s.get('success_probability') or 0),float(s.get('expected_r') or -99),float(s.get('rank_score') or 0)),reverse=True)
             # Scanner only publishes the ranked READY list.  A dedicated execution
             # thread performs fresh pre-entry validation and broker submission.
             self._publish_execution_candidates(ranked)
-            self.settle_observations();self.maybe_train()
+            self.settle_observations();self.maybe_train();self.train_success_model();self._ensure_historical_success_training()
             self.scan_status.update(status='COMPLETE',phase='Complete',completed=len(names),ready=sum(1 for s in self.signals.values() if s.get('decision')=='READY'),finished=now_ist().isoformat())
             self.last_cycle=now_ist().isoformat()
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
@@ -13121,11 +13632,17 @@ class StockDeskEngine(DeskEngine):
         threading.Thread(target=execution_loop,daemon=True,name='stock-ai-execution').start()
     def state(self):
         s=super().state()
-        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
+        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
+        sm=self.train_success_model();hm=self.historical_success_model()
+        if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
+        if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
+        archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
+        selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
         s.update(universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
-            execution=dict(self.execution_status))
+            execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
+            historical_archive=archive,history_backfill=dict(self.history_backfill_status))
         return s
     def control(self,action,body):
         # Disarming is immediate even while a broad scan is running.
@@ -13178,8 +13695,12 @@ def stock_ai_control(action):
                                 for i,symbol in enumerate(STOCK_DESK.a.symbols):
                                     STOCK_DESK.training=dict(status='SYNCING HISTORY',progress=round(100*i/max(1,len(STOCK_DESK.a.symbols))))
                                     STOCK_DESK.a.refresh(symbol)
+                                    if i+1<len(STOCK_DESK.a.symbols):time.sleep(STOCK_HISTORY_PACE_SECONDS)
                                 STOCK_DESK.training=dict(status='HISTORY READY',progress=100)
                     STOCK_DESK.cycle()
+                    if action=='sync':
+                        STOCK_DESK._ensure_deep_history_backfill(force=True)
+                        STOCK_DESK._ensure_historical_success_training(force=True)
                 except Exception as e:
                     STOCK_DESK.training=dict(status='ERROR',progress=0,error=str(e));STOCK_DESK.event('ERROR',str(e))
                 finally:STOCK_DESK.train_lock.release()
