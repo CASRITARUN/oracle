@@ -2033,12 +2033,29 @@ def get_instruments(force=False):
 
 
 def fo_stock_universe(force=False):
-    """Individual F&O stocks only (indices are offered separately via INDEX_SYMBOLS)."""
-    nfo, _ = get_instruments(force=force)
-    names = set()
-    for ins in nfo:
-        if ins["segment"] == "NFO-OPT" and ins["name"] not in INDEX_SYMBOLS:
-            names.add(ins["name"])
+    """Return only genuine NSE cash equities that currently have NFO options.
+
+    Do not infer "stock" merely because an NFO option name is not one of our
+    configured headline indices. NSE also lists derivatives on other indices
+    (for example NIFTYFPI / NIFTYNXT50), which do not resolve as NSE cash
+    equities and can otherwise leave the history backfill permanently partial.
+    The cash-market EQ intersection is the authoritative stock filter.
+    """
+    nfo, nse = get_instruments(force=force)
+    cash_equities = {
+        str(i.get("tradingsymbol") or "").upper()
+        for i in nse
+        if i.get("exchange") == "NSE"
+        and i.get("segment") == "NSE"
+        and i.get("instrument_type") == "EQ"
+        and i.get("tradingsymbol")
+    }
+    names = {
+        str(ins.get("name") or "").upper()
+        for ins in nfo
+        if ins.get("segment") == "NFO-OPT"
+        and str(ins.get("name") or "").upper() in cash_equities
+    }
     return sorted(names)
 
 
@@ -12875,7 +12892,7 @@ STOCK_HISTORY_BACKFILL_DAYS = max(90, int(os.environ.get('STOCK_HISTORY_BACKFILL
 STOCK_HISTORY_BACKFILL_CHUNK_DAYS = max(15, min(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_CHUNK_DAYS', '60'))))
 STOCK_HISTORY_BACKFILL_PACE_SECONDS = max(0.36, float(os.environ.get('STOCK_HISTORY_BACKFILL_PACE_SECONDS', '0.40')))
 STOCK_HISTORY_BACKFILL_RETRY_SECONDS = max(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_RETRY_SECONDS', '900')))
-STOCK_AI_BUILD = 'resolved-history-v2-20260913'
+STOCK_AI_BUILD = 'equity-universe-v3-20260913'
 STOCK_FULL_SCAN_BAR_MAX_AGE = 15
 STOCK_SUCCESS_MIN_SAMPLES = 40
 STOCK_SUCCESS_MIN_AUC = 0.52
