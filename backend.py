@@ -12875,6 +12875,7 @@ STOCK_HISTORY_BACKFILL_DAYS = max(90, int(os.environ.get('STOCK_HISTORY_BACKFILL
 STOCK_HISTORY_BACKFILL_CHUNK_DAYS = max(15, min(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_CHUNK_DAYS', '60'))))
 STOCK_HISTORY_BACKFILL_PACE_SECONDS = max(0.36, float(os.environ.get('STOCK_HISTORY_BACKFILL_PACE_SECONDS', '0.40')))
 STOCK_HISTORY_BACKFILL_RETRY_SECONDS = max(60, int(os.environ.get('STOCK_HISTORY_BACKFILL_RETRY_SECONDS', '900')))
+STOCK_AI_BUILD = 'resolved-history-v2-20260913'
 STOCK_FULL_SCAN_BAR_MAX_AGE = 15
 STOCK_SUCCESS_MIN_SAMPLES = 40
 STOCK_SUCCESS_MIN_AUC = 0.52
@@ -13018,6 +13019,13 @@ class StockDeskAdapter(DeskAdapter):
         bounds=self.history_bounds(symbol)
         first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
         complete=bool(first and first<=target_start+timedelta(days=3))
+        # If every legal older-history window down to the target was checked without an
+        # API error, but the archive still cannot reach the one-year boundary, the current
+        # instrument simply has no more usable older candles.  Resolve it as MAX_AVAILABLE
+        # rather than retrying the same zero-progress windows forever.  Genuine request/
+        # token errors remain ERROR/PARTIAL and are surfaced in the UI for investigation.
+        exhausted_without_error=bool(error is None and cursor_end<=target_start and int(bounds.get('n') or 0)>=240 and first)
+        if not complete and exhausted_without_error:max_available=True
         status='COMPLETE' if complete else 'MAX_AVAILABLE' if max_available else ('PARTIAL' if chunks else 'ERROR')
         return dict(symbol=symbol,status=status,rows_added=added_total,fetched=fetched_total,chunks=chunks,error=error,
             bounds=bounds,target_start=str(target_start),available_from=str(first) if first else None)
@@ -13659,7 +13667,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
