@@ -12178,7 +12178,8 @@ def _build_desk_engine_class():
                 split=int(n*.8);cut=dt(evidence[split]['ts']);train=[r for r in evidence[:split] if dt(r['target_ts'])<cut];val=evidence[split:]
                 if len(train)<40:return
                 m=fit([json.loads(r['features']) for r in train],[r['label'] for r in train]);p=predict(m,[json.loads(r['features']) for r in val]);y=np.array([r['label'] for r in val])
-                m.update(samples=n,accuracy=float(((p>=.5)==y).mean()*100),auc=auc(y,p),ts=stamp())
+                acc=float(((p>=.5)==y).mean()*100);baseline=float(max(y.mean(),1-y.mean())*100);brier=float(np.mean((p-y)**2))
+                m.update(samples=n,accuracy=acc,auc=auc(y,p),baseline=baseline,brier=brier,validation_samples=len(val),ts=stamp())
                 self.put('online_model',m);self.put('online_trained_count',n);self.put('online_last_sample',evidence[-1]['ts']);self.put('online_trained_at',stamp())
         def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=15):
             """Run the common directional model without touching an option chain.
@@ -12201,7 +12202,7 @@ def _build_desk_engine_class():
             f=self.a.features(bars,len(bars)-1,arr);x=[f[k] for k in FEATURES]
             if not all(finite(v) for v in x):s['reason']='Invalid features';return s
             hist=float(predict(m,x));online=self.get('online_model');op=float(predict(online,x)) if online else None
-            use_online=online and (online.get('auc') or 0)>=.52
+            use_online=bool(online and (online.get('auc') or 0)>=.52 and online.get('baseline') is not None and float(online.get('accuracy') or 0)>=float(online.get('baseline') or 0)-2)
             p=.8*hist+.2*op if use_online else hist
             s.update(p_up=p,historical_probability=hist,online_probability=op,model_id=m['id'],features=x,
                 regime='UPTREND' if f['ema_gap_20_50']>.05 else 'DOWNTREND' if f['ema_gap_20_50']<-.05 else 'RANGE',
@@ -12658,7 +12659,7 @@ def _build_desk_engine_class():
             explanations.append('The model estimates underlying direction, not the probability of an option trade being profitable.')
             counts=self.rows('SELECT kind,COUNT(*) n FROM desk_trade_events WHERE position_id=? GROUP BY kind',(pid,))
             coverage={r['kind']:r['n'] for r in counts}
-            limitation='Recorded observations are samples from existing supervision, not every exchange tick. Underlying signal prices may be from older candles (see bar_ts). News, continuous IV and auction imbalance are not recorded; market causes cannot be proven. Offline periods and gaps cannot be reconstructed. This recorder does not automatically retrain the trading models from profits or losses.'
+            limitation='Recorded observations are samples from existing supervision, not every exchange tick. Underlying signal prices may be from older candles (see bar_ts). News, continuous IV and auction imbalance are not recorded; market causes cannot be proven. Offline periods and gaps cannot be reconstructed. The directional model is not retrained directly from trade P&L; separate success models may learn from completed paper outcomes when their validation gates pass.'
             if not coverage.get('ENTRY_PLAN'):limitation+=' Historical trade: no event recorder entry record; only previously stored evidence is available.'
             if self.recorder_error:limitation+=' '+self.recorder_error
             observations=self.rows("SELECT MIN(CAST(json_extract(payload,'$.quote.bid') AS REAL)) low, MAX(CAST(json_extract(payload,'$.quote.bid') AS REAL)) high, MAX(CAST(json_extract(payload,'$.quote.spread_pct') AS REAL)) widest_spread FROM desk_trade_events WHERE position_id=? AND kind='OBSERVATION'",(pid,))[0]
@@ -12720,7 +12721,7 @@ def _build_desk_engine_class():
             for symbol in self.a.symbols:
                 s=dict(self.signals.get(symbol,dict(symbol=symbol,decision='WAIT',reason='Waiting for first market scan')));s.pop('features',None);signals.append(s)
             if model:model={k:v for k,v in model.items() if k not in ('mu','sd','w','bias')}
-            online=self.get('online_model');online={k:online[k] for k in ('samples','accuracy','auc','ts')} if online else None
+            online=self.get('online_model');online={k:online.get(k) for k in ('samples','accuracy','auc','baseline','brier','validation_samples','ts')} if online else None
             trades=self.rows("SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100")
             for trade in trades:
                 if not trade.get('exit_reason'):
@@ -12828,7 +12829,7 @@ def _claim_ai_worker_lease():
 
 _AI_WORKER_LEASE=_claim_ai_worker_lease()
 
-DESK = DeskEngine(DeskAdapter())
+DESK = None  # assigned to IndexAdvancedDeskEngine after success-intelligence helpers are defined
 
 @app.route('/api/ai-desk/state')
 def desk_state_route():
@@ -12856,6 +12857,7 @@ def desk_control_route(action):
                         if len(DESK.a.bars(symbol,260))<220:raise ValueError(f"Insufficient history for {symbol}; check Kite historical API access and backend logs")
                         DESK.training={"status":"SYNCING RECENT HISTORY","progress":20+25*i}
                     DESK.training={"status":"HISTORY READY","progress":100}
+                    if hasattr(DESK,'_ensure_historical_success_training'):DESK._ensure_historical_success_training(force=True)
                 except Exception as e:DESK.training={"status":"ERROR","error":str(e),"progress":0}
                 finally:DESK.train_lock.release()
             threading.Thread(target=sync_job,daemon=True,name='desk-sync').start()
@@ -13754,6 +13756,535 @@ def stock_ai_control(action):
         if action=='train':return jsonify(ok=True,started=STOCK_DESK.train())
         return jsonify(ok=True,config=STOCK_DESK.control(action,body))
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+
+# ===========================================================================
+# INDEX AI V4 — hierarchical success intelligence beyond the Stock AI layer.
+#
+# Direction remains a pooled historical + independently validated forward model.
+# READY index-option setups then pass through three additional evidence layers:
+#   1) historical target-before-stop setup success on the direction holdout,
+#   2) forward SHADOW option outcomes for every unique READY setup (taken or skipped),
+#   3) actual completed PAPER option outcomes after estimated costs.
+# Historical/shadow/paper models each support pooled + per-index specialists. Weak
+# models are ignored, probabilities are shrunk toward 50%, and execution is gated
+# again immediately before order submission. Shadow setups never place orders.
+# ===========================================================================
+INDEX_AI_BUILD = 'index-hierarchical-success-v4.1-audited-20260914'
+INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
+INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
+INDEX_HIST_SUCCESS_MIN_AUC = 0.52
+INDEX_HIST_SUCCESS_PER_SYMBOL = 700
+INDEX_SHADOW_SUCCESS_MIN_SAMPLES = 60
+INDEX_SHADOW_SPECIALIST_MIN_SAMPLES = 40
+INDEX_LIVE_SUCCESS_MIN_SAMPLES = 40
+INDEX_LIVE_SPECIALIST_MIN_SAMPLES = 30
+INDEX_SUCCESS_MIN_AUC = 0.52
+INDEX_EXEC_MIN_SUCCESS = max(.50,min(.90,float(os.environ.get('INDEX_EXEC_MIN_SUCCESS','0.58'))))
+INDEX_EXEC_MIN_EXPECTED_R = max(-.50,min(2.,float(os.environ.get('INDEX_EXEC_MIN_EXPECTED_R','0.10'))))
+INDEX_EXEC_FALLBACK_MIN_CONFIDENCE = max(.55,min(.90,float(os.environ.get('INDEX_EXEC_FALLBACK_MIN_CONFIDENCE','0.65'))))
+INDEX_DIRECTION_MIN_AUC = max(.50,min(.90,float(os.environ.get('INDEX_DIRECTION_MIN_AUC','0.52'))))
+INDEX_SUCCESS_RETRY_SECONDS = 900
+
+
+def _index_fit_dataset(records,min_samples,min_train,min_val,min_auc=INDEX_SUCCESS_MIN_AUC):
+    """Fit one chronologically validated binary model from (start,end,x,y,symbol)."""
+    records=sorted(records,key=lambda r:r[0])
+    base=dict(samples=len(records),required=min_samples,valid=False,status='LEARNING')
+    if len(records)<min_samples or len({r[3] for r in records})<2:
+        base['note']='Need more chronological wins and failures.'
+        return base
+    split=max(1,int(len(records)*.8));split=min(split,len(records)-min_val)
+    if split<=0:return base
+    cut=records[split][0]
+    train=[r for r in records[:split] if r[1]<cut]
+    val=[r for r in records[split:] if r[0]>=cut]
+    base.update(train_samples=len(train),validation_samples=len(val))
+    if len(train)<min_train or len(val)<min_val or len({r[3] for r in train})<2 or len({r[3] for r in val})<2:
+        base['note']='Need more non-overlapping chronological winners and failures in train and validation.'
+        return base
+    m=_stock_success_fit([r[2] for r in train],[r[3] for r in train])
+    y=np.asarray([r[3] for r in val],int);p=np.asarray(_stock_success_predict(m,[r[2] for r in val]),float)
+    aucv=_stock_success_auc(y,p);acc=float(((p>=.5)==y).mean()*100);baseline=float(max(y.mean(),1-y.mean())*100);brier=float(np.mean((p-y)**2))
+    valid=aucv is not None and aucv>=min_auc and acc>=baseline-2
+    # Payoff diagnostics are computed from TRAIN only so validation remains unseen.
+    train_r=[float(r[5]) for r in train if len(r)>5 and math.isfinite(float(r[5]))]
+    win_r=[float(r[5]) for r in train if len(r)>5 and int(r[3])==1 and math.isfinite(float(r[5]))]
+    loss_r=[float(r[5]) for r in train if len(r)>5 and int(r[3])==0 and math.isfinite(float(r[5]))]
+    m.update(base,status='VALIDATED' if valid else 'LEARNING',valid=bool(valid),accuracy=acc,auc=aucv,brier=brier,baseline=baseline,
+        avg_outcome_r=float(np.mean(np.clip(train_r,-5,5))) if train_r else None,
+        avg_win_r=float(np.mean(np.clip(win_r,-5,5))) if win_r else None,
+        avg_loss_r=float(np.mean(np.clip(loss_r,-5,5))) if loss_r else None)
+    return m
+
+
+def _index_public_model(model):
+    if not model:return model
+    def clean(m):
+        if not isinstance(m,dict):return m
+        return {k:v for k,v in m.items() if k not in ('mu','sd','w','bias')}
+    out=clean(model)
+    out['specialists']={k:clean(v) for k,v in (model.get('specialists') or {}).items()}
+    return out
+
+
+class IndexAdvancedDeskEngine(DeskEngine):
+    def __init__(self,adapter):
+        super().__init__(adapter)
+        self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
+        self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
+        self.execution_status={'status':'IDLE'}
+        self.hist_success_lock=threading.Lock();self.hist_success_thread=None;self.hist_success_last_attempt=0.;self.hist_success_cache=None;self.hist_success_cache_at=0.
+        self.shadow_success_lock=threading.Lock();self.shadow_success_cache=None;self.shadow_success_cache_at=0.
+        self.live_success_lock=threading.Lock();self.live_success_cache=None;self.live_success_cache_at=0.
+        self.scan_status={'status':'IDLE','completed':0,'total':len(self.a.symbols),'ready':0}
+        self._init_success_db()
+    def _init_success_db(self):
+        with self.db() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS index_shadow_setups(
+              id TEXT PRIMARY KEY,ts TEXT,symbol TEXT,bar_ts TEXT,model_id TEXT,contract TEXT,exchange TEXT,
+              entry REAL,stop REAL,target REAL,qty INTEGER,lot INTEGER,tick REAL,setup TEXT,status TEXT,
+              exit_ts TEXT,exit_price REAL,pnl REAL DEFAULT 0,fees REAL DEFAULT 0,label INTEGER,reason TEXT);
+            DROP INDEX IF EXISTS index_shadow_unique;
+            CREATE INDEX IF NOT EXISTS index_shadow_label ON index_shadow_setups(label,exit_ts);
+            CREATE INDEX IF NOT EXISTS index_shadow_symbol_bar ON index_shadow_setups(symbol,bar_ts,contract);
+            ''')
+    @staticmethod
+    def rank_signal(s,max_spread):
+        conf=max(0.,min(1.,float(s.get('confidence') or 0)))
+        if s.get('decision')!='READY':return round(100*conf,2) if s.get('p_up') is not None else 0.
+        spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max(.01,float(max_spread))))
+        if s.get('success_probability') is not None:
+            p=max(0.,min(1.,float(s['success_probability'])));ev=float(s.get('expected_r') or 0)
+            evq=max(0.,min(1.,(ev+.5)/2.0))
+            return round(80*p+12*evq+5*spread+3*conf,2)
+        depth=min(1.,float(s.get('depth_qty') or 0)/max(1.,float(s.get('qty') or 1))/3)
+        return round(88*conf+8*spread+4*depth,2)
+    def _success_vector(self,s):
+        feats=list(s.get('features') or [])
+        def fidx(i,default=0.):
+            try:return float(feats[i]) if math.isfinite(float(feats[i])) else default
+            except Exception:return default
+        conf=max(0.,min(1.,float(s.get('confidence') or 0)));hp=s.get('historical_probability');op=s.get('online_probability')
+        hs=abs(float(hp)-.5)*2 if hp is not None else conf;os=abs(float(op)-.5)*2 if op is not None else 0.
+        agree=1. if hp is not None and op is not None and (float(hp)>=.5)==(float(op)>=.5) else .5 if op is None else 0.
+        direction=s.get('direction');reg=s.get('regime');align=1. if (direction=='UP' and reg=='UPTREND') or (direction=='DOWN' and reg=='DOWNTREND') else .5 if reg=='RANGE' else 0.
+        spread=float(s.get('spread') or 99);mx=max(.01,float(self.config().get('max_spread') or 1.));spreadq=max(0.,min(1.,1-spread/mx))
+        qty=max(1.,float(s.get('qty') or 1));depth=max(0.,min(5.,float(s.get('depth_qty') or 0)/qty))/5
+        delta=abs(float(s.get('option_delta') or .5));deltaq=max(0.,1-abs(delta-.5)/.2)
+        vol=np.log1p(max(0.,float(s.get('option_volume') or 0)))/15.;oi=np.log1p(max(0.,float(s.get('option_oi') or 0)))/18.
+        dte=max(0.,min(60.,float(s.get('dte') or 0)))/60.;fresh=max(0.,min(1.,1-float(s.get('bar_age') or 15)/15.))
+        cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);stop=float(cfg.get('stop_pct') or 12)/40.
+        planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1.,float(s.get('qty') or 1)));cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
+        return [conf,hs,os,agree,fidx(11),fidx(12),fidx(8),fidx(9),fidx(10),align,spreadq,depth,deltaq,vol,oi,dte,fresh,reward,stop,cost_r]
+    def _historical_vector_from_features(self,f,p,reward=None,stop_barrier=None):
+        direction=1. if float(p)>=.5 else -1.;conf=max(float(p),1-float(p));reward=float(reward if reward is not None else self.config().get('reward_r',1.8))
+        if stop_barrier is None:
+            vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0));stop_barrier=max(.15,min(1.50,.50*vol+.35*rng))
+        return [conf,direction*float(f.get('ret_1') or 0),direction*float(f.get('ret_3') or 0),direction*float(f.get('ret_5') or 0),direction*float(f.get('ret_20') or 0),
+            direction*float(f.get('ema_gap_9_20') or 0),direction*float(f.get('ema_gap_20_50') or 0),direction*(float(f.get('rsi14') or 50)-50),
+            direction*(float(f.get('trend_score') or 12.5)-12.5),direction*(float(f.get('momentum_score') or 12.5)-12.5),float(f.get('volatility_10') or 0),
+            float(f.get('range_20') or 0),float(f.get('volume_ratio') or 0),float(f.get('time_sin') or 0),float(f.get('time_cos') or 0),float(stop_barrier),reward]
+    def _historical_vector(self,s):
+        vals=list(s.get('features') or []);f={name:(float(vals[i]) if i<len(vals) and math.isfinite(float(vals[i])) else 0.) for i,name in enumerate(STOCK_DIRECTION_FEATURES)}
+        return self._historical_vector_from_features(f,float(s['p_up'])) if s.get('p_up') is not None else None
+    @staticmethod
+    def _continuous_historical_window(rows,i,horizon_bars,square_off):
+        """Return (usable bars,last ts) for a continuous same-session path ending by square-off."""
+        try:
+            start=datetime.fromisoformat(str(rows[i]['ts']).replace('Z','+00:00'))
+            start=start.replace(tzinfo=IST) if start.tzinfo is None else start.astimezone(IST)
+            hh,mm=(int(x) for x in str(square_off).split(':',1));cutoff=start.replace(hour=hh,minute=mm,second=0,microsecond=0)
+            # Candle timestamps mark interval starts; entry is after the current 5-minute bar closes.
+            allowed=int((cutoff-(start+timedelta(minutes=5))).total_seconds()//300)
+            usable=min(int(horizon_bars),allowed)
+            if usable<1 or i+usable>=len(rows):return None
+            prev=start;start_date=start.date()
+            for j in range(i+1,i+usable+1):
+                cur=datetime.fromisoformat(str(rows[j]['ts']).replace('Z','+00:00'))
+                cur=cur.replace(tzinfo=IST) if cur.tzinfo is None else cur.astimezone(IST)
+                if cur.date()!=start_date or abs((cur-prev).total_seconds()-300)>2:return None
+                prev=cur
+            return usable,prev
+        except Exception:return None
+    @staticmethod
+    def _historical_outcome(rows,i,direction,stop_pct,target_pct,horizon_bars):
+        entry=float(rows[i]['close'] or 0)
+        if entry<=0:return None
+        stop=float(stop_pct)/100.;target=float(target_pct)/100.;end=min(len(rows)-1,i+int(horizon_bars))
+        for j in range(i+1,end+1):
+            hi=float(rows[j]['high'] or rows[j]['close'] or 0);lo=float(rows[j]['low'] or rows[j]['close'] or 0)
+            fav=(hi/entry)-1 if direction>0 else 1-(lo/entry);adv=1-(lo/entry) if direction>0 else (hi/entry)-1
+            hit_target=fav>=target;hit_stop=adv>=stop
+            if hit_target and hit_stop:return 0
+            if hit_stop:return 0
+            if hit_target:return 1
+        return None
+    def _hierarchical_probability(self,model,symbol,vector,specialist_min):
+        if not model or not vector:return None,None,None,None
+        pooled_valid=bool(model.get('pooled_valid') and model.get('w'));spec=(model.get('specialists') or {}).get(symbol) or {};spec_valid=bool(spec.get('valid') and spec.get('w'))
+        if not pooled_valid and not spec_valid:return None,None,None,None
+        pp=float(_stock_success_predict(model,vector)) if pooled_valid else None;sp=float(_stock_success_predict(spec,vector)) if spec_valid else None
+        if pp is not None and sp is not None:
+            n=float(spec.get('samples') or 0);sw=min(.75,max(.35,.35+max(0.,n-specialist_min)/300*.40));raw=(1-sw)*pp+sw*sp
+            source=f'Pooled + {symbol} specialist ({int(round((1-sw)*100))}/{int(round(sw*100))})';aucv=(1-sw)*float(model.get('auc') or .5)+sw*float(spec.get('auc') or .5);samples=max(float(model.get('samples') or 0),n)
+        elif sp is not None:raw=sp;source=f'{symbol} specialist';aucv=float(spec.get('auc') or .5);samples=float(spec.get('samples') or 0)
+        else:raw=pp;source='Pooled index model';aucv=float(model.get('auc') or .5);samples=float(model.get('samples') or 0)
+        return raw,source,aucv,samples
+    def historical_success_model(self,force=False):
+        now=time.monotonic()
+        if not force and self.hist_success_cache is not None and now-self.hist_success_cache_at<30:return self.hist_success_cache
+        m=self.get('index_historical_setup_success_model_v41');self.hist_success_cache=m;self.hist_success_cache_at=now;return m
+    def train_historical_success_model(self,force=False):
+        if not self.hist_success_lock.acquire(False):return self.historical_success_model()
+        try:
+            dm=self.model();prior=self.historical_success_model()
+            if not dm or not dm.get('mu') or not dm.get('validation_start'):
+                m=dict(status='WAITING FOR DIRECTION MODEL',valid=False,pooled_valid=False,samples=0,required=INDEX_HIST_SUCCESS_MIN_SAMPLES,updated=now_ist().isoformat())
+                self.put('index_historical_setup_success_model_v41',m);self.hist_success_cache=m;return m
+            holdout=datetime.fromisoformat(str(dm['validation_start']).replace('Z','+00:00'));holdout=holdout.replace(tzinfo=IST) if holdout.tzinfo is None else holdout.astimezone(IST)
+            cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);horizon=max(3,min(24,int(float(cfg.get('max_hold') or 90)//5)));square_off=str(cfg.get('square_off') or '15:15')
+            signature=f"{INDEX_AI_BUILD}|{dm.get('id')}|reward={reward:.4f}|horizon={horizon}|squareoff={square_off}"
+            if not force and prior and prior.get('signature')==signature and prior.get('status')=='VALIDATED':return prior
+            samples=[];per_symbol={}
+            for symbol in self.a.symbols:
+                rows=self.a.bars(symbol,20000)
+                if len(rows)<240:continue
+                arr={k:np.asarray([float(r[k] or 0) for r in rows],float) for k in ('close','high','low','volume')};arr['ts']=[str(r['ts']) for r in rows];made=[]
+                for i in range(200,len(rows)-horizon,3):
+                    try:t=datetime.fromisoformat(str(rows[i]['ts']).replace('Z','+00:00'));t=t.replace(tzinfo=IST) if t.tzinfo is None else t.astimezone(IST)
+                    except Exception:continue
+                    if t<holdout:continue
+                    f=self.a.features(rows,i,arr);x=[f.get(k,0) for k in STOCK_DIRECTION_FEATURES]
+                    if len(x)!=len(dm.get('mu') or []) or not all(math.isfinite(float(v)) for v in x):continue
+                    p=_stock_direction_predict(dm,x);conf=max(p,1-p)
+                    if conf<.55:continue
+                    vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0));stop=max(.15,min(1.50,.50*vol+.35*rng));target=stop*reward
+                    window=self._continuous_historical_window(rows,i,horizon,square_off)
+                    if window is None:continue
+                    path_bars,path_end=window
+                    label=self._historical_outcome(rows,i,1 if p>=.5 else -1,stop,target,path_bars)
+                    if label is None:continue
+                    hv=self._historical_vector_from_features(f,p,reward,stop)
+                    outcome_r=reward if int(label)==1 else -1.0
+                    if all(math.isfinite(float(v)) for v in hv):made.append((t.timestamp(),path_end.timestamp(),hv,int(label),symbol,outcome_r))
+                if len(made)>INDEX_HIST_SUCCESS_PER_SYMBOL:
+                    keep=np.linspace(0,len(made)-1,INDEX_HIST_SUCCESS_PER_SYMBOL,dtype=int);made=[made[int(k)] for k in keep]
+                samples.extend(made);per_symbol[symbol]=len(made)
+            pooled=_index_fit_dataset(samples,INDEX_HIST_SUCCESS_MIN_SAMPLES,200,60,INDEX_HIST_SUCCESS_MIN_AUC);specialists={}
+            for symbol in self.a.symbols:
+                specialists[symbol]=_index_fit_dataset([r for r in samples if r[4]==symbol],INDEX_HIST_SPECIALIST_MIN_SAMPLES,55,18,INDEX_HIST_SUCCESS_MIN_AUC)
+            pooled.update(pooled_valid=bool(pooled.get('valid')),specialists=specialists,per_symbol=per_symbol,direction_model_id=dm.get('id'),holdout_start=holdout.isoformat(),
+                horizon_minutes=horizon*5,reward_r=reward,signature=signature,features=STOCK_HIST_SUCCESS_FEATURES,label_definition='Index target-before-stop on unseen direction-model holdout using continuous same-session 5-minute paths capped by configured square-off; specialist models shrink toward pooled evidence.',updated=now_ist().isoformat())
+            any_valid=bool(pooled.get('pooled_valid') or any(v.get('valid') for v in specialists.values()));pooled['valid']=any_valid;pooled['status']='VALIDATED' if any_valid else 'LEARNING'
+            self.put('index_historical_setup_success_model_v41',pooled);self.hist_success_cache=pooled;self.hist_success_cache_at=time.monotonic()
+            self.event('INDEX_HIST_SUCCESS',f"{pooled['status']} samples={pooled.get('samples',0)} auc={pooled.get('auc')}")
+            return pooled
+        except Exception as e:
+            self.event('ERROR','Index historical success training: '+str(e))
+            if prior and prior.get('valid'):
+                kept=dict(prior);kept.update(last_training_error=str(e),last_training_error_at=now_ist().isoformat())
+                self.put('index_historical_setup_success_model_v41',kept);self.hist_success_cache=kept;self.hist_success_cache_at=time.monotonic();return kept
+            m=dict(status='ERROR',valid=False,pooled_valid=False,samples=0,required=INDEX_HIST_SUCCESS_MIN_SAMPLES,error=str(e),updated=now_ist().isoformat())
+            self.put('index_historical_setup_success_model_v41',m);self.hist_success_cache=m;self.hist_success_cache_at=time.monotonic();return m
+        finally:self.hist_success_lock.release()
+    def _live_priority_reason(self):
+        try:
+            cfg=self.config()
+            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Index AI live armed'
+            if any(p.get('mode')=='live' for p in self.active()):return 'Index AI live position active'
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):return 'Index AI live order unresolved'
+        except Exception:return 'Index live-state check unavailable'
+        for name,label in (('STOCK_DESK','Stock AI'),('CAS_DESK','CAS AI')):
+            e=globals().get(name)
+            if not e:continue
+            try:
+                c=e.config()
+                if c.get('mode')=='live' and c.get('armed'):return label+' live armed'
+                if any(p.get('mode')=='live' for p in e.active()):return label+' live position active'
+            except Exception:continue
+        return None
+    def _ensure_historical_success_training(self,force=False):
+        if self._live_priority_reason():return False
+        dm=self.model()
+        if not dm:return False
+        cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);horizon=max(3,min(24,int(float(cfg.get('max_hold') or 90)//5)));square_off=str(cfg.get('square_off') or '15:15');signature=f"{INDEX_AI_BUILD}|{dm.get('id')}|reward={reward:.4f}|horizon={horizon}|squareoff={square_off}"
+        prior=self.historical_success_model();same=prior and prior.get('signature')==signature
+        if not force and same and prior.get('status')=='VALIDATED':return False
+        if self.hist_success_thread and self.hist_success_thread.is_alive():return False
+        now=time.monotonic()
+        if not force and now-self.hist_success_last_attempt<INDEX_SUCCESS_RETRY_SECONDS:return False
+        self.hist_success_last_attempt=now
+        self.hist_success_thread=threading.Thread(target=lambda:self.train_historical_success_model(force=force),daemon=True,name='index-historical-success');self.hist_success_thread.start();return True
+    def _record_shadow_candidate(self,s):
+        if s.get('decision')!='READY' or not s.get('bar_ts') or not s.get('contract'):return
+        shadow=dict(s);shadow['strategy_version']=INDEX_AI_BUILD;shadow['qty']=max(1,int(s.get('qty') or s.get('lot') or 1))
+        key=f"{s['symbol']}|{s['bar_ts']}|{s['contract']}|{INDEX_AI_BUILD}"
+        try:
+            with self.db() as c:c.execute('''INSERT OR IGNORE INTO index_shadow_setups(id,ts,symbol,bar_ts,model_id,contract,exchange,entry,stop,target,qty,lot,tick,setup,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (key,now_ist().isoformat(),s['symbol'],str(s['bar_ts']),str(s.get('model_id') or ''),s['contract'],s['exchange'],float(s['entry']),float(s['stop']),float(s['target']),shadow['qty'],int(s.get('lot') or 1),float(s.get('tick') or .05),json.dumps(shadow,default=str),'OPEN'))
+        except Exception as e:self.event('ERROR','Shadow record: '+str(e),s.get('symbol',''))
+    def _settle_shadow_candidates(self):
+        rows=self.rows("SELECT * FROM index_shadow_setups WHERE status='OPEN' ORDER BY ts LIMIT 200");cfg=self.config();today=now_ist().date()
+        active=[];keys=[]
+        for r in rows:
+            try:
+                opened=datetime.fromisoformat(str(r['ts']).replace('Z','+00:00'));opened=opened.replace(tzinfo=IST) if opened.tzinfo is None else opened.astimezone(IST)
+                if opened.date()<today:
+                    with self.db() as c:c.execute("UPDATE index_shadow_setups SET status='ABANDONED',reason=? WHERE id=?",('No executable same-day close was observed',r['id']))
+                    continue
+                active.append((r,opened));keys.append(r['exchange']+':'+r['contract'])
+            except Exception as e:self.event('ERROR','Shadow parse: '+str(e),r.get('symbol',''))
+        if not active:return
+        try:books=kite_quote_bulk(list(dict.fromkeys(keys)),chunk_size=500,force_refresh=True)
+        except Exception as e:self.event('ERROR','Shadow quote batch: '+str(e));return
+        for r,opened in active:
+            try:
+                raw=books.get(r['exchange']+':'+r['contract'])
+                if not raw:continue
+                ts=_ai_ts_naive(raw.get('timestamp'));age=(now_ist()-ts).total_seconds() if ts else 999
+                st=quote_stats(raw);bid=float(st.get('bid') or 0)
+                if bid<=0 or age < -5 or age>60:continue
+                reason=None
+                if bid<=float(r['stop']):reason='Stop reached'
+                elif bid>=float(r['target']):reason='Target reached'
+                elif now_ist().strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
+                elif cfg.get('max_hold') is not None and (now_ist()-opened).total_seconds()>=float(cfg['max_hold'])*60:reason='Maximum holding time'
+                else:
+                    setup=json.loads(r['setup'] or '{}');sig=self.signals.get(r['symbol'],{})
+                    if sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction') and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
+                if not reason:continue
+                tick=max(.01,float(r['tick'] or .05));exit_px=max(tick,math.floor((bid*(1-float(cfg['slippage_bps'])/10000))/tick)*tick);qty=int(r['qty'] or r['lot'] or 1)
+                pnl=(exit_px-float(r['entry']))*qty;fees=2*float(cfg['fee_per_order']);label=1 if pnl-fees>0 else 0
+                with self.db() as c:c.execute("UPDATE index_shadow_setups SET status='CLOSED',exit_ts=?,exit_price=?,pnl=?,fees=?,label=?,reason=? WHERE id=?",
+                    (now_ist().isoformat(),exit_px,pnl,fees,label,reason,r['id']))
+            except Exception as e:self.event('ERROR','Shadow settle: '+str(e),r.get('symbol',''))
+    def shadow_success_model(self,force=False):
+        now=time.monotonic()
+        if not force and self.shadow_success_cache is not None and now-self.shadow_success_cache_at<30:return self.shadow_success_cache
+        m=self.get('index_shadow_success_model_v41');self.shadow_success_cache=m;self.shadow_success_cache_at=now;return m
+    def _fit_setup_rows(self,rows,min_samples,specialist_min,kind,last_key):
+        records=[]
+        for r in rows:
+            try:
+                s=json.loads(r['setup'] or '{}')
+                if s.get('strategy_version')!=INDEX_AI_BUILD:continue
+                x=self._success_vector(s)
+                if s.get('decision')=='READY' and len(x)==len(STOCK_SUCCESS_FEATURES) and all(math.isfinite(float(v)) for v in x):
+                    opened=datetime.fromisoformat(str(r['ts']).replace('Z','+00:00'));closed=datetime.fromisoformat(str(r['exit_ts']).replace('Z','+00:00'))
+                    start=opened.timestamp();end=closed.timestamp();planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1,int(s.get('qty') or 1)))
+                    net=float(r.get('pnl') or 0)-float(r.get('fees') or 0);outcome_r=net/planned
+                    records.append((start,end,x,int(r['label']),str(r['symbol']),outcome_r))
+            except Exception:continue
+        pooled=_index_fit_dataset(records,min_samples,max(25,int(min_samples*.55)),max(10,int(min_samples*.2)),INDEX_SUCCESS_MIN_AUC);specialists={}
+        for symbol in self.a.symbols:specialists[symbol]=_index_fit_dataset([x for x in records if x[4]==symbol],specialist_min,max(20,int(specialist_min*.55)),max(8,int(specialist_min*.2)),INDEX_SUCCESS_MIN_AUC)
+        pooled.update(pooled_valid=bool(pooled.get('valid')),specialists=specialists,features=STOCK_SUCCESS_FEATURES,last_sample_ts=last_key,kind=kind,updated=now_ist().isoformat())
+        any_valid=bool(pooled.get('pooled_valid') or any(v.get('valid') for v in specialists.values()));pooled['valid']=any_valid;pooled['status']='VALIDATED' if any_valid else 'LEARNING';return pooled
+    def train_shadow_success_model(self,force=False):
+        if not self.shadow_success_lock.acquire(False):return self.shadow_success_model()
+        prior=None
+        try:
+            rows=self.rows("SELECT symbol,ts,exit_ts,pnl,fees,label,setup FROM index_shadow_setups WHERE status='CLOSED' AND label IS NOT NULL ORDER BY exit_ts,id")
+            last=rows[-1]['exit_ts'] if rows else None;prior=self.shadow_success_model()
+            if not force and prior and prior.get('last_sample_ts')==last:return prior
+            m=self._fit_setup_rows(rows,INDEX_SHADOW_SUCCESS_MIN_SAMPLES,INDEX_SHADOW_SPECIALIST_MIN_SAMPLES,'Forward executable shadow-option outcomes',last)
+            self.put('index_shadow_success_model_v41',m);self.shadow_success_cache=m;self.shadow_success_cache_at=time.monotonic();self.event('INDEX_SHADOW_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
+        except Exception as e:
+            self.event('ERROR','Index shadow-success training: '+str(e))
+            if prior and prior.get('valid'):return prior
+            return dict(status='ERROR',valid=False,pooled_valid=False,samples=0,required=INDEX_SHADOW_SUCCESS_MIN_SAMPLES,error=str(e),updated=now_ist().isoformat())
+        finally:self.shadow_success_lock.release()
+    def live_success_model(self,force=False):
+        now=time.monotonic()
+        if not force and self.live_success_cache is not None and now-self.live_success_cache_at<30:return self.live_success_cache
+        m=self.get('index_live_option_success_model_v41');self.live_success_cache=m;self.live_success_cache_at=now;return m
+    def train_live_success_model(self,force=False):
+        if not self.live_success_lock.acquire(False):return self.live_success_model()
+        prior=None
+        try:
+            raw=self.rows("SELECT symbol,ts,exit_ts,pnl,fees,setup FROM desk_positions WHERE status='CLOSED' AND mode='paper' AND setup IS NOT NULL ORDER BY exit_ts,id")
+            rows=[dict(r,label=1 if float(r.get('pnl') or 0)-float(r.get('fees') or 0)>0 else 0) for r in raw]
+            last=rows[-1]['exit_ts'] if rows else None;prior=self.live_success_model()
+            if not force and prior and prior.get('last_sample_ts')==last:return prior
+            m=self._fit_setup_rows(rows,INDEX_LIVE_SUCCESS_MIN_SAMPLES,INDEX_LIVE_SPECIALIST_MIN_SAMPLES,'Actual completed paper-option outcomes after estimated costs',last)
+            self.put('index_live_option_success_model_v41',m);self.live_success_cache=m;self.live_success_cache_at=time.monotonic();self.event('INDEX_LIVE_SUCCESS',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
+        except Exception as e:
+            self.event('ERROR','Index paper-success training: '+str(e))
+            if prior and prior.get('valid'):return prior
+            return dict(status='ERROR',valid=False,pooled_valid=False,samples=0,required=INDEX_LIVE_SUCCESS_MIN_SAMPLES,error=str(e),updated=now_ist().isoformat())
+        finally:self.live_success_lock.release()
+    def _apply_success_intelligence(self,s):
+        if s.get('decision')!='READY':return s
+        s['strategy_version']=INDEX_AI_BUILD
+        hm=self.historical_success_model();sm=self.shadow_success_model();lm=self.live_success_model();hv=self._historical_vector(s);sv=self._success_vector(s);cfg=self.config()
+        weights=[];parts=[]
+        raw,source,aucv,samples=self._hierarchical_probability(hm,s['symbol'],hv,INDEX_HIST_SPECIALIST_MIN_SAMPLES)
+        if raw is not None:
+            shrink=min(.82,max(.28,.34+min(samples,5000)/5000*.25+max(0.,aucv-.5)*1.25));hp=.5+(raw-.5)*shrink
+            s['historical_setup_probability']=round(max(0.,min(1.,hp)),6);s['historical_setup_source']=source;weights.append(('historical',1.0,hp));parts.append('historical')
+        else:s['historical_setup_probability']=None;s['historical_setup_status']='LEARNING / awaiting validated pooled or specialist model'
+        raw,source,aucv,samples=self._hierarchical_probability(sm,s['symbol'],sv,INDEX_SHADOW_SPECIALIST_MIN_SAMPLES)
+        if raw is not None:
+            shrink=min(.92,max(.25,.25+min(samples,400)/400*.45+max(0.,aucv-.5)*1.0));sp=.5+(raw-.5)*shrink
+            s['shadow_success_probability']=round(max(0.,min(1.,sp)),6);s['shadow_success_source']=source;w=.65+min(1.35,samples/250);weights.append(('shadow',w,sp));parts.append('shadow')
+        else:s['shadow_success_probability']=None
+        raw,source,aucv,samples=self._hierarchical_probability(lm,s['symbol'],sv,INDEX_LIVE_SPECIALIST_MIN_SAMPLES)
+        if raw is not None:
+            shrink=min(1.,max(.25,.25+min(samples,250)/250*.55+max(0.,aucv-.5)*1.0));lp=.5+(raw-.5)*shrink
+            s['live_success_probability']=round(max(0.,min(1.,lp)),6);s['live_success_source']=source;w=1.0+min(2.0,samples/100);weights.append(('paper',w,lp));parts.append('paper')
+        else:s['live_success_probability']=None
+        if weights:
+            denom=sum(w for _,w,_ in weights);p=sum(w*v for _,w,v in weights)/denom;s['success_blend']={name:round(w/denom,3) for name,w,_ in weights};s['selection_basis']='Hierarchical '+ ' + '.join(parts)+' success intelligence'
+            planned=max(.01,(float(s['entry'])-float(s['stop']))*max(1,int(s['qty'])));cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned;s['success_probability']=round(max(0.,min(1.,p)),6);s['expected_r']=round(p*float(cfg['reward_r'])-(1-p)-cost_r,4);s['expected_r_basis']='Binary reward/stop EV proxy; not a calibrated realized-P&L forecast';s['success_model_valid']=True
+        else:
+            s['success_blend']=None;s['selection_basis']='Directional fallback while success layers validate';s['success_probability']=None;s['expected_r']=None;s['success_model_valid']=False
+        dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
+        if s.get('success_probability') is not None:
+            quality=bool(direction_ok and float(s['success_probability'])>=INDEX_EXEC_MIN_SUCCESS and float(s.get('expected_r') or -99)>=INDEX_EXEC_MIN_EXPECTED_R)
+            why='PASS' if quality else f"Need direction AUC ≥ {INDEX_DIRECTION_MIN_AUC:.2f}, success ≥ {INDEX_EXEC_MIN_SUCCESS*100:.0f}% and EV ≥ {INDEX_EXEC_MIN_EXPECTED_R:.2f}R"
+        else:
+            quality=bool(direction_ok and float(s.get('confidence') or 0)>=INDEX_EXEC_FALLBACK_MIN_CONFIDENCE);why='PASS · directional fallback' if quality else f"Fallback needs direction AUC ≥ {INDEX_DIRECTION_MIN_AUC:.2f} and confidence ≥ {INDEX_EXEC_FALLBACK_MIN_CONFIDENCE*100:.0f}%"
+        s['execution_quality_pass']=quality;s['execution_quality_reason']=why;s['rank_score']=self.rank_signal(s,cfg['max_spread']);return s
+    def evidence(self):
+        # Only current-build paper trades qualify the live-readiness gate. Older strategy
+        # versions remain in the journal but cannot silently validate a new execution policy.
+        rows=[]
+        for r in self.rows("SELECT * FROM desk_positions WHERE status='CLOSED' AND mode='paper' ORDER BY exit_ts"):
+            try:
+                setup=json.loads(r.get('setup') or '{}')
+                if setup.get('strategy_version')==INDEX_AI_BUILD:rows.append(r)
+            except Exception:continue
+        vals=[r['pnl']-r['fees'] for r in rows];wins=sum(x for x in vals if x>0);loss=-sum(x for x in vals if x<0)
+        def parse_ts(v):
+            x=datetime.fromisoformat(str(v).replace('Z','+00:00'));return x.replace(tzinfo=IST) if x.tzinfo is None else x.astimezone(IST)
+        n=len(vals);span=(parse_ts(rows[-1]['exit_ts'])-parse_ts(rows[0]['ts'])).total_seconds()/86400 if rows else 0
+        avg=sum((r['pnl']-r['fees'])/max(r['risk'],.01) for r in rows)/max(n,1);pf=wins/loss if loss else None;wr=sum(x>0 for x in vals)/max(n,1)*100
+        checks=[dict(name='Current-build closed paper trades',value=n,required=60,ok=n>=60),dict(name='Current-build record span · days',value=round(span,1),required=10,ok=span>=10),
+            dict(name='Net win rate · %',value=round(wr,1),required=42,ok=wr>=42),dict(name='Net expectancy · R',value=round(avg,3),required=.05,ok=avg>=.05),
+            dict(name='Profit factor',value=round(pf,2) if pf is not None else None,required=1.2,ok=(pf>=1.2 if pf is not None else wins>0))]
+        total=0;curve=[]
+        for r,v in zip(rows,vals):total+=v;curve.append(dict(ts=r['exit_ts'],pnl=round(total,2)))
+        return dict(ready=all(x['ok'] for x in checks),checks=checks,trades=n,net=round(total,2),win_rate=wr,equity=curve,build=INDEX_AI_BUILD)
+    def save_config(self,body):
+        # Freeze execution semantics while armed or exposed. This prevents a position from
+        # being entered under one stop/reward/cost regime and managed under another.
+        if self.config().get('armed') or self.active():raise ValueError('Disarm Index AI and close/reconcile positions before changing Index AI risk settings')
+        return super().save_config(body)
+    def _validated_success_layer_available(self):
+        return any(bool(m and m.get('valid')) for m in (self.historical_success_model(),self.shadow_success_model(),self.live_success_model()))
+    def inspect(self,symbol):
+        s=super().inspect(symbol);s['scan_stage']='DEEP'
+        if s.get('decision')=='READY':
+            self._apply_success_intelligence(s);self._record_shadow_candidate(s)
+        else:s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        return s
+    def enter(self,s):
+        if s.get('decision')!='READY' or not s.get('execution_quality_pass') or self.block() or self.get('close_requested'):return
+        fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
+        if fresh.get('decision')!='READY' or not fresh.get('execution_quality_pass') or self.get('close_requested'):return
+        return super().enter(fresh)
+    def _publish_execution_candidates(self,ranked):
+        ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('execution_quality_pass')]
+        with self.candidate_lock:
+            self.execution_generation+=1;self.execution_candidates=ready;self.execution_status=dict(status='CANDIDATES READY' if ready else 'NO EXECUTABLE CANDIDATE',generation=self.execution_generation,count=len(ready),best=ready[0]['symbol'] if ready else None,best_success_probability=ready[0].get('success_probability') if ready else None,best_expected_r=ready[0].get('expected_r') if ready else None,updated=now_ist().isoformat())
+        if ready:self.execution_event.set()
+    def execute_candidates(self):
+        if not self.entry_lock.acquire(False):return
+        try:
+            with self.candidate_lock:candidates=list(self.execution_candidates);generation=self.execution_generation;self.execution_candidates=[]
+            self.execution_status=dict(status='EXECUTING',generation=generation,count=len(candidates),updated=now_ist().isoformat())
+            for s in candidates:
+                if self.get('close_requested') or not self.config()['armed'] or self.block():break
+                try:self.enter(s)
+                except Exception as e:self.event('ERROR','Index execution: '+str(e),s.get('symbol',''))
+                if len(self.active())>=self.config()['max_positions']:break
+            self.execution_status=dict(status='IDLE',generation=generation,count=len(candidates),updated=now_ist().isoformat())
+        finally:self.entry_lock.release()
+    def supervise(self):
+        if not self.risk_lock.acquire(False):return
+        try:
+            self.reconcile();self.verify_positions()
+            if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
+        except Exception as e:self.put('halt','Index supervision error: '+str(e));self.event('ERROR',str(e))
+        finally:self.risk_lock.release()
+    def cycle(self):
+        if not self.lock.acquire(False):return
+        try:
+            self.last_cycle=now_ist().isoformat()
+            if not self.a.connected():return
+            self.supervise();names=list(self.a.symbols)
+            if not self.a.market_open():
+                for symbol in names:
+                    try:self.signals[symbol]=self.inspect(symbol)
+                    except Exception as e:self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e),rank_score=0)
+                self.maybe_train();self.settle_observations();self.train_shadow_success_model();self.train_live_success_model();self._ensure_historical_success_training();return
+            self.scan_status=dict(status='SCANNING',completed=0,total=len(names),phase='Direction + option + success intelligence',started=now_ist().isoformat())
+            for i,symbol in enumerate(names):
+                try:self.signals[symbol]=self.inspect(symbol)
+                except Exception as e:self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e),rank_score=0)
+                self.scan_status.update(completed=i+1,symbol=symbol)
+                self.supervise()
+            ranked=sorted(self.signals.values(),key=lambda s:(bool(s.get('execution_quality_pass')),s.get('success_probability') is not None,float(s.get('success_probability') or 0),float(s.get('expected_r') or -99),float(s.get('rank_score') or 0)),reverse=True)
+            self._publish_execution_candidates(ranked);self._settle_shadow_candidates();self.settle_observations();self.maybe_train();self.train_shadow_success_model();self.train_live_success_model();self._ensure_historical_success_training()
+            self.scan_status.update(status='COMPLETE',completed=len(names),ready=sum(1 for s in self.signals.values() if s.get('decision')=='READY'),executable=sum(1 for s in self.signals.values() if s.get('execution_quality_pass')),finished=now_ist().isoformat())
+            if self.get('close_requested') and not self.active():self.put('close_requested',False)
+        except Exception as e:self.scan_status.update(status='ERROR',error=str(e));self.event('ERROR','Index scan: '+str(e))
+        finally:self.lock.release()
+    def start(self):
+        if self.started:return
+        self.started=True
+        def scan_loop():
+            while not self.stop_event.is_set():self.cycle();self.stop_event.wait(15)
+        def risk_loop():
+            while not self.stop_event.wait(5):
+                if self.a.connected():self.supervise()
+        def execution_loop():
+            while not self.stop_event.is_set():
+                self.execution_event.wait(1)
+                if self.stop_event.is_set():break
+                if not self.execution_event.is_set():continue
+                self.execution_event.clear()
+                try:self.execute_candidates()
+                except Exception as e:
+                    self.put('halt','Index execution worker error: '+str(e));self.event('ERROR','Index execution worker: '+str(e))
+        threading.Thread(target=scan_loop,daemon=True,name='index-ai-scan').start();threading.Thread(target=risk_loop,daemon=True,name='index-ai-risk').start();threading.Thread(target=execution_loop,daemon=True,name='index-ai-execution').start()
+    def shadow_stats(self):
+        total=self.rows("SELECT COUNT(*) n,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open,SUM(CASE WHEN status='ABANDONED' THEN 1 ELSE 0 END) abandoned,SUM(CASE WHEN label=1 THEN 1 ELSE 0 END) wins FROM index_shadow_setups")[0]
+        per=self.rows("SELECT symbol,COUNT(*) n,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,SUM(CASE WHEN status='ABANDONED' THEN 1 ELSE 0 END) abandoned,SUM(CASE WHEN label=1 THEN 1 ELSE 0 END) wins FROM index_shadow_setups GROUP BY symbol ORDER BY symbol")
+        return dict(total=int(total.get('n') or 0),closed=int(total.get('closed') or 0),open=int(total.get('open') or 0),abandoned=int(total.get('abandoned') or 0),wins=int(total.get('wins') or 0),per_symbol=per)
+    def state(self):
+        s=super().state();s['signals'].sort(key=lambda x:(bool(x.get('execution_quality_pass')),x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
+        for i,row in enumerate(s['signals'],1):row['rank']=i
+        hm=self.historical_success_model();sm=self.shadow_success_model();lm=self.live_success_model();valid=[]
+        if hm and hm.get('valid'):valid.append('HISTORICAL')
+        if sm and sm.get('valid'):valid.append('SHADOW')
+        if lm and lm.get('valid'):valid.append('PAPER')
+        dm=s.get('model') or {};direction_live_ready=bool(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
+        success_live_ready=bool(valid)
+        s.update(build=INDEX_AI_BUILD,scan=dict(self.scan_status),execution=dict(self.execution_status),historical_success_model=_index_public_model(hm),shadow_success_model=_index_public_model(sm),live_success_model=_index_public_model(lm),
+            success_selector_status=' + '.join(valid) if valid else 'DIRECTIONAL FALLBACK',shadow=self.shadow_stats(),live_model_validation_ready=bool(direction_live_ready and success_live_ready),
+            live_model_validation_reason='READY' if direction_live_ready and success_live_ready else ('Direction validation gate not met' if not direction_live_ready else 'No success layer validated'),
+            quality_gate=dict(min_success=INDEX_EXEC_MIN_SUCCESS,min_expected_r=INDEX_EXEC_MIN_EXPECTED_R,fallback_confidence=INDEX_EXEC_FALLBACK_MIN_CONFIDENCE,min_direction_auc=INDEX_DIRECTION_MIN_AUC))
+        return s
+    def control(self,action,body):
+        if action in ('disarm','close'):
+            with self.risk_lock:
+                cfg=self.config();cfg['armed']=False;self.put('config',cfg)
+                if action=='close':self.put('close_requested',True);self.execution_event.clear();self.execution_candidates=[]
+                self.event('CONTROL',action)
+            if action=='close' and self.a.connected():self.supervise()
+            return cfg
+        cfg=self.config();target_mode=body.get('mode') if action=='mode' else cfg.get('mode')
+        if target_mode=='live' and action in ('mode','arm'):
+            dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
+            if not direction_ok:raise ValueError('Live Index AI requires a validated direction model meeting the configured AUC/accuracy gate')
+            if not self._validated_success_layer_available():raise ValueError('Live Index AI requires at least one validated success layer; manual paper-evidence override does not bypass model validation')
+        return super().control(action,body)
+
+# Replace the base index desk before shared risk and worker startup. Flask routes
+# above resolve the global DESK at request time, so they automatically use V4.
+DESK = IndexAdvancedDeskEngine(DeskAdapter())
 
 
 # ===========================================================================
