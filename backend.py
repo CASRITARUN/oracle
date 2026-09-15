@@ -633,7 +633,7 @@ class GovernedKiteConnect(KiteConnect):
         return BROKER_GATE.call(super()._request,route,method,*args,**kwargs)
 
 
-kite = GovernedKiteConnect(api_key=API_KEY)
+kite = GovernedKiteConnect(api_key=API_KEY, timeout=10)
 
 # Zerodha Quote API protection. Quote is limited to 1 request/second and a maximum of
 # 500 instruments per request. Keep one process-wide gate so Screen 1, Screen 2 and
@@ -12245,11 +12245,12 @@ def _build_desk_engine_class():
                option_expiry=str(expiry) if expiry is not None else None,dte=dte)
             q,why=self.a.quote(s['exchange'],s['contract'])
             if why:s.update(decision='WAIT',reason=why);return s
-            s.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'],depth_qty=q['ask_qty'])
+            s.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'],depth_qty=q['ask_qty'],quote_ts=q.get('quote_ts'))
             if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:s.update(decision='WAIT',reason='Option spread widened');return s
             if s['lot']<=0:s.update(decision='WAIT',reason='Invalid contract lot size');return s
             entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/s['tick'])*s['tick'],2);risk=entry*cfg['stop_pct']/100
-            max_lots=max(0,int(min(cfg['capital']/entry,cfg['risk']/risk,q['ask_qty'])//s['lot']))
+            fees=2*cfg['fee_per_order']
+            max_lots=max(0,int(min(max(0.,cfg['capital']-fees)/entry,max(0.,cfg['risk']-fees)/risk,q['ask_qty'])//s['lot']))
             lots=cfg['lots'] or max_lots
             s.update(requested_lots=cfg['lots'],max_lots=max_lots,lots=lots)
             if lots>max_lots:
@@ -12277,7 +12278,7 @@ def _build_desk_engine_class():
             if not self.a.market_open():return 'Market closed · next scan during trading hours'
             if self.get('halt'):return self.get('halt')
             if self.a.legacy_open():return 'Legacy positions remain open · close them before new entries'
-            if not cfg['armed']:return 'Entries disarmed · learning continues'
+            if not cfg['armed']:return cfg['mode'].upper()+' selected · entries DISARMED; learning runs independently'
             if any(p['qty']>0 and self.health.get(p['id'],{}).get('bid') is None for p in self.active()):return 'Position quote unavailable · new entries paused'
             if datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:return 'Square-off window · no new entries'
             if self.train_lock.locked():return 'Model training · new entries paused'
@@ -12492,7 +12493,7 @@ def _build_desk_engine_class():
                 if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
                 recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
                 if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
-                s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
+                s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence','fee_per_order','slippage_bps','max_spread')}
                 pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
                 with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                     (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
@@ -12606,7 +12607,7 @@ def _build_desk_engine_class():
                 elif action=='mode':
                     if body.get('mode') not in ('paper','live'):raise ValueError('Invalid execution mode')
                     if self.active():raise ValueError('Close active positions before switching execution mode')
-                    if body['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live requires paper evidence or manual override, and explicit acknowledgement')
+                    if body['mode']=='live' and body.get('ack') is not True:raise ValueError('Acknowledge live mode selection; arming is separate')
                     cfg.update(mode=body['mode'],armed=False)
                 elif action=='arm':
                     if hasattr(self,'shared_risk'):
@@ -12727,7 +12728,7 @@ def _build_desk_engine_class():
                 if not trade.get('exit_reason'):
                     last=self.rows("SELECT reason FROM desk_orders WHERE position_id=? AND side='SELL' AND filled>0 AND reason IS NOT NULL ORDER BY ts DESC LIMIT 1",(trade['id'],))
                     trade['exit_reason']=last[0]['reason'] if last else ('Not recorded · open Trade review' if trade['status']=='CLOSED' else 'No completed exit recorded')
-            return dict(version='2.0',recorder_error=self.recorder_error,timestamp=stamp(),connected=self.a.connected(),market_open=self.a.market_open(),config=cfg,
+            return dict(version='2.0',recorder_error=self.recorder_error,timestamp=stamp(),connected=self.a.connected(),backend_instance=str(os.getpid()),market_open=self.a.market_open(),config=cfg,
                 block=self.block(),last_cycle=self.last_cycle,training=self.training,model=model,online=online,evidence=evidence,
                 observations=obs,signals=signals,positions=active,trades=trades,
                 orders=self.rows('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60'),
@@ -12833,7 +12834,6 @@ DESK = None  # assigned to IndexAdvancedDeskEngine after success-intelligence he
 
 @app.route('/api/ai-desk/state')
 def desk_state_route():
-    if not require_session():return jsonify({"error":"Connect Kite using the login button above."}),401
     return jsonify(DESK.state())
 
 @app.route('/api/ai-desk/config',methods=['POST'])
@@ -13770,7 +13770,7 @@ def stock_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-hierarchical-success-v4.1-audited-20260914'
+INDEX_AI_BUILD = 'index-execution-audited-v4.3-20260915'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -13870,12 +13870,13 @@ class IndexAdvancedDeskEngine(DeskEngine):
         hs=abs(float(hp)-.5)*2 if hp is not None else conf;os=abs(float(op)-.5)*2 if op is not None else 0.
         agree=1. if hp is not None and op is not None and (float(hp)>=.5)==(float(op)>=.5) else .5 if op is None else 0.
         direction=s.get('direction');reg=s.get('regime');align=1. if (direction=='UP' and reg=='UPTREND') or (direction=='DOWN' and reg=='DOWNTREND') else .5 if reg=='RANGE' else 0.
-        spread=float(s.get('spread') or 99);mx=max(.01,float(self.config().get('max_spread') or 1.));spreadq=max(0.,min(1.,1-spread/mx))
+        cfg=s.get('risk_config_at_entry') or self.config()
+        spread=float(s['spread']) if s.get('spread') is not None else 99.;mx=max(.01,float(cfg.get('max_spread') or 1.));spreadq=max(0.,min(1.,1-spread/mx))
         qty=max(1.,float(s.get('qty') or 1));depth=max(0.,min(5.,float(s.get('depth_qty') or 0)/qty))/5
         delta=abs(float(s.get('option_delta') or .5));deltaq=max(0.,1-abs(delta-.5)/.2)
         vol=np.log1p(max(0.,float(s.get('option_volume') or 0)))/15.;oi=np.log1p(max(0.,float(s.get('option_oi') or 0)))/18.
-        dte=max(0.,min(60.,float(s.get('dte') or 0)))/60.;fresh=max(0.,min(1.,1-float(s.get('bar_age') or 15)/15.))
-        cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);stop=float(cfg.get('stop_pct') or 12)/40.
+        dte=max(0.,min(60.,float(s.get('dte') or 0)))/60.;fresh=max(0.,min(1.,1-float(s['bar_age'] if s.get('bar_age') is not None else 15)/15.))
+        reward=float(cfg.get('reward_r') or 1.8);stop=float(cfg.get('stop_pct') or 12)/40.
         planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1.,float(s.get('qty') or 1)));cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
         return [conf,hs,os,agree,fidx(11),fidx(12),fidx(8),fidx(9),fidx(10),align,spreadq,depth,deltaq,vol,oi,dte,fresh,reward,stop,cost_r]
     def _historical_vector_from_features(self,f,p,reward=None,stop_barrier=None):
@@ -13935,14 +13936,14 @@ class IndexAdvancedDeskEngine(DeskEngine):
     def historical_success_model(self,force=False):
         now=time.monotonic()
         if not force and self.hist_success_cache is not None and now-self.hist_success_cache_at<30:return self.hist_success_cache
-        m=self.get('index_historical_setup_success_model_v41');self.hist_success_cache=m;self.hist_success_cache_at=now;return m
+        m=self.get('index_historical_setup_success_model_v43');self.hist_success_cache=m;self.hist_success_cache_at=now;return m
     def train_historical_success_model(self,force=False):
         if not self.hist_success_lock.acquire(False):return self.historical_success_model()
         try:
             dm=self.model();prior=self.historical_success_model()
             if not dm or not dm.get('mu') or not dm.get('validation_start'):
                 m=dict(status='WAITING FOR DIRECTION MODEL',valid=False,pooled_valid=False,samples=0,required=INDEX_HIST_SUCCESS_MIN_SAMPLES,updated=now_ist().isoformat())
-                self.put('index_historical_setup_success_model_v41',m);self.hist_success_cache=m;return m
+                self.put('index_historical_setup_success_model_v43',m);self.hist_success_cache=m;return m
             holdout=datetime.fromisoformat(str(dm['validation_start']).replace('Z','+00:00'));holdout=holdout.replace(tzinfo=IST) if holdout.tzinfo is None else holdout.astimezone(IST)
             cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);horizon=max(3,min(24,int(float(cfg.get('max_hold') or 90)//5)));square_off=str(cfg.get('square_off') or '15:15')
             signature=f"{INDEX_AI_BUILD}|{dm.get('id')}|reward={reward:.4f}|horizon={horizon}|squareoff={square_off}"
@@ -13978,16 +13979,16 @@ class IndexAdvancedDeskEngine(DeskEngine):
             pooled.update(pooled_valid=bool(pooled.get('valid')),specialists=specialists,per_symbol=per_symbol,direction_model_id=dm.get('id'),holdout_start=holdout.isoformat(),
                 horizon_minutes=horizon*5,reward_r=reward,signature=signature,features=STOCK_HIST_SUCCESS_FEATURES,label_definition='Index target-before-stop on unseen direction-model holdout using continuous same-session 5-minute paths capped by configured square-off; specialist models shrink toward pooled evidence.',updated=now_ist().isoformat())
             any_valid=bool(pooled.get('pooled_valid') or any(v.get('valid') for v in specialists.values()));pooled['valid']=any_valid;pooled['status']='VALIDATED' if any_valid else 'LEARNING'
-            self.put('index_historical_setup_success_model_v41',pooled);self.hist_success_cache=pooled;self.hist_success_cache_at=time.monotonic()
+            self.put('index_historical_setup_success_model_v43',pooled);self.hist_success_cache=pooled;self.hist_success_cache_at=time.monotonic()
             self.event('INDEX_HIST_SUCCESS',f"{pooled['status']} samples={pooled.get('samples',0)} auc={pooled.get('auc')}")
             return pooled
         except Exception as e:
             self.event('ERROR','Index historical success training: '+str(e))
             if prior and prior.get('valid'):
                 kept=dict(prior);kept.update(last_training_error=str(e),last_training_error_at=now_ist().isoformat())
-                self.put('index_historical_setup_success_model_v41',kept);self.hist_success_cache=kept;self.hist_success_cache_at=time.monotonic();return kept
+                self.put('index_historical_setup_success_model_v43',kept);self.hist_success_cache=kept;self.hist_success_cache_at=time.monotonic();return kept
             m=dict(status='ERROR',valid=False,pooled_valid=False,samples=0,required=INDEX_HIST_SUCCESS_MIN_SAMPLES,error=str(e),updated=now_ist().isoformat())
-            self.put('index_historical_setup_success_model_v41',m);self.hist_success_cache=m;self.hist_success_cache_at=time.monotonic();return m
+            self.put('index_historical_setup_success_model_v43',m);self.hist_success_cache=m;self.hist_success_cache_at=time.monotonic();return m
         finally:self.hist_success_lock.release()
     def _live_priority_reason(self):
         try:
@@ -14019,7 +14020,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
         self.hist_success_thread=threading.Thread(target=lambda:self.train_historical_success_model(force=force),daemon=True,name='index-historical-success');self.hist_success_thread.start();return True
     def _record_shadow_candidate(self,s):
         if s.get('decision')!='READY' or not s.get('bar_ts') or not s.get('contract'):return
-        shadow=dict(s);shadow['strategy_version']=INDEX_AI_BUILD;shadow['qty']=max(1,int(s.get('qty') or s.get('lot') or 1))
+        shadow=dict(s);shadow['risk_config_at_entry']=dict(self.config());shadow['strategy_version']=INDEX_AI_BUILD;shadow['qty']=max(1,int(s.get('qty') or s.get('lot') or 1))
         key=f"{s['symbol']}|{s['bar_ts']}|{s['contract']}|{INDEX_AI_BUILD}"
         try:
             with self.db() as c:c.execute('''INSERT OR IGNORE INTO index_shadow_setups(id,ts,symbol,bar_ts,model_id,contract,exchange,entry,stop,target,qty,lot,tick,setup,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -14046,24 +14047,25 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 ts=_ai_ts_naive(raw.get('timestamp'));age=(now_ist()-ts).total_seconds() if ts else 999
                 st=quote_stats(raw);bid=float(st.get('bid') or 0)
                 if bid<=0 or age < -5 or age>60:continue
+                setup=json.loads(r['setup'] or '{}');trade_cfg=setup.get('risk_config_at_entry') or cfg
                 reason=None
                 if bid<=float(r['stop']):reason='Stop reached'
                 elif bid>=float(r['target']):reason='Target reached'
-                elif now_ist().strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
-                elif cfg.get('max_hold') is not None and (now_ist()-opened).total_seconds()>=float(cfg['max_hold'])*60:reason='Maximum holding time'
+                elif now_ist().strftime('%H:%M')>=trade_cfg['square_off']:reason='Intraday square-off'
+                elif trade_cfg.get('max_hold') is not None and (datetime.now(IST)-opened).total_seconds()>=float(trade_cfg['max_hold'])*60:reason='Maximum holding time'
                 else:
                     setup=json.loads(r['setup'] or '{}');sig=self.signals.get(r['symbol'],{})
-                    if sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction') and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
+                    if sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=trade_cfg['confidence'] and sig.get('direction') and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
                 if not reason:continue
-                tick=max(.01,float(r['tick'] or .05));exit_px=max(tick,math.floor((bid*(1-float(cfg['slippage_bps'])/10000))/tick)*tick);qty=int(r['qty'] or r['lot'] or 1)
-                pnl=(exit_px-float(r['entry']))*qty;fees=2*float(cfg['fee_per_order']);label=1 if pnl-fees>0 else 0
+                tick=max(.01,float(r['tick'] or .05));exit_px=max(tick,math.floor((bid*(1-float(trade_cfg['slippage_bps'])/10000))/tick)*tick);qty=int(r['qty'] or r['lot'] or 1)
+                pnl=(exit_px-float(r['entry']))*qty;fees=2*float(trade_cfg['fee_per_order']);label=1 if pnl-fees>0 else 0
                 with self.db() as c:c.execute("UPDATE index_shadow_setups SET status='CLOSED',exit_ts=?,exit_price=?,pnl=?,fees=?,label=?,reason=? WHERE id=?",
                     (now_ist().isoformat(),exit_px,pnl,fees,label,reason,r['id']))
             except Exception as e:self.event('ERROR','Shadow settle: '+str(e),r.get('symbol',''))
     def shadow_success_model(self,force=False):
         now=time.monotonic()
         if not force and self.shadow_success_cache is not None and now-self.shadow_success_cache_at<30:return self.shadow_success_cache
-        m=self.get('index_shadow_success_model_v41');self.shadow_success_cache=m;self.shadow_success_cache_at=now;return m
+        m=self.get('index_shadow_success_model_v43');self.shadow_success_cache=m;self.shadow_success_cache_at=now;return m
     def _fit_setup_rows(self,rows,min_samples,specialist_min,kind,last_key):
         records=[]
         for r in rows:
@@ -14073,6 +14075,8 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 x=self._success_vector(s)
                 if s.get('decision')=='READY' and len(x)==len(STOCK_SUCCESS_FEATURES) and all(math.isfinite(float(v)) for v in x):
                     opened=datetime.fromisoformat(str(r['ts']).replace('Z','+00:00'));closed=datetime.fromisoformat(str(r['exit_ts']).replace('Z','+00:00'))
+                    opened=opened.replace(tzinfo=IST) if opened.tzinfo is None else opened.astimezone(IST)
+                    closed=closed.replace(tzinfo=IST) if closed.tzinfo is None else closed.astimezone(IST)
                     start=opened.timestamp();end=closed.timestamp();planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1,int(s.get('qty') or 1)))
                     net=float(r.get('pnl') or 0)-float(r.get('fees') or 0);outcome_r=net/planned
                     records.append((start,end,x,int(r['label']),str(r['symbol']),outcome_r))
@@ -14089,7 +14093,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
             last=rows[-1]['exit_ts'] if rows else None;prior=self.shadow_success_model()
             if not force and prior and prior.get('last_sample_ts')==last:return prior
             m=self._fit_setup_rows(rows,INDEX_SHADOW_SUCCESS_MIN_SAMPLES,INDEX_SHADOW_SPECIALIST_MIN_SAMPLES,'Forward executable shadow-option outcomes',last)
-            self.put('index_shadow_success_model_v41',m);self.shadow_success_cache=m;self.shadow_success_cache_at=time.monotonic();self.event('INDEX_SHADOW_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
+            self.put('index_shadow_success_model_v43',m);self.shadow_success_cache=m;self.shadow_success_cache_at=time.monotonic();self.event('INDEX_SHADOW_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
         except Exception as e:
             self.event('ERROR','Index shadow-success training: '+str(e))
             if prior and prior.get('valid'):return prior
@@ -14098,7 +14102,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
     def live_success_model(self,force=False):
         now=time.monotonic()
         if not force and self.live_success_cache is not None and now-self.live_success_cache_at<30:return self.live_success_cache
-        m=self.get('index_live_option_success_model_v41');self.live_success_cache=m;self.live_success_cache_at=now;return m
+        m=self.get('index_live_option_success_model_v43');self.live_success_cache=m;self.live_success_cache_at=now;return m
     def train_live_success_model(self,force=False):
         if not self.live_success_lock.acquire(False):return self.live_success_model()
         prior=None
@@ -14108,7 +14112,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
             last=rows[-1]['exit_ts'] if rows else None;prior=self.live_success_model()
             if not force and prior and prior.get('last_sample_ts')==last:return prior
             m=self._fit_setup_rows(rows,INDEX_LIVE_SUCCESS_MIN_SAMPLES,INDEX_LIVE_SPECIALIST_MIN_SAMPLES,'Actual completed paper-option outcomes after estimated costs',last)
-            self.put('index_live_option_success_model_v41',m);self.live_success_cache=m;self.live_success_cache_at=time.monotonic();self.event('INDEX_LIVE_SUCCESS',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
+            self.put('index_live_option_success_model_v43',m);self.live_success_cache=m;self.live_success_cache_at=time.monotonic();self.event('INDEX_LIVE_SUCCESS',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}");return m
         except Exception as e:
             self.event('ERROR','Index paper-success training: '+str(e))
             if prior and prior.get('valid'):return prior
@@ -14171,6 +14175,14 @@ class IndexAdvancedDeskEngine(DeskEngine):
         # being entered under one stop/reward/cost regime and managed under another.
         if self.config().get('armed') or self.active():raise ValueError('Disarm Index AI and close/reconcile positions before changing Index AI risk settings')
         return super().save_config(body)
+    def block(self):
+        reason=super().block()
+        if reason:return reason
+        if self.config()['mode']=='live':
+            dm=self.model() or {}
+            if dm.get('auc') is None or float(dm['auc'])<INDEX_DIRECTION_MIN_AUC or float(dm.get('accuracy') or 0)<float(dm.get('baseline') or 0)-2:
+                return 'Live blocked: direction model validation gate not met; train model'
+        return None
     def _validated_success_layer_available(self):
         return any(bool(m and m.get('valid')) for m in (self.historical_success_model(),self.shadow_success_model(),self.live_success_model()))
     def inspect(self,symbol):
@@ -14183,7 +14195,22 @@ class IndexAdvancedDeskEngine(DeskEngine):
         if s.get('decision')!='READY' or not s.get('execution_quality_pass') or self.block() or self.get('close_requested'):return
         fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
         if fresh.get('decision')!='READY' or not fresh.get('execution_quality_pass') or self.get('close_requested'):return
-        return super().enter(fresh)
+        # Use the same lock order as scan/control (engine, then risk). A busy
+        # supervisor or scan defers this candidate; protective exits get priority.
+        if not self.lock.acquire(False):
+            self.signals[s['symbol']]=dict(fresh,decision='WAIT',reason='Index scan/control busy; entry deferred');return
+        try:
+            if not self.risk_lock.acquire(False):
+                self.signals[s['symbol']]=dict(fresh,decision='WAIT',reason='Position supervision busy; entry deferred');return
+            try:
+                if self.block() or self.get('close_requested'):return
+                quote,error=self.a.quote(fresh['exchange'],fresh['contract'])
+                if error or quote['ask']>fresh['entry'] or quote['ask_qty']<fresh['qty'] or quote.get('spread_pct') is None or not 0<=quote['spread_pct']<=self.config()['max_spread']:
+                    self.signals[s['symbol']]=dict(fresh,decision='WAIT',reason=error or 'Option price, spread or depth changed before submission');return
+                fresh['quote_ts']=quote.get('quote_ts')
+                return super().enter(fresh)
+            finally:self.risk_lock.release()
+        finally:self.lock.release()
     def _publish_execution_candidates(self,ranked):
         ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('execution_quality_pass')]
         with self.candidate_lock:
@@ -14263,8 +14290,8 @@ class IndexAdvancedDeskEngine(DeskEngine):
         dm=s.get('model') or {};direction_live_ready=bool(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
         success_live_ready=bool(valid)
         s.update(build=INDEX_AI_BUILD,scan=dict(self.scan_status),execution=dict(self.execution_status),historical_success_model=_index_public_model(hm),shadow_success_model=_index_public_model(sm),live_success_model=_index_public_model(lm),
-            success_selector_status=' + '.join(valid) if valid else 'DIRECTIONAL FALLBACK',shadow=self.shadow_stats(),live_model_validation_ready=bool(direction_live_ready and success_live_ready),
-            live_model_validation_reason='READY' if direction_live_ready and success_live_ready else ('Direction validation gate not met' if not direction_live_ready else 'No success layer validated'),
+            success_selector_status=' + '.join(valid) if valid else 'DIRECTIONAL FALLBACK',shadow=self.shadow_stats(),live_model_validation_ready=bool(direction_live_ready),
+            live_model_validation_reason=('READY · validated direction; success layers learning' if not success_live_ready else 'READY') if direction_live_ready else 'Train direction model: validation AUC/accuracy gate not met',
             quality_gate=dict(min_success=INDEX_EXEC_MIN_SUCCESS,min_expected_r=INDEX_EXEC_MIN_EXPECTED_R,fallback_confidence=INDEX_EXEC_FALLBACK_MIN_CONFIDENCE,min_direction_auc=INDEX_DIRECTION_MIN_AUC))
         return s
     def control(self,action,body):
@@ -14275,12 +14302,16 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 self.event('CONTROL',action)
             if action=='close' and self.a.connected():self.supervise()
             return cfg
-        cfg=self.config();target_mode=body.get('mode') if action=='mode' else cfg.get('mode')
-        if target_mode=='live' and action in ('mode','arm'):
-            dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
-            if not direction_ok:raise ValueError('Live Index AI requires a validated direction model meeting the configured AUC/accuracy gate')
-            if not self._validated_success_layer_available():raise ValueError('Live Index AI requires at least one validated success layer; manual paper-evidence override does not bypass model validation')
-        return super().control(action,body)
+        if not self.lock.acquire(False):raise ValueError('Index scan is busy; retry shortly. No control was applied.')
+        try:
+            cfg=self.config();target_mode=body.get('mode') if action=='mode' else cfg.get('mode')
+            if target_mode=='live' and action=='arm':
+                dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
+                if not direction_ok:raise ValueError('Live Index AI requires a validated direction model meeting the configured AUC/accuracy gate')
+                # A validated direction model can execute the existing high-confidence
+                # fallback while optional option-success layers collect observations.
+            with self.risk_lock:return super().control(action,body)
+        finally:self.lock.release()
 
 # Replace the base index desk before shared risk and worker startup. Flask routes
 # above resolve the global DESK at request time, so they automatically use V4.
@@ -14317,6 +14348,7 @@ class CASAdapter(DeskAdapter):
         self.stream_signatures={};self.stream_generation=0;self.seen_generation=0;self.wanted_tokens=set();self.token_keys={}
         self.last_subscription=0.;self.last_tick_mono=0.;self.order_dirty=False;self.exit_quotes={}
         self.last_connect_attempt=0.;self.stream_retry_needed=False;self.stream_error_code=None;self.stream_error_detail=''
+        self.instrument_errors={};self.prepare_requested=True;self.last_prepare=0.;self.accepted_ticks=0;self.rejected_ticks=0
     @contextmanager
     def db(self):
         c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'cas_options_ai.db'),timeout=10)
@@ -14331,12 +14363,15 @@ class CASAdapter(DeskAdapter):
     def load_contracts(self):
         today=now_ist().date()
         if self.contract_day==today:return
-        result={}
+        result={};errors={}
         for symbol in self.symbols:
-            ex,items=get_option_instruments_for_symbol(symbol)
-            result[symbol]=[dict(i,exchange=ex) for i in items
-                if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
-        self.contracts=result;self.contract_day=today
+            try:
+                ex,items=get_option_instruments_for_symbol(symbol)
+                result[symbol]=[dict(i,exchange=ex) for i in items if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
+                if not result[symbol]:errors[symbol]='No unexpired CE/PE contracts returned'
+            except Exception as e:errors[symbol]=self._safe_stream_error(e)
+        self.contracts=result;self.instrument_errors=errors
+        if not errors:self.contract_day=today
     def _invalidate_stream(self,ws,status):
         if ws is not self.stream:return
         with self.stream_lock:
@@ -14346,7 +14381,7 @@ class CASAdapter(DeskAdapter):
         if ws is not self.stream:return
         self._invalidate_stream(ws,'CONNECTED · warming fresh ticks')
         with self.stream_lock:
-            self.stream_connected=True;self.stream_retry_needed=False;self.stream_error_code=None;tokens=list(self.wanted_tokens)
+            self.stream_connected=True;self.stream_retry_needed=False;self.stream_error_code=None;self.stream_error_detail='';self.stream_status='CONNECTED · waiting for fresh quotes';tokens=list(self.wanted_tokens)
         if tokens:ws.subscribe(tokens);ws.set_mode(ws.MODE_FULL,tokens)
         self.wake.set()
     def _on_ticks(self,ws,ticks):
@@ -14361,7 +14396,8 @@ class CASAdapter(DeskAdapter):
                 ex=tick.get('exchange_timestamp')
                 # KiteTicker decodes exchange epochs with local datetime.fromtimestamp.
                 stamp=datetime.fromtimestamp(ex.timestamp(),timezone(timedelta(hours=5,minutes=30))).replace(tzinfo=None) if isinstance(ex,datetime) else _ai_ts_naive(ex)
-                if stamp is None:continue
+                if stamp is None:
+                    self.rejected_ticks+=1;continue
                 previous=self.stream_quotes.get(key)
                 if previous and stamp<_ai_ts_naive(previous['_exchange_ts']):continue
                 signature=(str(ex),tick.get('last_price'),str(tick.get('depth')),tick.get('volume_traded'))
@@ -14372,8 +14408,8 @@ class CASAdapter(DeskAdapter):
                 self.stream_quotes[key]=q
                 if len(self.stream_queue)>=4000:
                     self.stream_queue.clear();self.stream_generation+=1
-                self.stream_queue.append((key,q))
-            self.last_tick_mono=mono
+                self.stream_queue.append((key,q));self.accepted_ticks+=1;self.last_tick_mono=mono
+                self.stream_status='LIVE FEED · receiving quotes'
         self.wake.set()
     def _on_order(self,ws,data):
         if ws is self.stream:self.order_dirty=True;self.wake.set()
@@ -14427,7 +14463,7 @@ class CASAdapter(DeskAdapter):
         from kiteconnect import KiteTicker
         from twisted.internet import reactor
         if self.stream:
-            old=self.stream;self._invalidate_stream(old,'SESSION CHANGED');reactor.callFromThread(old.close)
+            old=self.stream;self.stream=None;reactor.callFromThread(old.stop_retry);reactor.callFromThread(old.close)
         self.stream=KiteTicker(API_KEY,token,reconnect=True,reconnect_max_tries=50,reconnect_max_delay=10)
         self.stream_token=token;ws=self.stream;self.stream_retry_needed=False;self.stream_status='CONNECTING'
         ws.on_connect=self._on_connect;ws.on_ticks=self._on_ticks;ws.on_order_update=self._on_order
@@ -14435,18 +14471,22 @@ class CASAdapter(DeskAdapter):
         ws.on_error=self._on_stream_error
         ws.on_reconnect=lambda w,n:self._invalidate_stream(w,'RECONNECTING')
         ws.on_noreconnect=self._on_stream_exhausted
-        ws.connect(threaded=True)
+        if reactor.running:reactor.callFromThread(lambda:ws.connect(threaded=True))
+        else:ws.connect(threaded=True)
     def update_subscriptions(self):
         if time.monotonic()-self.last_subscription<3:return
-        self.last_subscription=time.monotonic();self.load_contracts()
+        self.last_subscription=time.monotonic()
+        if time.monotonic()-self.last_prepare>=30 or self.prepare_requested:
+            self.prepare_requested=False;self.last_prepare=time.monotonic();self.load_contracts()
         mapping={}
         for symbol in self.symbols:
             token,err=resolve_token_for_symbol(symbol)
-            if err:raise ValueError(err)
+            if err:
+                self.instrument_errors[symbol]=str(err);continue
             mapping[int(token)]=INDEX_SYMBOLS[symbol]
         for items in self.contracts.values():
             for i in items:mapping[int(i['instrument_token'])]=i['exchange']+':'+i['tradingsymbol']
-        reverse={v:k for k,v in mapping.items()};wanted={reverse[INDEX_SYMBOLS[s]] for s in self.symbols}
+        reverse={v:k for k,v in mapping.items()};wanted={reverse[INDEX_SYMBOLS[s]] for s in self.symbols if INDEX_SYMBOLS[s] in reverse}
         with self.stream_lock:latest=dict(self.stream_quotes)
         for symbol in self.symbols:
             rows=self.contracts.get(symbol,[]);spot=latest.get(INDEX_SYMBOLS[symbol],{}).get('last_price')
@@ -14484,17 +14524,22 @@ class CASAdapter(DeskAdapter):
         for key,q in pending:
             self.quotes={key:q};self.engine.collect()
         self.quotes=snapshot
-        if not self.stream_connected:
-            # REST is only an exit fallback for owned options; never an entry feed.
-            keys=list(dict.fromkeys(p['exchange']+':'+p['contract'] for p in self.engine.active() if p['qty']>0))
-            if keys and time.monotonic()-self.last_batch>=1.05:
-                self.last_batch=time.monotonic();self.exit_quotes=kite.quote(keys)
-            self.quotes=dict(self.exit_quotes)
+        # REST fallback is restricted to owned exits and is never collected as a signal.
+        keys=[]
+        for p in self.engine.active():
+            if p['qty']<=0:continue
+            key=p['exchange']+':'+p['contract']
+            try:self.fresh(key)
+            except ValueError:keys.append(key)
+        if keys and time.monotonic()-self.last_batch>=1.05:
+            self.last_batch=time.monotonic();self.exit_quotes=kite.quote(list(dict.fromkeys(keys)))
+        for key in keys:
+            if key in self.exit_quotes:self.quotes[key]=self.exit_quotes[key]
     def feed_state(self):
         with self.stream_lock:
             return dict(connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
                 last_tick_age_seconds=round(time.monotonic()-self.last_tick_mono,2) if self.last_tick_mono else None,
-                source='KiteTicker FULL · event-driven',error_detail=getattr(self,'stream_error_detail',''),error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
+                accepted_ticks=self.accepted_ticks,rejected_ticks=self.rejected_ticks,instrument_errors=dict(self.instrument_errors),source='KiteTicker FULL · event-driven',error_detail=getattr(self,'stream_error_detail',''),error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
     def fresh(self,key):
         q=self.quotes.get(key)
         if not q:raise ValueError('Missing quote: '+key)
@@ -14529,7 +14574,12 @@ class CASAdapter(DeskAdapter):
 class CASEngine(DeskEngine):
     def __init__(self,adapter):
         self.ticks={};self.option_ticks={};self.confirm={};self.day=None;self.last_learn={};self.last_fit_count=0;self.last_reconcile=0.;self.last_verify=0.
+        self.runtime=dict(phase='STARTING',last_error=None,last_success=None,retry_at=None);self.retry_mono=0.
         super().__init__(adapter);adapter.engine=self
+        stored=self.get('config',{})
+        if 'cas_policy_version' not in stored:
+            stored.update(strategy='validated_model' if stored.get('mode')=='live' else 'momentum_rules',cas_policy_version=5,armed=False)
+            self.put('config',stored)
         # One-time migration of the old shipped profile. Keep custom risk amounts and
         # existing positions; their stored product remains MIS for correct exits.
         if self.get('fast_profile_version',0)<2:
@@ -14540,7 +14590,7 @@ class CASEngine(DeskEngine):
                 if cfg.get(key)==value:cfg[key]=CAS_DEFAULTS[key]
             cfg.update(armed=False,verified_date='');self.put('config',cfg)
             self.put('fast_profile_version',2);self.event('UPGRADE','Fast CAS profile installed; entries disarmed. New trades use NRML IOC limits.')
-    def config(self):return {**super().config(),**CAS_DEFAULTS,**self.get('config',{}),'max_hold':None}
+    def config(self):return {**super().config(),**CAS_DEFAULTS,'strategy':'momentum_rules',**self.get('config',{}),'max_hold':None}
     def init_db(self):
         super().init_db()
         with self.db() as c:
@@ -14606,10 +14656,15 @@ class CASEngine(DeskEngine):
             cfg.update(verified_date='',armed=False);self.put('config',cfg);self.confirm.clear();return cfg
     def block(self):
         cfg=self.config();t=now_ist()
-        if not self.a.stream_connected:return 'Streaming unavailable · new entries paused'
+        if not self.a.connected():return 'Kite token absent in this backend; reconnect using the header'
+        if not self.a.market_open():return 'Market closed · feed monitoring resumes during trading hours'
+        if self.get('halt'):return self.get('halt')
+        if not cfg['armed']:return cfg['mode'].upper()+' selected · DISARMED · strategy: '+cfg['strategy']
+        if not self.a.stream_connected:return 'Feed unavailable: '+self.a.stream_status+' · '+(self.a.stream_error_detail or 'Preparing/reconnecting; see readiness')
         if t.strftime('%H:%M')<cfg['entry_start'] or t.strftime('%H:%M')>=cfg['entry_end']:return 'Outside CAS entry window'
         if cfg['mode']=='live' and cfg.get('verified_date')!=t.date().isoformat():return 'Verify today’s exchange session and broker NRML cutoff in controls'
-        if cfg['mode']=='live' and not self.model():return 'Live requires a validated CAS model; collect paper observations first'
+        if self.runtime.get('last_error'):return 'CAS recovering: '+self.runtime['last_error']
+        if cfg['strategy']=='validated_model' and not self.model():return 'Validated-model strategy needs training; select Momentum rules to trade while learning'
         if DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed'):return 'Disarm other AI desks before CAS entries'
         count=self.rows("SELECT COUNT(*) n FROM desk_positions WHERE ts LIKE ? AND mode=?",(t.date().isoformat()+'%',cfg['mode']))[0]['n']
         if count>=cfg['max_trades']:return 'CAS daily entry-attempt limit reached'
@@ -14626,6 +14681,7 @@ class CASEngine(DeskEngine):
             self.ticks.clear();self.option_ticks.clear();self.confirm.clear();self.last_learn.clear();self.day=today
             with self.db() as c:c.execute('DELETE FROM cas_samples WHERE label IS NULL AND target<?',(_cas_epoch(now)-60,))
         for key in self.a.quotes:
+            if '_received_mono' not in self.a.quotes[key]:continue
             try:
                 raw,ts=self.a.fresh(key);stamp=_cas_epoch(ts)
                 if key in [INDEX_SYMBOLS[s] for s in self.a.symbols]:
@@ -14660,11 +14716,11 @@ class CASEngine(DeskEngine):
         if cfg['entry_start']<=now_ist().strftime('%H:%M')<cfg['entry_end'] and _cas_epoch(ts)-self.last_learn.get(symbol,0)>=5:
             with self.db() as c:c.execute('INSERT INTO cas_samples(symbol,ts,target,spot,features,profile) VALUES(?,?,?,?,?,2)',(symbol,_cas_epoch(ts),_cas_epoch(ts)+5,s['spot'],json.dumps(features)))
             self.last_learn[symbol]=_cas_epoch(ts)
-        model=self.model();p=None
+        model=self.model() if cfg['strategy']=='validated_model' else None;p=None
         if model:
             z=np.clip((np.array(features)-model['mu'])/model['sd'],-6,6)
             p=float(1/(1+np.exp(-np.clip(z@np.array(model['w'])+model['bias'],-30,30))))
-        s.update(p_up=p,confidence=max(p,1-p) if p is not None else 0,learning='Validated CAS model' if model else 'Rule-based paper bootstrap')
+        s.update(p_up=p,confidence=max(p,1-p) if p is not None else 0,learning='Validated CAS model' if model else 'Momentum rules · no ML probability')
         if not cfg['spike_bps']<=abs(move)<=cfg['max_spike_bps']:
             self.confirm.pop(symbol,None);s['reason']='Move below trigger or above chase limit';return s
         prev=self.confirm.get(symbol,{})
@@ -14679,7 +14735,7 @@ class CASEngine(DeskEngine):
         for ins in rows:
             if str(ins['expiry'])!=expiry or ins['instrument_type']!=typ:continue
             key=ins['exchange']+':'+ins['tradingsymbol']
-            if key not in self.a.quotes:continue
+            if key not in self.a.quotes or '_received_mono' not in self.a.quotes[key]:continue
             q,err=self.a.quote(ins['exchange'],ins['tradingsymbol'])
             if err or q['spread_pct']>cfg['max_spread']:continue
             ticks=self.option_ticks.get(key,[])
@@ -14698,9 +14754,11 @@ class CASEngine(DeskEngine):
         return s
     def enter(self,s):
         if s.get('decision')!='READY':return
-        if _cas_epoch(now_ist())-s.get('signal_epoch',0)>self.config()['max_quote_age']:return
+        if _cas_epoch(now_ist())-s.get('signal_epoch',0)>self.config()['max_quote_age']:
+            s.update(decision='WAIT',reason='Signal expired before entry');return
         q,err=self.a.quote(s['exchange'],s['contract'])
-        if err or q['ask_qty']<s['qty'] or q['ask']>s['entry']:return
+        if err or q['ask_qty']<s['qty'] or q['ask']>s['entry']:
+            s.update(decision='WAIT',reason=err or 'Option price/depth changed before entry');return
         super().enter(s)
     def reconcile(self):
         if not self.a.order_dirty and time.monotonic()-self.last_reconcile<1:return
@@ -14750,57 +14808,88 @@ class CASEngine(DeskEngine):
         except Exception as e:self.training=dict(status='ERROR',progress=0,error=str(e))
         finally:self.train_lock.release()
     def control(self,action,body):
-        with self.lock:
+        if not self.lock.acquire(False):raise ValueError('CAS cycle is busy; retry shortly. No control was applied.')
+        try:
             cfg=self.config()
-            if action=='verify-session':
-                if body.get('ack') is not True:raise ValueError('Confirm today is a trading day and the configured NFO/BFO/NRML cutoffs are supported')
-                cfg.update(verified_date=now_ist().date().isoformat(),armed=False);self.put('config',cfg);return cfg
-            if action=='arm' and cfg['mode']=='paper':
+            if action=='strategy':
+                if cfg['armed'] or self.active():raise ValueError('Disarm and close CAS positions before changing strategy')
+                strategy=body.get('strategy')
+                if strategy not in ('momentum_rules','validated_model'):raise ValueError('Unknown CAS strategy')
+                if strategy=='momentum_rules' and body.get('ack') is not True:raise ValueError('Acknowledge rule-based execution without a validated ML prediction')
+                cfg.update(strategy=strategy,armed=False)
+            elif action=='mode':
+                if body.get('mode') not in ('paper','live'):raise ValueError('Select Paper or Live')
+                if self.active():raise ValueError('Close/reconcile CAS positions before switching mode')
+                if body['mode']=='live' and body.get('ack') is not True:raise ValueError('Acknowledge Live mode')
+                cfg.update(mode=body['mode'],armed=False)
+            elif action=='verify-session':
+                if body.get('ack') is not True:raise ValueError('Confirm today’s trading session and broker cutoffs')
+                cfg.update(verified_date=now_ist().date().isoformat(),armed=False)
+            elif action=='arm':
+                if not self.a.connected():raise ValueError('Kite token is absent in this backend process. Reconnect using the header on this same page.')
+                if self.get('halt') or self.get('close_requested'):raise ValueError(self.get('halt') or 'Close request is pending')
+                if cfg['strategy']=='validated_model' and not self.model():raise ValueError('Train CAS model or explicitly select Momentum rules')
+                if self.a.legacy_open() or DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed'):raise ValueError('Disarm other desks and close/reconcile their positions first')
                 if hasattr(self,'shared_risk'):
-                    blocked=self.shared_risk.snapshot('paper')['entry_block']
-                    if blocked:raise ValueError(blocked)
-                if not self.a.connected():raise ValueError('Connect Kite first')
-                if self.get('halt') or self.get('close_requested'):raise ValueError('Resolve halt/close request first')
-                cfg['armed']=True;self.put('config',cfg);return cfg
-            if action in ('arm','mode') and (cfg['mode']=='live' or body.get('mode')=='live'):
-                if cfg.get('verified_date')!=now_ist().date().isoformat():raise ValueError('Verify today’s session and broker cutoffs first')
-                if not self.model():raise ValueError('Live requires a validated CAS-specific model')
-            if action in ('clear-halt','close'):self.last_verify=0.;self.last_reconcile=0.
-            return super().control(action,body)
+                    reason=self.shared_risk.snapshot(cfg['mode'])['entry_block']
+                    if reason:raise ValueError(reason)
+                if cfg['mode']=='live':
+                    if body.get('ack') is not True:raise ValueError('Explicit live arming acknowledgement required')
+                    if cfg.get('verified_date')!=now_ist().date().isoformat():raise ValueError('Verify today’s session and broker cutoff first')
+                    if not (cfg.get('live_override') is True or self.evidence()['ready']):raise ValueError('Paper-performance gate has not passed; review evidence or explicitly enable its override')
+                cfg['armed']=True;self.a.prepare_requested=True;self.a.wake.set()
+            elif action in ('disarm','close'):
+                cfg['armed']=False
+                if action=='close':self.put('close_requested',True)
+                self.a.wake.set()
+            else:return super().control(action,body)
+            self.put('config',cfg);self.event('CONTROL',action+' · '+cfg['mode']+' · '+cfg['strategy']);return cfg
+        finally:self.lock.release()
     def cycle(self):
         if not self.lock.acquire(False):return
         try:
-            self.last_cycle=now_ist().isoformat()
+            self.last_cycle=datetime.now(IST).isoformat();cfg=self.config();hhmm=now_ist().strftime('%H:%M')
             self.a.ensure_stream()
-            if not self.a.connected():return
-            self.reconcile();self.verify_positions();cfg=self.config();hhmm=now_ist().strftime('%H:%M')
+            if not self.a.connected():
+                self.runtime['phase']='LOGIN REQUIRED';return
+            self.reconcile();self.verify_positions()
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
-            if not self.a.market_open():return
-            warm_start=(datetime.strptime(cfg['entry_start'],'%H:%M')-timedelta(minutes=2)).strftime('%H:%M')
-            if hhmm<warm_start and not self.active():return
-            if hhmm>=cfg['square_off'] and not self.active():return
-            try:self.a.batch()
-            except Exception:
-                self.a.quotes={};self.confirm.clear();raise
-            self.collect()
+            if not self.a.market_open():
+                self.runtime['phase']='MARKET CLOSED';return
+            if time.monotonic()<self.retry_mono:
+                self.runtime['phase']='RETRY WAIT';return
+            self.runtime['phase']='PREPARING FEED'
+            self.a.batch();self.collect()
+            self.runtime.update(last_error=None,exit_error=None,retry_at=None,last_success=datetime.now(IST).isoformat())
+            # Feed failures never erase unresolved broker halts. Old transient latches
+            # can recover only after successful reconciliation and fresh feed work.
             halt=self.get('halt') or ''
             if halt.startswith('CAS cycle error:') and not self.mismatches and not self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
-                self.put('halt',None);cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-                self.event('RECOVERED','CAS cycle recovered; entries remain disarmed. Review readiness and arm again.')
-            # Manage owned positions before scanning for another entry.
+                self.put('halt',None);cfg['armed']=False;self.put('config',cfg)
+                self.event('RECOVERED','Legacy cycle error recovered; entries remain disarmed')
             self.manage(bool(self.get('close_requested')))
             for symbol in self.a.symbols:
                 try:self.signals[symbol]=self.inspect(symbol)
                 except Exception as e:
-                    self.confirm.pop(symbol,None);self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e))
+                    self.confirm.pop(symbol,None)
+                    self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=self.a.instrument_errors.get(symbol) or self.a._safe_stream_error(e))
             self.manage(bool(self.get('close_requested')))
-            for s in sorted(self.signals.values(),key=lambda s:abs(s.get('move_bps',0)),reverse=True):self.enter(s)
-            if self.get('close_requested') and not self.active():self.put('close_requested',False)
+            for sig in sorted(self.signals.values(),key=lambda x:abs(x.get('move_bps',0)),reverse=True):self.enter(sig)
+            self.runtime['phase']=('SCANNING' if cfg['entry_start']<=hhmm<cfg['entry_end'] else 'MONITORING · OUTSIDE ENTRY WINDOW')
             count=self.rows('SELECT COUNT(*) n FROM cas_samples WHERE label IS NOT NULL AND profile=2')[0]['n']
             if count>=300 and count-self.last_fit_count>=100 and not cfg['armed'] and not self.active() and not self.train_lock.locked():
                 self.last_fit_count=count;self.train()
         except Exception as e:
-            self.put('halt','CAS cycle error: '+str(e));self.event('ERROR',str(e))
+            detail=self.a._safe_stream_error(e);previous=self.runtime.get('last_error')
+            self.retry_mono=time.monotonic()+2
+            self.runtime.update(phase='RECOVERING',last_error=type(e).__name__+': '+detail,retry_at=(datetime.now(IST)+timedelta(seconds=2)).isoformat())
+            if previous!=self.runtime['last_error']:self.event('ERROR',self.runtime['last_error'])
+            # Supervision must still attempt exits if subscription/scanning failed.
+            try:
+                keys=list(dict.fromkeys(p['exchange']+':'+p['contract'] for p in self.active() if p['qty']>0))
+                if keys and self.a.market_open():
+                    self.a.quotes=kite.quote(keys);self.manage(bool(self.get('close_requested')))
+            except Exception as exit_error:self.runtime['exit_error']=self.a._safe_stream_error(exit_error)
         finally:self.lock.release()
     def live_readiness(self,s):
         cfg=s['config'];stream=s['stream'];today=now_ist().date().isoformat();hhmm=now_ist().strftime('%H:%M')
@@ -14813,22 +14902,22 @@ class CASEngine(DeskEngine):
         add('Instrument subscriptions',stream['subscriptions']>len(self.a.symbols),str(stream['subscriptions'])+' subscriptions. Use Prepare CAS feed; option subscriptions populate after index ticks arrive.')
         age=stream.get('last_tick_age_seconds')
         add('Recent stream arrivals',age is not None and age<=cfg['max_quote_age'],'Arrival age: '+(str(age)+' seconds' if age is not None else 'not received')+'. Every entry also requires fresh exchange timestamps and an executable option book.')
-        add('Validated CAS model',bool(s.get('model')),str(s['observations'].get('settled') or 0)+' settled CAS observations available. At least 300 and a passing validation result are required; use paper collection then Train CAS model.')
+        add('Execution strategy',cfg['strategy']=='momentum_rules' or bool(s.get('model')),('Momentum rules: no ML probability used; learning is separate.' if cfg['strategy']=='momentum_rules' else str(s['observations'].get('settled') or 0)+' settled observations; need 300 and passing validation. Train model or explicitly select Momentum rules.'))
         add('Today’s session verification',cfg.get('verified_date')==today,'Verify today’s exchange hours and broker NRML cutoff after saving settings.')
         add('Paper performance gate',cfg.get('live_override') is True or s['evidence']['ready'],'The existing paper-evidence override bypasses only this gate, never model validation or risk controls.')
         others=DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed') or bool(self.a.legacy_open())
         add('Other desks idle',not others,'Disarm the other AI desks and reconcile/close their positions before CAS entries.')
         shared=self.shared_risk.snapshot('live')['entry_block'] if hasattr(self,'shared_risk') else None
         add('Shared live risk',not shared,shared or 'Shared live risk checks clear.')
-        add('CAS error state',not s.get('halt'),s.get('halt') or 'No retained CAS halt.')
-        add('Live mode selected',cfg['mode']=='live','Select Live after the required model, performance and verification gates pass.')
+        add('CAS error state',not s.get('halt') and not self.runtime.get('last_error'),s.get('halt') or self.runtime.get('last_error') or 'No CAS error.')
+        add('Live mode selected',cfg['mode']=='live','Live can be selected while disarmed. Arming checks the chosen strategy, evidence and session verification.')
         add('Entries armed',cfg['armed'],'Arm live execution explicitly. One-attempt mode disarms after its entry request.')
         qualified=any(x.get('decision')=='READY' for x in s['signals'])
         add('Qualifying signal',qualified,'At least one fresh signal must meet spike, confirmation, option momentum, spread, depth and risk checks; see each index’s signal reason.')
         return checks
     def state(self):
         s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=2')[0]
-        s.update(version='CAS-4',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
+        s.update(version='CAS-5',runtime=dict(self.runtime),feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Saved IST entry and exit windows apply. Verify each exchange and broker cutoff.')
         s['live_readiness']=self.live_readiness(s)
         return s
     def start(self):
@@ -14996,7 +15085,6 @@ def shared_ai_risk():
 
 @app.route('/api/cas-ai/state')
 def cas_ai_state():
-    if not require_session():return jsonify(error='Connect Kite first'),401
     return jsonify(CAS_DESK.state())
 
 @app.route('/api/cas-ai/config',methods=['POST'])
@@ -15014,11 +15102,8 @@ def cas_ai_control(action):
     if not isinstance(body,dict):return jsonify(error='JSON object required'),400
     try:
         if action=='prepare':
-            if not CAS_DESK.lock.acquire(False):return jsonify(error='CAS supervision is running; retry Prepare shortly'),409
-            try:
-                CAS_DESK.a.ensure_stream();CAS_DESK.a.last_subscription=0.;CAS_DESK.a.update_subscriptions()
-                return jsonify(ok=True,message='Subscriptions prepared. Readiness shows remaining live prerequisites; entries were not armed.')
-            finally:CAS_DESK.lock.release()
+            CAS_DESK.a.prepare_requested=True;CAS_DESK.a.last_subscription=0.;CAS_DESK.a.wake.set()
+            return jsonify(ok=True,message='Feed preparation queued; progress and errors appear in CAS status.'),202
         if action=='reconnect':
             CAS_DESK.a.request_stream_reconnect();return jsonify(ok=True,message='Reconnect requested; trading gates still apply')
         if action=='scan':
