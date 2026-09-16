@@ -1817,11 +1817,9 @@ def callback():
     SESSION["access_token"] = data["access_token"]
     SESSION["logged_in_at"] = now_ist().isoformat()
     kite.set_access_token(SESSION["access_token"])
-    # Do not wait for the next 30-second scanner tick: wake Stock AI immediately so
-    # full-F&O discovery and resumable deep-history collection begin after login.
-    try:
-        if 'STOCK_DESK' in globals():threading.Thread(target=STOCK_DESK.cycle,daemon=True,name='stock-ai-login-wake').start()
-    except Exception:pass
+    # Return the Kite callback immediately. Heavy Stock AI discovery, archive work and
+    # model fitting are owned by background workers; never start a full scan from this
+    # HTTP request because a single reverse-proxy worker can otherwise hit a 504.
     return redirect("/")
 
 
@@ -6035,12 +6033,17 @@ def _build_desk_engine_class():
                     if len(rows)<300:continue
                     arr={k:np.array([float(r[k] or 0) for r in rows]) for k in ('close','high','low','volume')}
                     arr['ts']=[str(r['ts']) for r in rows]
+                    # Use the full eligible historical sequence, as in the original Stock AI logic.
+                    # We keep every third 5-minute bar to avoid near-identical overlapping labels,
+                    # but there is NO fixed per-stock sample cap. All available qualifying history
+                    # (up to the existing 20,000-bar archive read) can contribute to training.
                     for i in range(200,len(rows)-3,3):
                         t=dt(rows[i]['ts']);end=dt(rows[i+3]['ts'])
                         if (end-t).total_seconds()!=900:continue
                         f=self.a.features(rows,i,arr);x=[f[k] for k in FEATURES]
                         if all(finite(v) for v in x):samples.append((t.timestamp(),end.timestamp(),x,int(rows[i+3]['close']>rows[i]['close'])))
                     self.training=dict(status='BUILDING FEATURES',progress=10+20*(j+1)/max(1,len(self.a.symbols)),symbol=symbol)
+                    time.sleep(.005)  # cooperative yield: keep Flask/nginx requests responsive
                 samples.sort(key=lambda r:r[0])
                 if len(samples)<300:raise ValueError('Need at least 300 labelled observations from five-minute history. Connect Kite and sync the archive.')
                 split=int(len(samples)*.8);cut=samples[split][0]
@@ -6816,6 +6819,7 @@ STOCK_HIST_SUCCESS_MAX_SAMPLES = 24000
 STOCK_HIST_SUCCESS_PER_SYMBOL = 160
 STOCK_HIST_SUCCESS_RETRY_SECONDS = 900
 STOCK_HIST_MIN_ARCHIVE_COVERAGE = max(0.50, min(1.0, float(os.environ.get('STOCK_HIST_MIN_ARCHIVE_COVERAGE', '0.70'))))
+STOCK_HISTORY_COVERAGE_CACHE_SECONDS = max(30, int(os.environ.get('STOCK_HISTORY_COVERAGE_CACHE_SECONDS', '90')))
 STOCK_DIRECTION_FEATURES = ['ret_1','ret_3','ret_5','ret_10','ret_20','ema_gap_9_20',
     'ema_gap_20_50','rsi14','volatility_10','range_20','volume_ratio','trend_score','momentum_score','time_sin','time_cos']
 STOCK_PATTERN_FEATURES = [
@@ -7036,6 +7040,7 @@ class StockDeskEngine(DeskEngine):
         self.hist_success_thread=None;self.hist_success_last_attempt=0.0
         self.history_backfill_thread=None;self.history_backfill_last_attempt=0.0;self.history_backfill_universe=()
         self.history_backfill_status=dict(status='WAITING FOR KITE',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=0,rows_added=0)
+        self.history_coverage_cache=[];self.history_coverage_cache_at=0.0;self.history_coverage_cache_symbols=()
     def _full_mode(self):
         return self.get('stock_universe_info',{}).get('mode')!='Custom watchlist'
     def select_universe(self,body=None):
@@ -7240,6 +7245,17 @@ class StockDeskEngine(DeskEngine):
         except Exception:
             return 'Stock AI live-state check unavailable'
         return None
+    def _live_history_coverage(self,force=False):
+        symbols=tuple(self.a.symbols or ())
+        now=time.monotonic()
+        if (not force and self.history_coverage_cache and self.history_coverage_cache_symbols==symbols and
+                now-self.history_coverage_cache_at<STOCK_HISTORY_COVERAGE_CACHE_SECONDS):
+            return [dict(r) for r in self.history_coverage_cache]
+        rows=self.a.history_coverage(symbols)
+        self.history_coverage_cache=[dict(r) for r in rows]
+        self.history_coverage_cache_symbols=symbols;self.history_coverage_cache_at=now
+        return [dict(r) for r in rows]
+
     def _history_archive_coverage(self):
         hb=self.history_backfill_status or {}
         total=max(0,int(hb.get('total') or len(self.a.symbols) or 0))
@@ -7313,16 +7329,21 @@ class StockDeskEngine(DeskEngine):
             # rows-added telemetry bug, so a completed archive can be much richer than the
             # coverage snapshot stored in the last direction model even when added_total==0.
             # Compare the live archive to that snapshot and rebuild whenever they differ.
-            live_cov=self.a.history_coverage(universe)
+            live_cov=self._live_history_coverage(force=True)
             live_usable={r['symbol'] for r in live_cov if int(r.get('bars') or 0)>=300}
             prior_model=self.model() or {}
             prior_cov={str(r.get('symbol')) for r in (prior_model.get('coverage') or []) if int(r.get('bars') or 0)>=300}
             coverage_changed=(live_usable!=prior_cov)
             should_retrain=bool(added_total>0 or (complete and coverage_changed) or not prior_model)
+            retrain_started=False
             if should_retrain and not self.train_lock.locked() and not self._live_execution_priority_reason():
-                self.event('HISTORY_BACKFILL','Live archive coverage changed; rebuilding direction model')
-                self.train()
-            if self._history_archive_coverage()['ready'] and not self._live_execution_priority_reason():self._ensure_historical_success_training(force=True)
+                self.event('HISTORY_BACKFILL','Live archive coverage changed; rebuilding direction model in background')
+                retrain_started=bool(self.train())
+            # Never fit the historical-success model concurrently with a full direction
+            # retrain. The next scanner cycle will start it against the newly saved model.
+            if (not retrain_started and self._history_archive_coverage()['ready'] and
+                    not self._live_execution_priority_reason()):
+                self._ensure_historical_success_training(force=True)
         self.history_backfill_thread=threading.Thread(target=job,daemon=True,name='stock-ai-deep-history')
         self.history_backfill_thread.start();return True
     def _historical_success_signature(self):
@@ -7802,14 +7823,14 @@ class StockDeskEngine(DeskEngine):
         s=super().state()
         s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.train_success_model();hm=self.historical_success_model()
+        sm=self.success_model();hm=self.historical_success_model()
         if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage()
         hist_ready=bool(hm and hm.get('valid') and archive.get('ready') and hm.get('brier') is not None and float(hm.get('brier'))<=STOCK_HIST_SUCCESS_MAX_BRIER)
         live_ready=bool(sm and sm.get('valid') and sm.get('brier') is not None and float(sm.get('brier'))<=STOCK_SUCCESS_MAX_BRIER)
         selector_status='BLENDED' if hist_ready and live_ready else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if live_ready else 'DIRECTIONAL FALLBACK'
-        live_history_coverage=self.a.history_coverage(self.a.symbols)
+        live_history_coverage=self._live_history_coverage()
         s.update(build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
