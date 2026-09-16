@@ -6912,6 +6912,19 @@ class StockDeskAdapter(DeskAdapter):
             r=c.execute("SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM ai_hist_candles WHERE symbol=? AND interval=?",(symbol,AI_HIST_INTERVAL)).fetchone()
             return dict(n=int(r['n'] or 0),first_ts=r['first_ts'],last_ts=r['last_ts']) if r else dict(n=0,first_ts=None,last_ts=None)
         finally:c.close()
+    def history_coverage(self,symbols=None):
+        """Return LIVE archive coverage from ai_hist_candles, not a model-training snapshot.
+
+        One grouped SQLite query keeps the Learning Lab accurate without doing one COUNT
+        query per F&O stock on every state refresh.
+        """
+        wanted=list(symbols or self.symbols or [])
+        c=ai_db()
+        try:
+            rows=c.execute("SELECT symbol,COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM ai_hist_candles WHERE interval=? GROUP BY symbol",(AI_HIST_INTERVAL,)).fetchall()
+            by={str(r['symbol']):dict(symbol=str(r['symbol']),bars=int(r['n'] or 0),first=r['first_ts'],last=r['last_ts']) for r in rows}
+            return [by.get(str(sym),dict(symbol=str(sym),bars=0,first=None,last=None)) for sym in wanted]
+        finally:c.close()
     def backfill_history(self,symbol,target_days=STOCK_HISTORY_BACKFILL_DAYS,progress=None,pause_check=None):
         """Resumably fill older 5-minute stock history, newest missing chunk first.
 
@@ -7296,7 +7309,19 @@ class StockDeskEngine(DeskEngine):
                 max_available_symbols=max_available_names[:20],coverage_ratio=round(archive_complete/max(1,total),4),
                 finished=now_ist().isoformat(),errors=errors[:8],pause_reason=None)
             self.event('HISTORY_BACKFILL',f"{self.history_backfill_status['status']} · {archive_complete}/{total} resolved ({full_year} full-year + {max_available} max-available) · added {added_total} rows")
-            if added_total>0 and not self.train_lock.locked() and not self._live_execution_priority_reason():self.train()
+            # Retrain not only when this particular pass INSERTed rows. Older builds had a
+            # rows-added telemetry bug, so a completed archive can be much richer than the
+            # coverage snapshot stored in the last direction model even when added_total==0.
+            # Compare the live archive to that snapshot and rebuild whenever they differ.
+            live_cov=self.a.history_coverage(universe)
+            live_usable={r['symbol'] for r in live_cov if int(r.get('bars') or 0)>=300}
+            prior_model=self.model() or {}
+            prior_cov={str(r.get('symbol')) for r in (prior_model.get('coverage') or []) if int(r.get('bars') or 0)>=300}
+            coverage_changed=(live_usable!=prior_cov)
+            should_retrain=bool(added_total>0 or (complete and coverage_changed) or not prior_model)
+            if should_retrain and not self.train_lock.locked() and not self._live_execution_priority_reason():
+                self.event('HISTORY_BACKFILL','Live archive coverage changed; rebuilding direction model')
+                self.train()
             if self._history_archive_coverage()['ready'] and not self._live_execution_priority_reason():self._ensure_historical_success_training(force=True)
         self.history_backfill_thread=threading.Thread(target=job,daemon=True,name='stock-ai-deep-history')
         self.history_backfill_thread.start();return True
@@ -7784,10 +7809,11 @@ class StockDeskEngine(DeskEngine):
         hist_ready=bool(hm and hm.get('valid') and archive.get('ready') and hm.get('brier') is not None and float(hm.get('brier'))<=STOCK_HIST_SUCCESS_MAX_BRIER)
         live_ready=bool(sm and sm.get('valid') and sm.get('brier') is not None and float(sm.get('brier'))<=STOCK_SUCCESS_MAX_BRIER)
         selector_status='BLENDED' if hist_ready and live_ready else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if live_ready else 'DIRECTIONAL FALLBACK'
+        live_history_coverage=self.a.history_coverage(self.a.symbols)
         s.update(build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
-            historical_archive=archive,history_backfill=dict(self.history_backfill_status))
+            historical_archive=archive,history_backfill=dict(self.history_backfill_status),history_coverage=live_history_coverage)
         return s
     def control(self,action,body):
         # Disarming is immediate even while a broad scan is running.
