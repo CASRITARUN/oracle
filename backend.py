@@ -31,6 +31,202 @@ IMPORTANT
   try/except around kite.place_order() in place_basket_orders() for the fallback behavior.
 """
 
+# Kronos integration and installer are embedded: no extra application .py files required.
+# Heavy ML imports execute only in the isolated worker, before any broker/app imports.
+import sys as _kronos_sys
+import types as _kronos_types
+
+_INDEX_KRONOS_SOURCE = r'''"""Kronos inference isolated from Flask and broker/risk threads; no broker imports."""
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import queue
+import subprocess
+import sys
+import threading
+import time
+
+
+def blend_signal(rows, forecast):
+    """A bounded direction score, NOT a calibrated probability."""
+    close = [float(r['close']) for r in rows]
+    tr = [max(float(b['high'])-float(b['low']), abs(float(b['high'])-a['close']),
+              abs(float(b['low'])-a['close'])) for a,b in zip(rows[-21:-1], rows[-20:])]
+    atr = sum(tr[:-1])/max(1,len(tr)-1)
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError('No measurable index movement')
+    move = float(forecast['close'][-1])-close[-1]
+    if not math.isfinite(move):
+        raise ValueError('Non-finite forecast')
+    def ema(values,n):
+        v=values[0]
+        for x in values[1:]:v += 2/(n+1)*(x-v)
+        return v
+    trend=(ema(close[-60:],9)-ema(close[-60:],21))/atr
+    momentum=(close[-1]-close[-4])/atr
+    technical=0.6*math.tanh(trend)+0.4*math.tanh(momentum/2)
+    kronos=math.tanh(move/atr)
+    score=.6*kronos+.4*technical
+    path=sum(abs(b-a) for a,b in zip(close[-7:-1],close[-6:]))
+    efficiency=abs(close[-1]-close[-7])/max(path,1e-9)
+    reason=None
+    if tr[-1]>3*atr:reason='Exceptional last-bar move; wait for stabilisation'
+    elif efficiency<.25:reason='Choppy index: insufficient directional progress'
+    elif abs(move)<.25*atr:reason='Kronos forecast too small relative to recent volatility'
+    elif kronos*technical<=0:reason='Kronos and short-term price action disagree'
+    return dict(p_up=.5+.5*score,confidence=.5+.5*abs(score),direction='UP' if score>0 else 'DOWN',
+                regime='TREND' if reason is None else 'WAIT',forecast_move=move,atr=atr,
+                kronos_score=.5+.5*kronos,technical_score=.5+.5*technical,
+                efficiency=efficiency,signal_wait=reason,
+                factors=[dict(name='Kronos forecast',impact=.6*kronos),dict(name='Price action',impact=.4*technical)])
+
+
+class KronosService:
+    def __init__(self):
+        self.lock=threading.Lock();self.jobs=queue.Queue(maxsize=12)
+        self.results={};self.pending=set();self.retry={};self.process=None
+        self.status='IDLE';self.error=None
+        threading.Thread(target=self._loop,daemon=True,name='kronos-inference-dispatch').start()
+
+    def request(self,symbol,rows):
+        payload=json.dumps(rows,sort_keys=True,default=str,allow_nan=False)
+        key=hashlib.sha256(payload.encode()).hexdigest()
+        with self.lock:
+            result=self.results.get(symbol)
+            if result and result['key']==key:return dict(result)
+            if symbol not in self.pending and time.monotonic()>=self.retry.get(symbol,0):
+                try:self.jobs.put_nowait((symbol,key,rows));self.pending.add(symbol)
+                except queue.Full:pass
+            return dict(status='WAIT',reason=self.error or 'Kronos inference queued / running')
+
+    def snapshot(self):
+        with self.lock:return dict(status=self.status,error=self.error,pending=len(self.pending),
+                                   model='NeoQuasar/Kronos-small',context=256,horizon_minutes=15)
+
+    def _start(self):
+        self.process=subprocess.Popen([sys.executable,'-u',str(Path(__file__).resolve()),'--kronos-worker'],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,bufsize=1)
+        answers=queue.Queue();proc=self.process
+        def reader():
+            try:
+                for line in proc.stdout:
+                    try:answers.put(json.loads(line))
+                    except ValueError:continue
+            finally:answers.put({'error':'Kronos worker exited; check installation'})
+        threading.Thread(target=reader,daemon=True,name='kronos-output').start()
+        self.answers=answers
+
+    def _loop(self):
+        while True:
+            symbol,key,rows=self.jobs.get()
+            try:
+                with self.lock:self.status='RUNNING'
+                if self.process is None or self.process.poll() is not None:self._start()
+                self.process.stdin.write(json.dumps(dict(rows=rows),default=str,allow_nan=False)+'\n');self.process.stdin.flush()
+                result=self.answers.get(timeout=180)
+                if result.get('error'):raise RuntimeError(result['error'])
+                values=result.get('close',[])
+                if len(values)!=3 or not all(math.isfinite(float(v)) and float(v)>0 for v in values):
+                    raise ValueError('Kronos returned invalid forecast prices')
+                with self.lock:
+                    self.results[symbol]=dict(result,key=key,status='READY',completed=time.time())
+                    self.status='READY';self.error=None;self.retry.pop(symbol,None)
+            except Exception as e:
+                if self.process is not None:
+                    self.process.kill();self.process.wait();self.process=None
+                with self.lock:
+                    self.status='UNAVAILABLE';self.error=str(e) or 'Kronos inference timed out'
+                    self.retry[symbol]=time.monotonic()+60
+            finally:
+                with self.lock:self.pending.discard(symbol)
+                self.jobs.task_done()
+
+
+def worker():
+    # Heavy dependencies are imported only in this isolated subprocess.
+    import contextlib
+    with contextlib.redirect_stdout(sys.stderr):
+        source=Path(os.environ.get('KRONOS_SOURCE',str(Path(__file__).resolve().parent/'vendor'/'Kronos')))
+        if not (source/'model'/'__init__.py').exists():
+            raise RuntimeError('Kronos not installed. Run: python backend.py --setup-kronos')
+        import pandas as pd
+        import torch
+        sys.path.insert(0,str(source))
+        from model import Kronos, KronosTokenizer, KronosPredictor
+        torch.set_num_threads(max(1,min(4,os.cpu_count() or 1)))
+        device=os.environ.get('KRONOS_DEVICE','cpu')
+        tokenizer=KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base')
+        model=Kronos.from_pretrained('NeoQuasar/Kronos-small')
+        model.eval();tokenizer.eval()
+        predictor=KronosPredictor(model,tokenizer,device=device,max_context=512)
+    for line in sys.stdin:
+        try:
+            req=json.loads(line);df=pd.DataFrame(req['rows'])
+            ts=pd.to_datetime(df['ts']);future=pd.Series(pd.date_range(ts.iloc[-1]+pd.Timedelta(minutes=5),periods=3,freq='5min'))
+            # Cash index volume may be zero. Do not manufacture traded volume or amount.
+            with contextlib.redirect_stdout(sys.stderr),torch.inference_mode():
+                torch.manual_seed(int(hashlib.sha256(line.encode()).hexdigest()[:8],16))
+                out=predictor.predict(df=df[['open','high','low','close','volume']],x_timestamp=ts,
+                    y_timestamp=future,pred_len=3,T=1.0,top_p=.9,sample_count=3)
+            print(json.dumps(dict(close=[float(x) for x in out['close']],timestamps=[str(t) for t in future]),allow_nan=False),flush=True)
+        except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
+
+if __name__=='__main__':
+    try:worker()
+    except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
+'''
+_KRONOS_SETUP_SOURCE = r'''"""Run once with the SAME Python environment as backend.py. Never accesses Kite."""
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main():
+    if sys.version_info<(3,10):raise SystemExit('Kronos needs Python 3.10 or newer.')
+    root=Path(__file__).resolve().parent
+    source=root/'vendor'/'Kronos'
+    source.parent.mkdir(exist_ok=True)
+    if not source.exists():
+        subprocess.run(['git','clone','--depth','1','https://github.com/shiyu-coder/Kronos.git',str(source)],check=True)
+    if not (source/'model'/'__init__.py').exists():raise SystemExit('vendor/Kronos exists but does not contain the official model package.')
+    subprocess.run([sys.executable,'-m','pip','install','-r',str(source/'requirements.txt')],check=True)
+    commit=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
+    (root/'kronos_source_revision.txt').write_text(commit+'\n')
+    code="from model import Kronos,KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small'); print('Kronos weights cached successfully')"
+    subprocess.run([sys.executable,'-c',code],cwd=source,check=True)
+    print('Setup complete. Start backend.py using this Python environment. Entries remain disarmed.')
+
+if __name__=='__main__':
+    try:main()
+    except (OSError,subprocess.CalledProcessError) as e:raise SystemExit('Kronos setup failed: '+str(e))
+'''
+
+def _load_embedded_kronos():
+    module = _kronos_types.ModuleType('index_kronos')
+    module.__file__ = __file__
+    _kronos_sys.modules['index_kronos'] = module
+    exec(compile(_INDEX_KRONOS_SOURCE, __file__ + ':kronos', 'exec'), module.__dict__)
+    return module
+
+_embedded_kronos = _load_embedded_kronos()
+if __name__ == '__main__' and '--setup-kronos' in _kronos_sys.argv:
+    _setup_scope = {'__name__': 'kronos_setup', '__file__': __file__}
+    exec(compile(_KRONOS_SETUP_SOURCE, __file__ + ':setup', 'exec'), _setup_scope)
+    try:
+        _setup_scope['main']()
+    except Exception as exc:
+        raise SystemExit('Kronos setup failed: ' + str(exc))
+    raise SystemExit(0)
+if __name__ == '__main__' and '--kronos-worker' in _kronos_sys.argv:
+    try:
+        _embedded_kronos.worker()
+    except Exception as exc:
+        import json as _worker_json
+        print(_worker_json.dumps({'error': type(exc).__name__ + ': ' + str(exc)}), flush=True)
+    raise SystemExit(0)
+
 import os
 import math
 import time
@@ -595,7 +791,7 @@ class BrokerRequestGate:
         bucket='write' if method.upper() not in ('GET','HEAD') else 'quote' if route.startswith('market.quote') else 'history' if 'historical' in route else 'read'
         # Only share short-lived read-only account snapshots; never share order mutations.
         cacheable=method.upper()=='GET' and route in ('orders','trades','portfolio.positions')
-        key=(route,json.dumps([args,kwargs],sort_keys=True,default=str))
+        key=(getattr(getattr(fn,'__self__',None),'access_token',None),route,json.dumps([args,kwargs],sort_keys=True,default=str))
         deadline=time.monotonic()+1.5
         while True:
             with self.lock:
@@ -1912,9 +2108,10 @@ def callback():
     if not request_token:
         return "Login failed: no request_token received.", 400
     data = kite.generate_session(request_token, api_secret=API_SECRET)
-    SESSION["access_token"] = data["access_token"]
-    SESSION["logged_in_at"] = now_ist().isoformat()
-    kite.set_access_token(SESSION["access_token"])
+    with _SESSION_CHECK_LOCK:
+        SESSION["access_token"] = data["access_token"]
+        SESSION["logged_in_at"] = now_ist().isoformat()
+        kite.set_access_token(SESSION["access_token"])
     # Do not wait for the next 30-second scanner tick: wake Stock AI immediately so
     # full-F&O discovery and resumable deep-history collection begin after login.
     try:
@@ -1923,26 +2120,38 @@ def callback():
     return redirect("/")
 
 
+_SESSION_CHECK_LOCK = threading.Lock()
+_SESSION_CHECK = {'token': None, 'at': 0., 'valid': False}
+
+def validate_kite_session(force=False):
+    """Only a profile check of the current token may expire the shared session.
+    A segment/endpoint error is not, by itself, evidence that login is invalid.
+    Dedicated client prevents in-flight checks from changing the trading client.
+    """
+    with _SESSION_CHECK_LOCK:
+        token=SESSION.get('access_token')
+        if not token:return dict(logged_in=False,logged_in_at=None)
+        if not force and _SESSION_CHECK['token']==token and time.monotonic()-_SESSION_CHECK['at']<30:
+            return dict(logged_in=True,logged_in_at=SESSION.get('logged_in_at'))
+        try:
+            client=KiteConnect(api_key=API_KEY,access_token=token,timeout=8)
+            client.profile()
+        except TokenException:
+            if SESSION.get('access_token')==token:
+                SESSION.update(access_token=None,logged_in_at=None)
+                _SESSION_CHECK.update(token=None,at=0.,valid=False)
+                return dict(logged_in=False,logged_in_at=None,session_expired=True)
+            return dict(logged_in=bool(SESSION.get('access_token')),logged_in_at=SESSION.get('logged_in_at'))
+        except Exception:
+            return dict(logged_in=True,logged_in_at=SESSION.get('logged_in_at'),
+                        warning='Broker session verification temporarily unavailable')
+        if SESSION.get('access_token')==token:
+            _SESSION_CHECK.update(token=token,at=time.monotonic(),valid=True)
+        return dict(logged_in=bool(SESSION.get('access_token')),logged_in_at=SESSION.get('logged_in_at'))
+
 @app.route("/api/session-status")
 def session_status():
-    """Actively validates the token (not just checks it's present) so a stale/expired token
-    can't keep showing 'Connected' after it's no longer valid — this is the fix for the tool
-    showing 'connected' even when Zerodha has actually invalidated the session."""
-    if not SESSION["access_token"]:
-        return jsonify({"logged_in": False, "logged_in_at": None})
-    try:
-        kite.set_access_token(SESSION["access_token"])
-        kite.profile()  # cheap call just to confirm the token still actually works
-        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"]})
-    except TokenException:
-        SESSION["access_token"] = None
-        SESSION["logged_in_at"] = None
-        return jsonify({"logged_in": False, "logged_in_at": None, "session_expired": True})
-    except Exception:
-        # network hiccup or similar — don't log the user out for a transient error,
-        # just report what we last knew
-        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"],
-                         "warning": "Could not verify token freshness right now (network issue?)."})
+    return jsonify(validate_kite_session())
 
 
 def require_session():
@@ -1956,23 +2165,22 @@ def require_session():
 def logout():
     """Clears the stored session so the dashboard stops using this token — does NOT invalidate
     the token on Zerodha's side (Kite has no logout API), it just makes this app forget it."""
-    SESSION["access_token"] = None
-    SESSION["logged_in_at"] = None
+    with _SESSION_CHECK_LOCK:
+        SESSION["access_token"] = None
+        SESSION["logged_in_at"] = None
     logger.info("User logged out — session cleared.")
     return jsonify({"ok": True})
 
 
 @app.errorhandler(TokenException)
 def handle_token_exception(e):
-    """Catches an expired/invalid token from ANY route (whichever endpoint happened to hit
-    Zerodha with a stale token), clears the stored session, and tells the frontend to show the
-    login button again — instead of a generic 500 error or a UI that silently keeps showing
-    'Connected' while every data call quietly fails."""
-    SESSION["access_token"] = None
-    SESSION["logged_in_at"] = None
-    logger.warning("TokenException caught — clearing session and asking frontend to reconnect.")
-    return jsonify({"error": "session_expired", "session_expired": True,
-                     "message": "Your Zerodha session has expired. Please reconnect."}), 401
+    status=validate_kite_session(force=True)
+    if status.get('session_expired') or not status.get('logged_in'):
+        return jsonify(dict(error='session_expired',session_expired=True,
+                            message='Kite session expired. Please reconnect.')),401
+    logger.warning('Broker endpoint authentication failed; profile did not confirm session expiry')
+    return jsonify(dict(error='broker_endpoint_access',session_expired=False,
+                        message='Broker request denied. Check MCX segment access / API permissions; login retained.')),503
 
 
 @app.errorhandler(Exception)
@@ -9131,7 +9339,7 @@ def _get_recent_index_bars(symbol, n):
     snapshot cache."""
     c = ai_db()
     rows = c.execute(
-        "SELECT ts,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
+        "SELECT ts,open,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
         (symbol, AI_HIST_INTERVAL, int(n))).fetchall()
     c.close()
     return list(reversed(rows))
@@ -12635,7 +12843,7 @@ def _build_desk_engine_class():
                         if blocked:raise ValueError(blocked)
                     if not self.a.connected():raise ValueError('Connect Kite first')
                     if self.get('halt'):raise ValueError(self.get('halt'))
-                    if not self.model():raise ValueError('Train a model first')
+                    if not self.model() and not getattr(self,'direction_engine_ready',lambda:False)():raise ValueError('Direction engine not ready; check model / Kronos status')
                     if cfg['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live evidence or manual override / acknowledgement missing')
                     if self.a.legacy_open():raise ValueError('Legacy positions must be reconciled and closed first')
                     cfg['armed']=True
@@ -13845,7 +14053,13 @@ def commodity_regime(rows,direction,tick,now=None):
     prior=tail[-14:-2];level=max(r['high'] for r in prior) if sign==1 else min(r['low'] for r in prior)
     breakout=all(sign*(r['close']-level)>tick for r in tail[-2:]) and rv>=1.3
     aligned=sign*net>0 and sign*(close[-1]-close[-13])>0
-    if not aligned:return dict(result,status='CONFLICT',reason='No entry: 30/60-minute movement disagrees with ML direction')
+    result.update(momentum_30=net,momentum_60=close[-1]-close[-13],model_direction=direction)
+    # A confirmed short-term reversal need not wait for the full hour to turn.
+    reversal_level=max(r['high'] for r in tail[-6:-2]) if sign==1 else min(r['low'] for r in tail[-6:-2])
+    reversal_breakout=all(sign*(r['close']-reversal_level)>tick for r in tail[-2:])
+    reversal=not aligned and reversal_breakout and sign*net>0 and rv>=1.5 and efficiency>=.45
+    if reversal:return dict(result,status='REVERSAL',reason='Two-close breakout confirms reversal despite lagging 60-minute trend',ready=True)
+    if not aligned:return dict(result,status='CONFLICT',reason=f'Waiting for confirmation: ML {direction}, 30m {net:+.2f}, 60m {close[-1]-close[-13]:+.2f}; no confirmed reversal')
     if not breakout and efficiency<COMMODITY_POLICY['min_efficiency']:return dict(result,status='CHOPPY',reason='No entry: back-and-forth movement without directional progress')
     return dict(result,status='BREAKOUT' if breakout else 'TREND',reason='Futures activity and direction qualify',ready=True)
 
@@ -14977,7 +15191,7 @@ def commodity_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-hierarchical-success-v4.1-audited-20260914'
+INDEX_AI_BUILD = 'index-kronos-price-action-v5-20260917'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -15491,7 +15705,137 @@ class IndexAdvancedDeskEngine(DeskEngine):
 
 # Replace the base index desk before shared risk and worker startup. Flask routes
 # above resolve the global DESK at request time, so they automatically use V4.
-DESK = IndexAdvancedDeskEngine(DeskAdapter())
+class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
+    """Forecast + price action; retains the existing durable execution/risk ledger."""
+    def __init__(self,adapter):
+        super().__init__(adapter)
+        from index_kronos import KronosService
+        self.kronos=KronosService()
+        if self.get('direction_build')!=INDEX_AI_BUILD:
+            cfg=self.config();cfg.update(armed=False,live_override=False)
+            # Retain execution mode for any existing positions; never rewrite broker holdings.
+            self.put('config',cfg);self.put('direction_build',INDEX_AI_BUILD)
+            self.event('STRATEGY_UPGRADE','Kronos direction installed; entries disarmed; prior override reset')
+
+    def direction_engine_ready(self):
+        now=now_ist()
+        return any(s.get('kronos_ready') and _ai_ts_naive(s.get('bar_ts')) is not None
+                   and 0<=(now-_ai_ts_naive(s['bar_ts'])).total_seconds()<=600 for s in self.signals.values())
+
+    def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=10):
+        from index_kronos import blend_signal
+        now=now_ist()
+        if refresh:self.a.refresh(symbol)
+        rows=[]
+        for row in self.a.bars(symbol,256):
+            ts=_ai_ts_naive(row.get('ts'))
+            if ts is None or ts+timedelta(minutes=5)>now:continue
+            vals={k:float(row.get(k) or 0) for k in ('open','high','low','close','volume')}
+            if not all(math.isfinite(v) for v in vals.values()) or min(vals[k] for k in ('open','high','low','close'))<=0 or vals['volume']<0:
+                return dict(symbol=symbol,decision='WAIT',reason='Invalid OHLCV history; refresh history')
+            if not vals['low']<=min(vals['open'],vals['close'])<=max(vals['open'],vals['close'])<=vals['high']:
+                return dict(symbol=symbol,decision='WAIT',reason='Inconsistent OHLC history')
+            rows.append(dict(vals,ts=ts.isoformat()))
+        s=dict(symbol=symbol,ts=now.isoformat(),decision='WAIT',reason='Need 64 completed OHLC candles',
+               chart=[dict(ts=r['ts'],close=r['close']) for r in rows[-60:]],strategy_version=INDEX_AI_BUILD)
+        if len(rows)<64:return s
+        stamps=[_ai_ts_naive(r['ts']) for r in rows]
+        if any(b<=a or (a.date()==b.date() and (b-a).total_seconds()!=300) for a,b in zip(stamps,stamps[1:])):
+            s['reason']='Index history contains duplicates or intraday gaps';return s
+        age=(now-stamps[-1]).total_seconds()/60
+        s.update(spot=rows[-1]['close'],bar_ts=rows[-1]['ts'],bar_age=round(age,1))
+        if not self.a.market_open():s['reason']='Market closed';return s
+        if age<5 or age>min(10,max_bar_age):s['reason']='Stale completed index candle';return s
+        if len([t for t in stamps[-13:] if t.date()==now.date()])<13:
+            s['reason']='Session warm-up: need 13 completed five-minute candles';return s
+        if (stamps[-1]+timedelta(minutes=15)).strftime('%H:%M')>='15:30':
+            s['reason']='Forecast would cross session close';return s
+        forecast=self.kronos.request(symbol,rows)
+        if forecast.get('status')!='READY':s['reason']=forecast.get('reason','Kronos unavailable');return s
+        if time.time()-forecast['completed']>600:s['reason']='Kronos forecast expired';return s
+        s.update(blend_signal(rows,forecast),kronos_ready=True,model_id=INDEX_AI_BUILD,
+                 forecast=forecast['close'],forecast_timestamps=forecast['timestamps'],
+                 score_kind='Uncalibrated directional score; not probability',selection_basis='60% Kronos + 40% price action')
+        if s['signal_wait']:s['reason']=s['signal_wait'];return s
+        if s['confidence']<self.config()['confidence']:s['reason']='Blended direction score below configured threshold';return s
+        s.update(decision='CANDIDATE',reason='Forecast and price action agree; checking CE/PE liquidity')
+        return s
+
+    def inspect(self,symbol):
+        s=DeskEngine.inspect(self,symbol)
+        if s.get('decision')=='READY':
+            # A conservative first-order option move scenario, not a profit forecast.
+            costs=float(s['ask'])-float(s['bid'])+2*self.config()['fee_per_order']/max(1,s['qty'])+s['entry']*2*self.config()['slippage_bps']/10000
+            move=abs(s.get('option_delta',0)*s.get('forecast_move',0))
+            s.update(option_move_scenario=move,estimated_roundtrip_cost=costs)
+            if move<=1.5*costs:s.update(decision='WAIT',reason='Forecast-derived option move too small for spread and estimated costs')
+        s['execution_quality_pass']=s.get('decision')=='READY'
+        s['execution_quality_reason']=s.get('reason')
+        s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        return s
+
+    def enter(self,s):
+        if s.get('decision')!='READY' or self.block():return
+        fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
+        if fresh.get('decision')=='READY':return DeskEngine.enter(self,fresh)
+
+    def block(self):
+        reason=DeskEngine.block(self)
+        if reason:return reason
+        if not self.direction_engine_ready():return 'Kronos has no fresh forecast; entries paused'
+        return None
+
+    def supervise(self):
+        # Do not allow a cached signal to trigger reversal exits after it has aged.
+        now=now_ist()
+        for symbol,s in list(self.signals.items()):
+            ts=_ai_ts_naive(s.get('bar_ts'))
+            if ts is None or (now-ts).total_seconds()>600:
+                self.signals[symbol]=dict(s,confidence=0,bar_age=999,kronos_ready=False)
+        return super().supervise()
+
+    def cycle(self):
+        if not self.lock.acquire(False):return
+        try:
+            self.last_cycle=now_ist().isoformat()
+            if not self.a.connected():return
+            self.supervise()
+            self.scan_status=dict(status='SCANNING',phase='Kronos + price action + option costs',total=len(self.a.symbols),completed=0)
+            for i,symbol in enumerate(self.a.symbols):
+                try:self.signals[symbol]=self.inspect(symbol)
+                except Exception as e:self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e))
+                self.scan_status['completed']=i+1
+            ranked=sorted(self.signals.values(),key=lambda s:s.get('rank_score',0),reverse=True)
+            self._publish_execution_candidates(ranked)
+            self.scan_status.update(status='COMPLETE',ready=sum(s.get('decision')=='READY' for s in ranked),finished=now_ist().isoformat())
+            if self.get('close_requested') and not self.active():self.put('close_requested',False)
+        finally:self.lock.release()
+
+    def _ensure_historical_success_training(self,force=False):return False
+    def train(self,*args,**kwargs):
+        # Pretrained Kronos is loaded by its worker, never trained on the UI thread.
+        threading.Thread(target=self.cycle,daemon=True,name='kronos-refresh').start()
+        return True
+
+    def state(self):
+        s=DeskEngine.state(self)
+        s['signals'].sort(key=lambda x:x.get('rank_score',0),reverse=True)
+        for i,row in enumerate(s['signals'],1):row['rank']=i
+        s.update(build=INDEX_AI_BUILD,kronos=self.kronos.snapshot(),direction_engine_ready=self.direction_engine_ready(),
+                 scan=dict(self.scan_status),execution=dict(self.execution_status),
+                 live_model_validation_ready=self.direction_engine_ready(),
+                 live_model_validation_reason='Fresh Kronos forecast required',success_selector_status='KRONOS + PRICE ACTION',
+                 quality_gate={},shadow={})
+        return s
+
+    def control(self,action,body):
+        if action in ('disarm','close'):return IndexAdvancedDeskEngine.control(self,action,body)
+        if action=='arm' and not self.direction_engine_ready():raise ValueError('Kronos not ready: install dependencies, sync OHLC history, and wait for a fresh forecast')
+        # Explicit manual override bypasses paper evidence only; data, risk and broker checks remain.
+        return DeskEngine.control(self,action,body)
+
+DESK = IndexKronosDeskEngine(DeskAdapter())
+
 
 
 # ===========================================================================
