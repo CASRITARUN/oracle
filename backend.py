@@ -12448,29 +12448,47 @@ def _build_desk_engine_class():
                     self.put('halt','Broker reconciliation: '+str(e))
                     with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
             # A remaining uncertainty blocks entries, while verified positions are managed.
+        def clear_position_halt(self):
+            # Clear only this reconciliation block, never daily/risk/order stops.
+            halt=self.get('halt') or ''
+            if not halt.startswith(('Broker/local position mismatch','CAS broker/product quantity mismatch')):return
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):return
+            cfg=self.config();cfg['armed']=False;self.put('config',cfg)
+            self.put('halt',None)
+            self.event('RECOVERY','Broker quantities now match the local ledger. Entries remain disarmed; re-arm when ready.')
         def verify_positions(self):
             live=[p for p in self.active() if p['mode']=='live']
-            if not live:self.mismatches=set();return
-            actual={}
-            try:holdings=self.a.holdings()
-            except Exception as e:
-                if type(e).__name__=='BrokerDeferred':return
+            if not live:
+                self.mismatches=set();self.clear_position_halt();return
+            try:
+                holdings=self.a.holdings()
+                if not isinstance(holdings,list):raise ValueError('Invalid broker position snapshot')
+                actual={}
+                for p in holdings:
+                    key=(p.get('exchange'),p.get('tradingsymbol'),p.get('product'))
+                    actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
+            except Exception:
+                # A deferred or failed read is not evidence of matching quantities.
                 self.mismatches={p['id'] for p in live}
                 raise
-            self.mismatches=set()
-            for p in holdings:
-                if p.get('product')=='MIS':
-                    key=(p.get('exchange'),p.get('tradingsymbol'))
-                    actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
             expected={}
             for p in live:
-                key=(p['exchange'],p['contract']);expected[key]=expected.get(key,0)+p['qty']
+                key=(p['exchange'],p['contract'],p.get('product') or 'MIS')
+                expected[key]=expected.get(key,0)+p['qty']
+            previous=set(self.mismatches);self.mismatches=set();details=[]
             for key,qty in expected.items():
-                if actual.get(key,0)!=qty:
-                    self.mismatches.update(p['id'] for p in live if (p['exchange'],p['contract'])==key)
+                broker_qty=actual.get(key,0)
+                affected=[p for p in live if (p['exchange'],p['contract'],p.get('product') or 'MIS')==key]
+                if broker_qty!=qty:
+                    reason=f"{key[0]}:{key[1]} {key[2]}: local {qty}, broker {broker_qty}; automated exit suspended"
+                    details.append(reason)
+                    for p in affected:
+                        self.mismatches.add(p['id']);self.health[p['id']]={'reason':reason}
+            for pid in previous-self.mismatches:
+                if 'quantity' in str(self.health.get(pid,{}).get('reason','')).lower() or 'automated exit suspended' in str(self.health.get(pid,{}).get('reason','')):self.health.pop(pid,None)
             if self.mismatches:
-                self.put('halt','Broker/local position mismatch · reconcile in Kite before continuing')
-                for pid in self.mismatches:self.health[pid]={'reason':'Broker quantity mismatch; automated exit suspended'}
+                self.put('halt','Broker/local position mismatch · '+'; '.join(details)+' · check Kite Orders/Trades/Positions, then recheck')
+            else:self.clear_position_halt()
 
         def enter(self,s):
             cfg=self.config()
@@ -12629,6 +12647,7 @@ def _build_desk_engine_class():
                             if o['broker_id']:self.a.cancel(o['broker_id'])
                     if self.a.connected() and self.a.market_open():self.manage(close_all=True)
                 elif action=='clear-halt':
+                    self.reconcile()
                     if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):raise ValueError('Broker orders still unresolved')
                     self.verify_positions()
                     if self.mismatches:raise ValueError('Broker positions still differ from the desk ledger')
@@ -14559,23 +14578,7 @@ class CASEngine(DeskEngine):
     def verify_positions(self):
         if time.monotonic()-self.last_verify<1:return
         self.last_verify=time.monotonic()
-        live=[p for p in self.active() if p['mode']=='live']
-        if not live:self.mismatches=set();return
-        try:book=self.a.holdings()
-        except Exception as e:
-            if type(e).__name__=='BrokerDeferred':return
-            self.mismatches={p['id'] for p in live};raise
-        self.mismatches=set();actual={};expected={}
-        for p in book:
-            key=(p.get('exchange'),p.get('tradingsymbol'),p.get('product'))
-            actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
-        for p in live:
-            key=(p['exchange'],p['contract'],p['product']);expected[key]=expected.get(key,0)+p['qty']
-        for p in live:
-            key=(p['exchange'],p['contract'],p['product'])
-            if actual.get(key,0)!=expected[key]:
-                self.mismatches.add(p['id']);self.health[p['id']]={'reason':'Broker/product quantity mismatch; exit suspended'}
-        if self.mismatches:self.put('halt','CAS broker/product quantity mismatch; reconcile in Kite')
+        return super().verify_positions()
     def save_config(self,body):
         with self.lock:
             if self.config()['armed'] or self.active():raise ValueError('Disarm and close positions before changing CAS settings')
