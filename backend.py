@@ -51,37 +51,63 @@ from datetime import datetime
 
 
 def blend_signal(rows, forecast):
-    """A bounded direction score, NOT a calibrated probability."""
-    close = [float(r['close']) for r in rows]
-    tr = [max(float(b['high'])-float(b['low']), abs(float(b['high'])-a['close']),
-              abs(float(b['low'])-a['close'])) for a,b in zip(rows[-21:-1], rows[-20:])]
-    atr = sum(tr[:-1])/max(1,len(tr)-1)
-    if not math.isfinite(atr) or atr <= 0:
-        raise ValueError('No measurable index movement')
-    move = float(forecast['close'][-1])-close[-1]
-    if not math.isfinite(move):
-        raise ValueError('Non-finite forecast')
+    """Blend Kronos and price action with soft disagreement and hysteresis-friendly diagnostics.
+
+    This remains a directional score, NOT a calibrated probability.  V7 deliberately
+    avoids treating every model disagreement as a hard WAIT: a setup may qualify when
+    one component is materially dominant and the combined edge is still strong.  Very
+    weak forecasts, shock bars and genuinely directionless price action still wait.
+    """
+    close=[float(r['close']) for r in rows]
+    tr=[max(float(b['high'])-float(b['low']),abs(float(b['high'])-a['close']),
+            abs(float(b['low'])-a['close'])) for a,b in zip(rows[-21:-1],rows[-20:])]
+    # Exclude the latest bar from the baseline ATR so a single shock does not immediately
+    # inflate the denominator and erase an otherwise useful forecast.
+    atr=sum(tr[:-1])/max(1,len(tr)-1)
+    if not math.isfinite(atr) or atr<=0:raise ValueError('No measurable index movement')
+    predicted=[float(x) for x in (forecast.get('close') or [])]
+    if len(predicted)!=3 or not all(math.isfinite(x) for x in predicted):raise ValueError('Non-finite forecast')
+    # Weight the whole 15-minute path rather than only its last point.  This is less
+    # brittle when the third forecast point mean-reverts slightly after a directional move.
+    path_moves=[x-close[-1] for x in predicted]
+    move=.20*path_moves[0]+.30*path_moves[1]+.50*path_moves[2]
     def ema(values,n):
         v=values[0]
-        for x in values[1:]:v += 2/(n+1)*(x-v)
+        for x in values[1:]:v+=2/(n+1)*(x-v)
         return v
     trend=(ema(close[-60:],9)-ema(close[-60:],21))/atr
     momentum=(close[-1]-close[-4])/atr
-    technical=0.6*math.tanh(trend)+0.4*math.tanh(momentum/2)
+    micro=(close[-1]-close[-2])/atr
+    technical=.50*math.tanh(trend)+.35*math.tanh(momentum/1.75)+.15*math.tanh(micro)
     kronos=math.tanh(move/atr)
-    score=.6*kronos+.4*technical
+    score=.58*kronos+.42*technical
     path=sum(abs(b-a) for a,b in zip(close[-7:-1],close[-6:]))
     efficiency=abs(close[-1]-close[-7])/max(path,1e-9)
-    reason=None
-    if tr[-1]>3*atr:reason='Exceptional last-bar move; wait for stabilisation'
-    elif efficiency<.25:reason='Choppy index: insufficient directional progress'
-    elif abs(move)<.25*atr:reason='Kronos forecast too small relative to recent volatility'
-    elif kronos*technical<=0:reason='Kronos and short-term price action disagree'
+    forecast_move_atr=abs(move)/atr
+    agree=(kronos==0 or technical==0 or kronos*technical>0)
+    dominant=max(abs(kronos),abs(technical));opposing=min(abs(kronos),abs(technical))
+    soft_disagreement=(not agree and dominant>=.26 and dominant>=1.75*max(.04,opposing) and abs(score)>=.13)
+    if agree:agreement='AGREE'
+    elif soft_disagreement:agreement='DOMINANT_KRONOS' if abs(kronos)>=abs(technical) else 'DOMINANT_PRICE_ACTION'
+    else:agreement='CONFLICT'
+    # Trend-efficient tapes can act on a somewhat smaller forecast; choppy tapes need a
+    # larger projected move.  A strong technical impulse may carry a modest Kronos move,
+    # but only when the blended score remains meaningful.
+    min_move_atr=.12 if efficiency>=.48 and abs(technical)>=.20 else .16
+    reason=None;note=None
+    if tr[-1]>3.25*atr and abs(score)<.45:reason='Exceptional last-bar move; wait for stabilisation'
+    elif efficiency<.18 and abs(score)<.34:reason='Choppy index: directional edge is not persistent enough'
+    elif forecast_move_atr<min_move_atr and abs(technical)<.32:reason='Forecast edge too small after volatility scaling'
+    elif not agree and not soft_disagreement:reason='Kronos / price-action conflict without a dominant edge'
+    elif soft_disagreement:note='Mild model disagreement accepted because one directional component is dominant'
+    else:note='Kronos and price action are directionally aligned'
     return dict(p_up=.5+.5*score,confidence=.5+.5*abs(score),direction='UP' if score>0 else 'DOWN',
                 regime='TREND' if reason is None else 'WAIT',forecast_move=move,atr=atr,
+                forecast_move_atr=forecast_move_atr,min_forecast_atr=min_move_atr,
                 kronos_score=.5+.5*kronos,technical_score=.5+.5*technical,
-                efficiency=efficiency,signal_wait=reason,
-                factors=[dict(name='Kronos forecast',impact=.6*kronos),dict(name='Price action',impact=.4*technical)])
+                efficiency=efficiency,agreement=agreement,signal_margin=abs(score),
+                signal_wait=reason,signal_note=note,
+                factors=[dict(name='Kronos forecast',impact=.58*kronos),dict(name='Price action',impact=.42*technical)])
 
 
 class KronosService:
@@ -12863,6 +12889,9 @@ def _build_desk_engine_class():
                 elif datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
                 elif cfg.get('max_hold') is not None and (datetime.now(IST)-dt(p['ts'])).total_seconds()>=cfg['max_hold']*60:reason='Maximum holding time'
                 elif self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
+                elif hasattr(self,'reversal_exit_reason'):
+                    try:reason=self.reversal_exit_reason(p,setup,sig,bid,q)
+                    except Exception as exc:self.record_trade(p['id'],'REVERSAL_FILTER_UNAVAILABLE',dict(error=str(exc)))
                 elif sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
                 if reason is None and hasattr(self,'additional_exit_reason'):
                     try:reason=self.additional_exit_reason(p,q)
@@ -13027,7 +13056,8 @@ def _build_desk_engine_class():
                 'Maximum holding time':'The holding-time setting triggered the exit. A timed exit can close either a profit or a loss.',
                 'Intraday square-off':'The configured square-off time triggered the exit; this was not necessarily a stop or target.',
                 'Manual close all':'A manual close-all request triggered the exit.',
-                'Direction reversed':'The monitored direction signal changed enough to meet the reversal-exit rule.',
+                'Direction reversed':'Legacy reversal rule.',
+                'Confirmed direction reversal':'A materially stronger opposite signal persisted on a new completed candle under the V7 reversal filter.',
                 'Partial profit at planned R':'The engine requested a partial profit exit; remaining quantity is recorded separately.'}
             why=interpretations.get(recorded_reason,recorded_reason)
             changed=' '.join(x for x in explanations if x.startswith(('Largest recorded','A monitored direction')))
@@ -15314,7 +15344,7 @@ def commodity_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-kronos-price-action-v6-20260918'
+INDEX_AI_BUILD = 'index-kronos-hysteresis-v7-20260918'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -15597,7 +15627,8 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 elif cfg.get('max_hold') is not None and (now_ist()-opened).total_seconds()>=float(cfg['max_hold'])*60:reason='Maximum holding time'
                 else:
                     setup=json.loads(r['setup'] or '{}');sig=self.signals.get(r['symbol'],{})
-                    if sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction') and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
+                    shadow_pos={'id':'shadow:'+str(r['id']),'entry':float(r['entry']),'stop':float(r['stop'])}
+                    reason=self.reversal_exit_reason(shadow_pos,setup,sig,bid,raw)
                 if not reason:continue
                 tick=max(.01,float(r['tick'] or .05));exit_px=max(tick,math.floor((bid*(1-float(cfg['slippage_bps'])/10000))/tick)*tick);qty=int(r['qty'] or r['lot'] or 1)
                 pnl=(exit_px-float(r['entry']))*qty;fees=2*float(cfg['fee_per_order']);label=1 if pnl-fees>0 else 0
@@ -15834,6 +15865,9 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         super().__init__(adapter)
         from index_kronos import KronosService
         self.kronos=KronosService()
+        # Per-position reversal confirmation memory.  Counts distinct completed candles,
+        # never repeated 15-second scans of the same candle.
+        self.reversal_memory={}
         if self.get('direction_build')!=INDEX_AI_BUILD:
             cfg=self.config();cfg.update(armed=False,live_override=False)
             # Retain execution mode for any existing positions; never rewrite broker holdings.
@@ -15880,10 +15914,15 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
                  forecast=forecast['close'],forecast_timestamps=forecast['timestamps'],
                  forecast_horizon_minutes=int(forecast.get('remaining_horizon_minutes') or 15),
                  forecast_cache_mode=forecast.get('cache_mode','EXACT'),forecast_source_bar=forecast.get('source_bar_ts'),
-                 score_kind='Uncalibrated directional score; not probability',selection_basis='60% Kronos + 40% price action')
+                 score_kind='Uncalibrated directional score; not probability',selection_basis='58% Kronos + 42% price action · dominant-edge override')
         if s['signal_wait']:s['reason']=s['signal_wait'];return s
-        if s['confidence']<self.config()['confidence']:s['reason']='Blended direction score below configured threshold';return s
-        s.update(decision='CANDIDATE',reason='Forecast and price action agree; checking CE/PE liquidity')
+        configured=float(self.config()['confidence'])
+        # A dominant-edge disagreement already passed a stricter structural test above;
+        # allow a small confidence concession instead of converting every such case to WAIT.
+        required=max(.60,configured-.04) if str(s.get('agreement','')).startswith('DOMINANT_') else configured
+        s['required_confidence']=required
+        if s['confidence']<required:s['reason']='Blended direction score below adaptive threshold';return s
+        s.update(decision='CANDIDATE',reason=(s.get('signal_note') or 'Directional edge qualifies')+'; checking CE/PE liquidity')
         return s
 
     def inspect(self,symbol):
@@ -15893,7 +15932,11 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
             costs=float(s['ask'])-float(s['bid'])+2*self.config()['fee_per_order']/max(1,s['qty'])+s['entry']*2*self.config()['slippage_bps']/10000
             move=abs(s.get('option_delta',0)*s.get('forecast_move',0))
             s.update(option_move_scenario=move,estimated_roundtrip_cost=costs)
-            if move<=1.5*costs:s.update(decision='WAIT',reason='Forecast-derived option move too small for spread and estimated costs')
+            s['edge_cost_ratio']=move/max(costs,.01)
+            # Avoid spending spread/fees on tiny projected moves.  This gate is intentionally
+            # stronger in V7 because the user observed trades closing around break-even while
+            # costs dominated the realised result.
+            if move<=2.0*costs:s.update(decision='WAIT',reason='Projected option move does not clear 2× spread and estimated costs')
         s['execution_quality_pass']=s.get('decision')=='READY'
         s['execution_quality_reason']=s.get('reason')
         s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
@@ -15908,6 +15951,53 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         reason=DeskEngine.block(self)
         if reason:return reason
         if not self.direction_engine_ready():return 'Kronos has no fresh forecast; entries paused'
+        return None
+
+    def reversal_exit_reason(self,p,setup,sig,bid,q=None):
+        """Index-only reversal exit with candle confirmation and asymmetric hysteresis.
+
+        Stops, targets, square-off and portfolio risk exits are handled before this method
+        and remain immediate.  A model flip is intentionally harder to exit on than it is
+        to display: the signal must come from a NEW completed candle, be materially strong,
+        and normally persist across two distinct candles.  There is no fixed minimum hold.
+        """
+        pid=p.get('id');entry_direction=setup.get('direction');current=sig.get('direction')
+        bar_ts=_ai_ts_naive(sig.get('bar_ts'));entry_bar=_ai_ts_naive(setup.get('bar_ts'))
+        if not pid or not entry_direction or not current or bar_ts is None:return None
+        # Never reverse a trade from a recomputation of the same candle that created it.
+        if entry_bar is not None and bar_ts<=entry_bar:
+            self.reversal_memory.pop(pid,None);return None
+        if sig.get('bar_age',999)>10 or not sig.get('kronos_ready'):
+            return None
+        if current==entry_direction:
+            self.reversal_memory.pop(pid,None);return None
+        cfg=self.config();confidence=float(sig.get('confidence') or 0)
+        margin=float(sig.get('signal_margin') or max(0.,(confidence-.5)*2))
+        move_atr=abs(float(sig.get('forecast_move_atr') or 0));agreement=str(sig.get('agreement') or '')
+        entry_conf=float(setup.get('confidence') or cfg.get('confidence') or .65)
+        normal_gate=max(.68,min(.80,max(float(cfg.get('confidence') or .65)+.04,entry_conf+.02)))
+        qualifies=confidence>=normal_gate and margin>=.30 and move_atr>=.14 and agreement!='CONFLICT'
+        if not qualifies:
+            self.reversal_memory.pop(pid,None)
+            if pid in self.health:self.health[pid]['reason']='HOLD · opposite read is not strong enough to confirm reversal'
+            return None
+        # Count completed candles, not scanner cycles.
+        key=bar_ts.isoformat();mem=self.reversal_memory.get(pid,{})
+        if mem.get('direction')!=current:mem={'direction':current,'bars':[]}
+        bars=list(mem.get('bars') or [])
+        if key not in bars:bars.append(key)
+        mem={'direction':current,'bars':bars[-3:]};self.reversal_memory[pid]=mem
+        risk_per_unit=max(.01,float(p.get('entry') or 0)-float(p.get('stop') or 0))
+        trade_r=(float(bid)-float(p.get('entry') or 0))/risk_per_unit
+        # An exceptionally strong, aligned opposite signal can exit on the first NEW bar.
+        # A losing trade also needs only one strong confirmed bar once it has moved -0.35R.
+        hard=confidence>=.80 and margin>=.60 and move_atr>=.25 and agreement=='AGREE'
+        adverse_confirm=trade_r<=-.35 and confidence>=.73 and margin>=.46 and move_atr>=.18 and agreement=='AGREE'
+        needed=1 if (hard or adverse_confirm) else 2
+        if len(mem['bars'])>=needed:
+            self.reversal_memory.pop(pid,None)
+            return 'Confirmed direction reversal'
+        if pid in self.health:self.health[pid]['reason']=f'HOLD · reversal confirmation {len(mem["bars"])}/{needed} completed bars'
         return None
 
     def supervise(self):
