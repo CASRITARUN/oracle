@@ -47,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 
 def blend_signal(rows, forecast):
@@ -84,26 +85,79 @@ def blend_signal(rows, forecast):
 
 
 class KronosService:
+    """Asynchronous, coalescing Kronos service.
+
+    The UI/scanner may ask for the same symbol every 15 seconds while a CPU forecast is
+    still running.  Queue SYMBOLS rather than frozen candle payloads, so a queued symbol
+    always uses its newest completed candle when inference actually begins.  A small
+    batch is used when several indices are waiting.  This avoids a permanent WAIT loop
+    on slower VMs where four sequential forecasts can take longer than one 5-minute bar.
+    """
     def __init__(self):
-        self.lock=threading.Lock();self.jobs=queue.Queue(maxsize=12)
-        self.results={};self.pending=set();self.retry={};self.process=None
-        self.status='IDLE';self.error=None
+        self.lock=threading.Lock();self.jobs=queue.Queue(maxsize=8)
+        self.results={};self.pending=set();self.latest={};self.retry={};self.process=None
+        self.status='IDLE';self.error=None;self.active_symbols=[];self.active_since=None
+        self.last_completed=None;self.completed_count=0
+        self.lookback=max(64,min(160,int(os.environ.get('KRONOS_LOOKBACK','96'))))
+        self.batch_size=max(1,min(4,int(os.environ.get('KRONOS_BATCH_SIZE','2'))))
+        self.timeout=max(90,min(600,int(os.environ.get('KRONOS_TIMEOUT_SECONDS','300'))))
         threading.Thread(target=self._loop,daemon=True,name='kronos-inference-dispatch').start()
 
+    @staticmethod
+    def _parse_ts(value):
+        text=str(value or '').replace('Z','+00:00')
+        try:return datetime.fromisoformat(text)
+        except ValueError:
+            try:return datetime.strptime(text[:19],'%Y-%m-%d %H:%M:%S')
+            except ValueError:return None
+
+    def _queue_locked(self,symbol):
+        if symbol in self.pending or time.monotonic()<self.retry.get(symbol,0):return
+        try:
+            self.jobs.put_nowait(symbol);self.pending.add(symbol)
+        except queue.Full:
+            self.error='Kronos queue full; newest candle retained for retry'
+
     def request(self,symbol,rows):
-        payload=json.dumps(rows,sort_keys=True,default=str,allow_nan=False)
+        # Keep a compact, fixed lookback.  The official predictor supports much longer
+        # contexts, but intraday direction only needs enough recent structure here and a
+        # smaller context materially improves CPU latency on the trading VM.
+        compact=[dict(r) for r in rows[-self.lookback:]]
+        payload=json.dumps(compact,sort_keys=True,default=str,allow_nan=False)
         key=hashlib.sha256(payload.encode()).hexdigest()
         with self.lock:
+            self.latest[symbol]=(key,compact)
             result=self.results.get(symbol)
-            if result and result['key']==key:return dict(result)
-            if symbol not in self.pending and time.monotonic()>=self.retry.get(symbol,0):
-                try:self.jobs.put_nowait((symbol,key,rows));self.pending.add(symbol)
-                except queue.Full:pass
-            return dict(status='WAIT',reason=self.error or 'Kronos inference queued / running')
+            if not result or result.get('key')!=key:self._queue_locked(symbol)
+            if result:
+                exact=result.get('key')==key
+                # A forecast generated from the previous completed candle is still useful
+                # while its future horizon has not expired.  Return it immediately and let
+                # the newest candle refresh continue in the background instead of forcing
+                # the desk back to NO PREDICTION every five minutes.
+                current_ts=self._parse_ts(compact[-1].get('ts')) if compact else None
+                final_ts=self._parse_ts((result.get('timestamps') or [None])[-1])
+                remaining=None
+                if current_ts and final_ts:
+                    if current_ts.tzinfo is not None:current_ts=current_ts.replace(tzinfo=None)
+                    if final_ts.tzinfo is not None:final_ts=final_ts.replace(tzinfo=None)
+                    remaining=(final_ts-current_ts).total_seconds()/60
+                if exact or (remaining is not None and remaining>=5 and time.time()-float(result.get('completed',0))<=600):
+                    out=dict(result);out['cache_mode']='EXACT' if exact else 'ROLLING'
+                    out['remaining_horizon_minutes']=15 if exact else max(5,int(round(remaining)))
+                    return out
+            active=', '.join(self.active_symbols) if self.active_symbols else None
+            reason=self.error or ('Kronos inference running: '+active if active else 'Kronos inference queued / running')
+            return dict(status='WAIT',reason=reason)
 
     def snapshot(self):
-        with self.lock:return dict(status=self.status,error=self.error,pending=len(self.pending),
-                                   model='NeoQuasar/Kronos-small',context=256,horizon_minutes=15)
+        with self.lock:
+            age=round(time.time()-self.active_since,1) if self.active_since else None
+            fresh=sum(1 for r in self.results.values() if time.time()-float(r.get('completed',0))<=600)
+            return dict(status=self.status,error=self.error,pending=len(self.pending),active=list(self.active_symbols),
+                        active_seconds=age,last_completed=self.last_completed,completed_count=self.completed_count,
+                        fresh_results=fresh,batch_size=self.batch_size,lookback=self.lookback,
+                        model='NeoQuasar/Kronos-small',context=self.lookback,horizon_minutes=15)
 
     def _start(self):
         self.process=subprocess.Popen([sys.executable,'-u',str(Path(__file__).resolve()),'--kronos-worker'],
@@ -118,30 +172,66 @@ class KronosService:
         threading.Thread(target=reader,daemon=True,name='kronos-output').start()
         self.answers=answers
 
+    def _take_batch(self,first_symbol):
+        symbols=[first_symbol]
+        while len(symbols)<self.batch_size:
+            try:sym=self.jobs.get_nowait()
+            except queue.Empty:break
+            if sym not in symbols:symbols.append(sym)
+            else:self.jobs.task_done()
+        with self.lock:
+            jobs=[]
+            for sym in symbols:
+                item=self.latest.get(sym)
+                if item:jobs.append((sym,item[0],item[1]))
+            self.active_symbols=[x[0] for x in jobs];self.active_since=time.time();self.status='RUNNING'
+        return symbols,jobs
+
     def _loop(self):
         while True:
-            symbol,key,rows=self.jobs.get()
+            first=self.jobs.get();symbols,jobs=self._take_batch(first)
             try:
-                with self.lock:self.status='RUNNING'
+                if not jobs:continue
                 if self.process is None or self.process.poll() is not None:self._start()
-                self.process.stdin.write(json.dumps(dict(rows=rows),default=str,allow_nan=False)+'\n');self.process.stdin.flush()
-                result=self.answers.get(timeout=180)
-                if result.get('error'):raise RuntimeError(result['error'])
-                values=result.get('close',[])
-                if len(values)!=3 or not all(math.isfinite(float(v)) and float(v)>0 for v in values):
-                    raise ValueError('Kronos returned invalid forecast prices')
+                payload={'batch':[dict(symbol=s,key=k,rows=r) for s,k,r in jobs]}
+                self.process.stdin.write(json.dumps(payload,default=str,allow_nan=False)+'\n');self.process.stdin.flush()
+                answer=self.answers.get(timeout=self.timeout)
+                if answer.get('error'):raise RuntimeError(answer['error'])
+                returned=answer.get('batch')
+                if not isinstance(returned,list):raise RuntimeError('Kronos worker returned malformed batch response')
+                by_symbol={str(x.get('symbol')):x for x in returned if isinstance(x,dict)}
+                now=time.time()
                 with self.lock:
-                    self.results[symbol]=dict(result,key=key,status='READY',completed=time.time())
-                    self.status='READY';self.error=None;self.retry.pop(symbol,None)
+                    for symbol,key,rows in jobs:
+                        result=by_symbol.get(symbol)
+                        if not result:continue
+                        if result.get('error'):
+                            self.error=f"{symbol}: {result['error']}";self.retry[symbol]=time.monotonic()+30;continue
+                        values=result.get('close',[])
+                        if len(values)!=3 or not all(math.isfinite(float(v)) and float(v)>0 for v in values):
+                            self.error=f'{symbol}: Kronos returned invalid forecast prices';self.retry[symbol]=time.monotonic()+30;continue
+                        self.results[symbol]=dict(result,key=key,status='READY',completed=now,source_bar_ts=rows[-1].get('ts'))
+                        self.retry.pop(symbol,None);self.completed_count+=1;self.last_completed=now
+                    self.error=None if any(s in by_symbol and not by_symbol[s].get('error') for s,_,_ in jobs) else self.error
             except Exception as e:
                 if self.process is not None:
-                    self.process.kill();self.process.wait();self.process=None
+                    try:self.process.kill();self.process.wait(timeout=5)
+                    except Exception:pass
+                    self.process=None
                 with self.lock:
                     self.status='UNAVAILABLE';self.error=str(e) or 'Kronos inference timed out'
-                    self.retry[symbol]=time.monotonic()+60
+                    for symbol,_,_ in jobs:self.retry[symbol]=time.monotonic()+45
             finally:
-                with self.lock:self.pending.discard(symbol)
-                self.jobs.task_done()
+                with self.lock:
+                    self.active_symbols=[];self.active_since=None
+                    for symbol in symbols:self.pending.discard(symbol)
+                    # If a newer candle arrived while this batch was running, enqueue the
+                    # symbol once more.  The queue will use only the newest payload.
+                    for symbol,key,_ in jobs:
+                        latest=self.latest.get(symbol)
+                        if latest and latest[0]!=key:self._queue_locked(symbol)
+                    if self.status!='UNAVAILABLE':self.status='READY' if self.results else 'IDLE'
+                for _ in symbols:self.jobs.task_done()
 
 
 def worker():
@@ -160,17 +250,28 @@ def worker():
         tokenizer=KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base')
         model=Kronos.from_pretrained('NeoQuasar/Kronos-small')
         model.eval();tokenizer.eval()
-        predictor=KronosPredictor(model,tokenizer,device=device,max_context=512)
+        predictor=KronosPredictor(model,tokenizer,device=device,max_context=max(96,min(160,int(os.environ.get('KRONOS_LOOKBACK','96')))))
     for line in sys.stdin:
         try:
-            req=json.loads(line);df=pd.DataFrame(req['rows'])
-            ts=pd.to_datetime(df['ts']);future=pd.Series(pd.date_range(ts.iloc[-1]+pd.Timedelta(minutes=5),periods=3,freq='5min'))
-            # Cash index volume may be zero. Do not manufacture traded volume or amount.
+            req=json.loads(line);items=req.get('batch') or []
+            if not items:raise ValueError('Empty Kronos batch')
+            frames=[];timestamps=[];futures=[];symbols=[]
+            for item in items:
+                df=pd.DataFrame(item['rows'][-160:])
+                ts=pd.to_datetime(df['ts']);future=pd.Series(pd.date_range(ts.iloc[-1]+pd.Timedelta(minutes=5),periods=3,freq='5min'))
+                frames.append(df[['open','high','low','close','volume']]);timestamps.append(ts);futures.append(future);symbols.append(str(item['symbol']))
+            results=[]
             with contextlib.redirect_stdout(sys.stderr),torch.inference_mode():
                 torch.manual_seed(int(hashlib.sha256(line.encode()).hexdigest()[:8],16))
-                out=predictor.predict(df=df[['open','high','low','close','volume']],x_timestamp=ts,
-                    y_timestamp=future,pred_len=3,T=1.0,top_p=.9,sample_count=3)
-            print(json.dumps(dict(close=[float(x) for x in out['close']],timestamps=[str(t) for t in future]),allow_nan=False),flush=True)
+                if len(frames)>1 and len({len(x) for x in frames})==1 and hasattr(predictor,'predict_batch'):
+                    outs=predictor.predict_batch(df_list=frames,x_timestamp_list=timestamps,y_timestamp_list=futures,
+                        pred_len=3,T=1.0,top_p=.9,sample_count=1,verbose=False)
+                else:
+                    outs=[predictor.predict(df=df,x_timestamp=ts,y_timestamp=fut,pred_len=3,T=1.0,top_p=.9,sample_count=1,verbose=False)
+                          for df,ts,fut in zip(frames,timestamps,futures)]
+            for symbol,out,future in zip(symbols,outs,futures):
+                results.append(dict(symbol=symbol,close=[float(x) for x in out['close']],timestamps=[str(t) for t in future]))
+            print(json.dumps(dict(batch=results),allow_nan=False),flush=True)
         except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
 
 if __name__=='__main__':
@@ -2112,11 +2213,14 @@ def callback():
         SESSION["access_token"] = data["access_token"]
         SESSION["logged_in_at"] = now_ist().isoformat()
         kite.set_access_token(SESSION["access_token"])
-    # Do not wait for the next 30-second scanner tick: wake Stock AI immediately so
-    # full-F&O discovery and resumable deep-history collection begin after login.
-    try:
-        if 'STOCK_DESK' in globals():threading.Thread(target=STOCK_DESK.cycle,daemon=True,name='stock-ai-login-wake').start()
-    except Exception:pass
+    # Do not wait for the next scanner tick after login. Wake each AI desk independently
+    # so the UI gets live data promptly; the desk's normal locks/risk gates still apply.
+    for _name,_thread_name in (('STOCK_DESK','stock-ai-login-wake'),('COMMODITY_DESK','commodity-ai-login-wake'),('DESK','index-ai-login-wake')):
+        try:
+            _desk=globals().get(_name)
+            if _desk is not None:threading.Thread(target=_desk.cycle,daemon=True,name=_thread_name).start()
+        except Exception:
+            pass
     return redirect("/")
 
 
@@ -13324,7 +13428,7 @@ class StockDeskEngine(DeskEngine):
             refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat()))
         self.signals={k:v for k,v in self.signals.items() if k in selected}
         self.refresh_cursor=0
-        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} stocks; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
+        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} MCX underlyings; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
         return selected
     def _sync_full_universe_membership(self):
         if not self._full_mode():return
@@ -13334,7 +13438,7 @@ class StockDeskEngine(DeskEngine):
         info=self.get('stock_universe_info',{});info.update(mode='Full F&O universe',total_fo=len(universe),selected=len(universe),
             deep_check=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat())
         self.put('stock_universe_info',info);self.signals={k:v for k,v in self.signals.items() if k in universe}
-        self.event('UNIVERSE',f'F&O membership refreshed: {len(universe)} stocks')
+        self.event('UNIVERSE',f'MCX option universe refreshed: {len(universe)} underlyings')
     @staticmethod
     def rank_signal(s,max_spread):
         confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
@@ -13423,12 +13527,12 @@ class StockDeskEngine(DeskEngine):
         """Heavy history work yields whenever any automated live desk may need Kite."""
         try:
             cfg=self.config()
-            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
-            if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
+            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Commodity AI live entries armed'
+            if any(p.get('mode')=='live' for p in self.active()):return 'Commodity AI live position active'
             if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
-                return 'Stock AI live order unresolved'
+                return 'Commodity AI live order unresolved'
         except Exception:
-            return 'Stock AI live-state check unavailable'
+            return 'Commodity AI live-state check unavailable'
         for name,label in (('DESK','Index AI'),('CAS_DESK','CAS AI')):
             desk=globals().get(name)
             if not desk or desk is self:continue
@@ -13911,7 +14015,7 @@ class StockDeskEngine(DeskEngine):
         s=super().state()
         s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.train_success_model();hm=self.historical_success_model()
+        sm=self.success_model();hm=self.historical_success_model()
         if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
@@ -14108,13 +14212,26 @@ def commodity_parity_match(pairs,futures,years):
     if len(matches)!=1:raise ValueError('Underlying futures mapping ambiguous or inconsistent with fresh option prices; retrying automatically')
     return matches[0]
 
-_MCX_MASTER={'rows':None,'at':0.0,'day':None}
+_MCX_MASTER={'rows':None,'at':0.0,'day':None,'loading':False,'error':None}
+_MCX_MASTER_LOCK=threading.Lock()
 def commodity_instruments():
-    if _MCX_MASTER['rows'] is None or _MCX_MASTER.get('day')!=now_ist().date().isoformat():
-        rows=kite.instruments('MCX')
-        if not isinstance(rows,list) or not rows:raise ValueError('MCX instrument master unavailable')
-        _MCX_MASTER.update(rows=rows,at=time.monotonic(),day=now_ist().date().isoformat())
-    return _MCX_MASTER['rows']
+    today=now_ist().date().isoformat()
+    if _MCX_MASTER['rows'] is not None and _MCX_MASTER.get('day')==today:
+        return _MCX_MASTER['rows']
+    with _MCX_MASTER_LOCK:
+        if _MCX_MASTER['rows'] is not None and _MCX_MASTER.get('day')==today:
+            return _MCX_MASTER['rows']
+        _MCX_MASTER.update(loading=True,error=None)
+        try:
+            rows=kite.instruments('MCX')
+            if not isinstance(rows,list) or not rows:raise ValueError('MCX instrument master unavailable')
+            _MCX_MASTER.update(rows=rows,at=time.monotonic(),day=today,error=None)
+            return rows
+        except Exception as exc:
+            _MCX_MASTER['error']=str(exc)
+            raise
+        finally:
+            _MCX_MASTER['loading']=False
 def commodity_future(symbol):
     name=symbol.removeprefix('MCX:')
     matches=[r for r in commodity_instruments() if r.get('tradingsymbol')==name and r.get('instrument_type')=='FUT']
@@ -15082,7 +15199,7 @@ class CommodityDeskEngine(DeskEngine):
         s=super().state()
         s['signals'].sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.train_success_model();hm=self.historical_success_model()
+        sm=self.success_model();hm=self.historical_success_model()
         if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
@@ -15093,12 +15210,18 @@ class CommodityDeskEngine(DeskEngine):
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
         s['commodity_policy']=COMMODITY_POLICY
         s['commodity_setup']=dict(mode='AUTOMATIC',contracts=self.a._auto_records(),errors=dict(self.a.discovery_errors))
+        # State reads are deliberately network-free. The scanner refreshes the MCX master
+        # in the background; the UI only reports whatever master is already cached.
+        cached_rows=_MCX_MASTER.get('rows') if _MCX_MASTER.get('day')==now_ist().date().isoformat() else None
+        s['commodity_master']=dict(ready=bool(cached_rows),loading=bool(_MCX_MASTER.get('loading')),error=_MCX_MASTER.get('error'),
+            age_seconds=(round(time.monotonic()-float(_MCX_MASTER.get('at') or 0),1) if cached_rows else None))
         s['commodity_contracts']=[]
-        for symbol in self.a.symbols:
-            try:
-                f=commodity_future(symbol)
-                s['commodity_contracts'].append(dict(name=f['name'],future=f['tradingsymbol'],expiry=str(f['expiry'])))
-            except ValueError:pass
+        if cached_rows:
+            for symbol in self.a.symbols:
+                name=symbol.removeprefix('MCX:')
+                matches=[r for r in cached_rows if r.get('tradingsymbol')==name and r.get('instrument_type')=='FUT']
+                if len(matches)==1:
+                    f=matches[0];s['commodity_contracts'].append(dict(name=f['name'],future=f['tradingsymbol'],expiry=str(f['expiry'])))
         s['price_basis']='INR per broker quantity = exchange premium × verified multiplier; quantities are broker quantities.'
         return s
     def control(self,action,body):
@@ -15191,7 +15314,7 @@ def commodity_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-kronos-price-action-v5-20260917'
+INDEX_AI_BUILD = 'index-kronos-price-action-v6-20260918'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -15755,6 +15878,8 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         if time.time()-forecast['completed']>600:s['reason']='Kronos forecast expired';return s
         s.update(blend_signal(rows,forecast),kronos_ready=True,model_id=INDEX_AI_BUILD,
                  forecast=forecast['close'],forecast_timestamps=forecast['timestamps'],
+                 forecast_horizon_minutes=int(forecast.get('remaining_horizon_minutes') or 15),
+                 forecast_cache_mode=forecast.get('cache_mode','EXACT'),forecast_source_bar=forecast.get('source_bar_ts'),
                  score_kind='Uncalibrated directional score; not probability',selection_basis='60% Kronos + 40% price action')
         if s['signal_wait']:s['reason']=s['signal_wait'];return s
         if s['confidence']<self.config()['confidence']:s['reason']='Blended direction score below configured threshold';return s
