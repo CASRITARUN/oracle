@@ -8,6 +8,7 @@ html.website-connection-warning:not(.website-checking)::after { content:'Connect
 const websiteFetch = window.fetch.bind(window);
 let websiteRevoked=false, websiteStatusBusy=false, websiteCsrf='', websiteLockBusy=false;
 let websiteVerified=false, websiteNextCheck=0, websiteFailures=0;
+const WEBSITE_WARNING_FAILURES=3;
 function websiteHide(){document.documentElement.classList.add('website-connection-warning')}
 function websiteSignOut(){
   websiteRevoked=true;websiteHide();window.location.replace('/website-login');
@@ -26,19 +27,19 @@ window.fetch = async (...args) => {
 async function websiteCheck(force=false){
   if(websiteStatusBusy||websiteRevoked||websiteLockBusy||document.hidden||(!force&&Date.now()<websiteNextCheck))return;
   websiteStatusBusy=true;
-  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
   try{
     const response=await websiteFetch('/api/website-status',{cache:'no-store',signal:controller.signal});
     if(response.status===401){websiteSignOut();return}
     if(!response.ok)throw Error('Access check failed');
     const data=await response.json();
     if(data.authenticated!==true||!data.csrf)throw Error('Access check failed');
-    websiteCsrf=data.csrf;websiteVerified=true;websiteFailures=0;websiteNextCheck=Date.now()+15000;
+    websiteCsrf=data.csrf;websiteVerified=true;websiteFailures=0;websiteNextCheck=Date.now()+30000;
     document.documentElement.classList.remove('website-connection-warning');
     if(!websiteRevoked&&!websiteLockBusy&&!document.hidden)document.documentElement.classList.remove('website-connection-warning');
   }catch{
-    websiteFailures++;websiteNextCheck=Date.now()+Math.min(30000,5000*2**Math.min(websiteFailures-1,3));
-    if(!websiteRevoked&&!websiteLockBusy)document.documentElement.classList.add('website-connection-warning');
+    websiteFailures++;websiteNextCheck=Date.now()+Math.min(60000,10000*2**Math.min(websiteFailures-1,3));
+    if(!websiteRevoked&&!websiteLockBusy&&(navigator.onLine===false||websiteFailures>=WEBSITE_WARNING_FAILURES))document.documentElement.classList.add('website-connection-warning');
   }finally{clearTimeout(timer);websiteStatusBusy=false}
 }
 async function websiteLockAll(event){
@@ -66,7 +67,7 @@ window.addEventListener('online',()=>websiteCheck(true));
 window.addEventListener('focus',()=>websiteCheck());
 window.addEventListener('pageshow',()=>websiteCheck());
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)websiteCheck()});
-setInterval(()=>websiteCheck(),5000);
+setInterval(()=>websiteCheck(),15000);
 websiteCheck();
 </script>
 <meta charset="UTF-8">
@@ -1313,15 +1314,28 @@ document.getElementById("closeConfirmBtn").onclick = async () => {
 let priceChartInstance = null;
 let currentExecPositionId = null;
 
-async function checkSession() {
-  const r = await apiFetch("/api/session-status");
-  const d = await r.json();
+let sessionStatusPromise=null, sessionStatusAt=0, sessionStatusValue=null;
+async function checkSession(force=false) {
+  let d;
+  if(!force && sessionStatusValue && Date.now()-sessionStatusAt<5000){
+    d=sessionStatusValue;
+  } else {
+    if(!sessionStatusPromise){
+      sessionStatusPromise=(async()=>{
+        const r=await apiFetch("/api/session-status");
+        const value=await r.json();
+        sessionStatusValue=value;sessionStatusAt=Date.now();
+        return value;
+      })().finally(()=>{sessionStatusPromise=null});
+    }
+    d=await sessionStatusPromise;
+  }
   const el = document.getElementById("loginArea");
   if (d.logged_in) {
     el.innerHTML = `<span class="pill ok">Connected to Kite</span> <button class="secondary small-btn" id="logoutBtn">Log out</button>`;
     document.getElementById("logoutBtn").onclick = async () => {
       await apiFetch("/api/logout", {method: "POST"});
-      checkSession();
+      sessionStatusValue=null;sessionStatusAt=0;checkSession(true);
     };
   } else {
     el.innerHTML = `<button id="loginBtn">Connect Kite Account</button>`;
@@ -2586,11 +2600,18 @@ function fmtTime(v) { return v ? new Date(v).toLocaleTimeString() : "—"; }
 </script>
 
 <script>
-checkSession();
-loadWatchlist();
-loadOrders();
-loadBrokerPositions();
-loadEvents();
+(async function bootstrapDashboard(){
+  try{
+    const loggedIn=await checkSession();
+    if(!loggedIn)return;
+    // Keep first paint responsive. Non-critical broker panels load in short, separate slots
+    // instead of competing with the AI workers and session validation at the same instant.
+    loadWatchlist();
+    setTimeout(()=>{if(document.visibilityState==='visible')loadEvents()},350);
+    setTimeout(()=>{if(document.visibilityState==='visible')loadOrders()},800);
+    setTimeout(()=>{if(document.visibilityState==='visible')loadBrokerPositions()},1300);
+  }catch(e){console.error('Dashboard bootstrap failed',e)}
+})();
 </script>
 
 <script>
@@ -2673,9 +2694,9 @@ async function loadExistingPositionIntel() {
 }
 document.getElementById("refreshPositionIntelBtn")?.addEventListener("click", loadExistingPositionIntel);
 setInterval(() => {
-  if (document.visibilityState === "visible") loadExistingPositionIntel();
-}, 30000);
-loadExistingPositionIntel();
+  if (document.visibilityState === "visible" && document.getElementById('tabPageCondor')?.classList.contains('active')) loadExistingPositionIntel();
+}, 45000);
+setTimeout(()=>{if(document.visibilityState==='visible'&&document.getElementById('tabPageCondor')?.classList.contains('active'))loadExistingPositionIntel()},2200);
 </script>
 
 
@@ -2708,7 +2729,7 @@ function dkLineChart(points,key,empty){
   const grid=[0,.25,.5,.75,1].map(t=>{const v=min+(max-min)*t;return `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#293443" stroke-dasharray="3 5"/><text x="${W-R+13}" y="${y(v)+4}" fill="#95a4b9" font-size="12" font-family="monospace">${dkEsc(dkNum(v,1))}</text>`}).join('');
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${dkEsc(key==='pnl'?'Cumulative net paper trading result':'Recent index closing prices')}"><title>${dkEsc(data.length+' observations; latest '+dkNum(values.at(-1)))}</title>${grid}<path d="${line} L${x(data.length-1)},${H-B} L${L},${H-B} Z" fill="#b1ef65" opacity=".04"/><path d="${line}" fill="none" stroke="#b1ef65" stroke-width="2.5" vector-effect="non-scaling-stroke"/><circle cx="${x(data.length-1)}" cy="${y(values.at(-1))}" r="4" fill="#b1ef65"/><text x="${L}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${dkEsc(dkTime(data[0].ts))}</text><text text-anchor="end" x="${W-R}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${dkEsc(dkTime(data.at(-1).ts))} IST</text></svg>`;
 }
-async function dkRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);try{const r=await fetch('/api/ai-desk/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
+async function dkRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),35000);try{const r=await fetch('/api/ai-desk/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
 function dkNotice(message,error=false){dkText('dkNotice',message);dkEl('dkNotice')?.classList.toggle('error',error)}
 async function dkConfirm(title,text){const d=dkEl('dkDialog');dkText('dkDialogTitle',title);dkText('dkDialogText',text);return new Promise(resolve=>{d.addEventListener('close',()=>resolve(d.returnValue==='confirm'),{once:true});d.showModal()})}
 async function dkAction(action,body={}){
@@ -2733,9 +2754,9 @@ function initAutoTradeAIUI(){
   dkEl('dkSettings').oninput=()=>deskDirty=true;
   dkEl('dkSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='square_off'||k==='cooldown'?v:Number(v));await dkRequest('config',body);deskDirty=false;dkNotice('Risk settings saved.');await refreshAutoTradeAI()}catch(err){dkNotice(err.message,true)}};
   dkEl('dkExport').onclick=()=>{if(!deskState)return;const keys=['ts','symbol','mode','contract','qty','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...deskState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='ai-desk-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
-  refreshAutoTradeAI();deskTimer=setInterval(()=>{if(!document.hidden&&dkEl('desk')?.getClientRects().length)refreshAutoTradeAI()},8000);
+  refreshAutoTradeAI();deskTimer=setInterval(()=>{if(!document.hidden&&dkEl('desk')?.getClientRects().length)refreshAutoTradeAI()},12000);
 }
-async function refreshAutoTradeAI(){if(deskBusy)return;deskBusy=true;try{deskState=await dkRequest('state');dkRender(deskState)}catch(e){dkNotice(e.name==='AbortError'?'Backend request timed out; displayed values may be stale.':e.message,true);dkText('dkPulse','OFFLINE');['dkArm','dkMode','dkLiveOverride'].forEach(id=>{if(dkEl(id))dkEl(id).disabled=true})}finally{deskBusy=false}}
+async function refreshAutoTradeAI(){if(deskBusy)return;deskBusy=true;try{deskState=await dkRequest('state');dkRender(deskState)}catch(e){const delayed=e.name==='AbortError';dkNotice(delayed?'Backend is busy; retrying automatically. Last displayed values are retained.':e.message,true);dkText('dkPulse',navigator.onLine===false?'OFFLINE':'RETRYING');if(!deskState)dkEl('dkArm').disabled=true}finally{deskBusy=false}}
 function dkRender(s){
   renderSharedRisk('dk');
   const cfg=s.config||{},ev=s.evidence||{},model=s.model||{},obs=s.observations||{},hm=s.historical_success_model||{},shm=s.shadow_success_model||{},lm=s.live_success_model||{},shadow=s.shadow||{},gate=s.quality_gate||{};
@@ -2751,7 +2772,7 @@ function dkRender(s){
   const sig=(s.signals||[]).find(x=>x.symbol===deskSymbol)||{};
   dkText('dkChartName',deskSymbol);dkText('dkSpot',dkNum(sig.spot));dkText('dkChartMeta',sig.bar_age!=null?(sig.bar_age>15?'Historical view · stale for execution':'Latest completed candle'):'Completed 5-minute candles');dkText('dkBarTime',sig.bar_ts?dkDate(sig.bar_ts)+' IST':'No candle received');dkHTML('dkPriceChart',dkLineChart(sig.chart,'close','Connect Kite and sync history to see market candles.'));
   dkText('dkDirection',sig.direction==='UP'?'Upward bias':sig.direction==='DOWN'?'Downward bias':'Awaiting data');dkText('dkRegime',sig.regime||'—');dkText('dkProbability',sig.p_up==null?'—':dkNum(sig.p_up*100,1)+' / 100');dkEl('dkProbFill').style.width=sig.p_up==null?'0%':Math.max(0,Math.min(100,sig.p_up*100))+'%';dkText('dkReason',s.block||sig.reason||'Waiting for data');
-  dkHTML('dkModels',dkKV('Kronos status',s.kronos?.status||'WAIT')+dkKV('Kronos upward score',sig.kronos_score==null?'—':dkNum(sig.kronos_score*100,1)+' / 100')+dkKV('Price-action upward score',sig.technical_score==null?'—':dkNum(sig.technical_score*100,1)+' / 100')+dkKV('15-minute forecast move',sig.forecast_move==null?'—':dkNum(sig.forecast_move,2)+' points')+dkKV('Blend','60% Kronos / 40% price action'));
+  dkHTML('dkModels',dkKV('Kronos status',s.kronos?.status||'WAIT')+dkKV('Kronos upward score',sig.kronos_score==null?'—':dkNum(sig.kronos_score*100,1)+' / 100')+dkKV('Price-action upward score',sig.technical_score==null?'—':dkNum(sig.technical_score*100,1)+' / 100')+dkKV((sig.forecast_horizon_minutes||15)+'-minute forecast move',sig.forecast_move==null?'—':dkNum(sig.forecast_move,2)+' points')+dkKV('Forecast source',sig.forecast_cache_mode==='ROLLING'?'Prior candle · horizon still live':sig.forecast_cache_mode==='EXACT'?'Latest completed candle':'—')+dkKV('Blend','60% Kronos / 40% price action'));
   const factors=sig.factors||[],max=Math.max(.01,...factors.map(f=>Math.abs(f.impact)));
   dkHTML('dkFactors',factors.length?factors.map(f=>`<div class="dk-factor"><span>${dkEsc(f.name.replace(/_/g,' '))}</span><div class="dk-factor-track"><i style="width:${Math.abs(f.impact)/max*100}%;background:${f.impact>0?'#b1ef65':'#8bb6ff'}"></i></div><b>${f.impact>0?'+':''}${dkNum(f.impact)}</b></div>`).join(''):'<span class="dk-muted">Feature contributions appear with a prediction.</span>');
   dkText('dkContract',sig.contract||'No qualified contract');dkHTML('dkPlan',dkKV('Status',sig.decision||'WAIT')+dkKV('Selection',sig.selection_basis||'Kronos + price action')+dkKV('Rank score',sig.rank_score==null?'—':dkNum(sig.rank_score,1)+' / 100')+dkKV('Entry checks',sig.execution_quality_pass?'PASS':sig.reason||'Waiting')+dkKV('Option move scenario / unit',dkMoney(sig.option_move_scenario))+dkKV('Round-trip cost estimate / unit',dkMoney(sig.estimated_roundtrip_cost))+dkKV('Lots / quantity',(sig.lots??'—')+' / '+(sig.qty??'—'))+dkKV('Estimated entry',dkMoney(sig.entry))+dkKV('Stop / target',dkMoney(sig.stop)+' / '+dkMoney(sig.target))+dkKV('Spread',sig.spread==null?'—':dkNum(sig.spread)+'%'));
@@ -2760,7 +2781,7 @@ function dkRender(s){
   dkHTML('dkPositions',dkTable(['Index / option','Mode','Qty','Entry','Bid','Open P&L','Status / action'],(s.positions||[]).map(p=>[p.symbol+' / '+p.contract,p.mode,p.qty,dkNum(p.entry),dkNum(p.bid),dkMoney(p.unrealized),p.status+' · '+(p.reason||'Reconciling')])));
   dkHTML('dkEvents',(s.events||[]).slice(0,8).map(e=>`<div class="dk-event"><time>${dkTime(e.ts)}</time><b>${dkEsc(e.kind)}</b><span>${dkEsc((e.symbol?e.symbol+' · ':'')+e.detail)}</span></div>`).join('')||'<div class="dk-empty">The next scan will add its decision and reason here.</div>');
   const train=s.training||{},training=train.status==='SYNCING RECENT HISTORY';dkEl('dkSync').disabled=training;dkEl('dkTrain').disabled=false;
-  dkHTML('dkKronosStatus',dkKV('Build',s.build)+dkKV('Worker',s.kronos?.status||'IDLE')+dkKV('Model',s.kronos?.model||'Kronos-small')+dkKV('Fresh forecast available',s.direction_engine_ready?'YES':'NO')+dkKV('Queued symbols',s.kronos?.pending??0)+dkKV('History sync',train.status||'IDLE')+dkKV('Details',s.kronos?.error||train.error||'Ready for the next completed candle'));
+  dkHTML('dkKronosStatus',dkKV('Build',s.build)+dkKV('Worker',s.kronos?.status||'IDLE')+dkKV('Model',s.kronos?.model||'Kronos-small')+dkKV('Fresh forecasts',`${s.kronos?.fresh_results??0} / 4`)+dkKV('Queued symbols',s.kronos?.pending??0)+dkKV('Active batch',(s.kronos?.active||[]).join(', ')||'—')+dkKV('Batch / lookback',`${s.kronos?.batch_size??'—'} symbols / ${s.kronos?.lookback??'—'} bars`)+dkKV('History sync',train.status||'IDLE')+dkKV('Details',s.kronos?.error||train.error||(s.kronos?.active_seconds!=null?`Inference running ${dkNum(s.kronos.active_seconds,0)}s`:'Ready for the next completed candle')));
   dkHTML('dkForecastPath',dkTable(['Forecast candle · IST','Forecast close'],(sig.forecast||[]).map((v,i)=>[dkDate(sig.forecast_timestamps?.[i]),dkNum(v,2)])));
   dkHTML('dkPaperLearning',dkKV('Current strategy closed trades',ev.trades||0)+dkKV('Net result',dkMoney(ev.net))+dkKV('Observed win rate',dkNum(ev.win_rate,1)+'%')+dkKV('Live eligibility',cfg.live_override?'Manual paper-evidence override':ev.ready?'Paper thresholds met':'Building paper record'));
   dkHTML('dkEquity',dkLineChart(ev.equity,'pnl','Close at least two paper trades to draw the equity curve.'));
@@ -2796,7 +2817,7 @@ function skLineChart(points,key,empty){
   const grid=[0,.25,.5,.75,1].map(t=>{const v=min+(max-min)*t;return `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#293443" stroke-dasharray="3 5"/><text x="${W-R+13}" y="${y(v)+4}" fill="#95a4b9" font-size="12" font-family="monospace">${skEsc(skNum(v,1))}</text>`}).join('');
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${skEsc(key==='pnl'?'Cumulative net paper trading result':'Recent stock closing prices')}"><title>${skEsc(data.length+' observations; latest '+skNum(values.at(-1)))}</title>${grid}<path d="${line} L${x(data.length-1)},${H-B} L${L},${H-B} Z" fill="#b1ef65" opacity=".04"/><path d="${line}" fill="none" stroke="#b1ef65" stroke-width="2.5" vector-effect="non-scaling-stroke"/><circle cx="${x(data.length-1)}" cy="${y(values.at(-1))}" r="4" fill="#b1ef65"/><text x="${L}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${skEsc(skTime(data[0].ts))}</text><text text-anchor="end" x="${W-R}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${skEsc(skTime(data.at(-1).ts))} IST</text></svg>`;
 }
-async function skRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);try{const r=await fetch('/api/stock-ai/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
+async function skRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),35000);try{const r=await fetch('/api/stock-ai/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
 function skNotice(message,error=false){skText('skNotice',message);skEl('skNotice')?.classList.toggle('error',error)}
 async function skConfirm(title,text){const d=skEl('skDialog');skText('skDialogTitle',title);skText('skDialogText',text);return new Promise(resolve=>{d.addEventListener('close',()=>resolve(d.returnValue==='confirm'),{once:true});d.showModal()})}
 async function skAction(action,body={}){
@@ -2822,9 +2843,9 @@ function initStockTradeAIUI(){
   skEl('skSettings').oninput=()=>stockdeskDirty=true;
   skEl('skSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='square_off'||k==='cooldown'?v:Number(v));await skRequest('config',body);stockdeskDirty=false;skNotice('Risk settings saved.');await refreshStockTradeAI()}catch(err){skNotice(err.message,true)}};
   skEl('skExport').onclick=()=>{if(!stockdeskState)return;const keys=['ts','symbol','mode','contract','qty','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...stockdeskState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='stock-ai-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
-  refreshStockTradeAI();stockdeskTimer=setInterval(()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI()},8000);
+  refreshStockTradeAI();stockdeskTimer=setInterval(()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI()},12000);
 }
-async function refreshStockTradeAI(){if(stockdeskBusy)return;stockdeskBusy=true;try{stockdeskState=await skRequest('state');skRender(stockdeskState)}catch(e){skNotice(e.name==='AbortError'?'Backend request timed out; displayed values may be stale.':e.message,true);skText('skPulse','OFFLINE');['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true})}finally{stockdeskBusy=false}}
+async function refreshStockTradeAI(){if(stockdeskBusy)return;stockdeskBusy=true;try{stockdeskState=await skRequest('state');skRender(stockdeskState)}catch(e){const delayed=e.name==='AbortError';skNotice(delayed?'Backend is busy; retrying automatically. Last displayed values are retained.':e.message,true);skText('skPulse',navigator.onLine===false?'OFFLINE':'RETRYING');if(!stockdeskState)skEl('skArm').disabled=true}finally{stockdeskBusy=false}}
 function skRender(s){
   renderSharedRisk('sk');
   if(!(s.signals||[]).some(x=>x.symbol===stockdeskSymbol))stockdeskSymbol=s.signals?.[0]?.symbol||'';
@@ -2893,7 +2914,7 @@ function ckLineChart(points,key,empty){
   const grid=[0,.25,.5,.75,1].map(t=>{const v=min+(max-min)*t;return `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#293443" stroke-dasharray="3 5"/><text x="${W-R+13}" y="${y(v)+4}" fill="#95a4b9" font-size="12" font-family="monospace">${ckEsc(ckNum(v,1))}</text>`}).join('');
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${ckEsc(key==='pnl'?'Cumulative net paper trading result':'Recent stock closing prices')}"><title>${ckEsc(data.length+' observations; latest '+ckNum(values.at(-1)))}</title>${grid}<path d="${line} L${x(data.length-1)},${H-B} L${L},${H-B} Z" fill="#b1ef65" opacity=".04"/><path d="${line}" fill="none" stroke="#b1ef65" stroke-width="2.5" vector-effect="non-scaling-stroke"/><circle cx="${x(data.length-1)}" cy="${y(values.at(-1))}" r="4" fill="#b1ef65"/><text x="${L}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${ckEsc(ckTime(data[0].ts))}</text><text text-anchor="end" x="${W-R}" y="${H-4}" fill="#879ab3" font-size="11" font-family="monospace">${ckEsc(ckTime(data.at(-1).ts))} IST</text></svg>`;
 }
-async function ckRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);try{const r=await fetch('/api/commodity-ai/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
+async function ckRequest(path,body){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),35000);try{const r=await fetch('/api/commodity-ai/'+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store'});let data;try{data=await r.json()}catch{throw Error('Backend response is not JSON. Check the updated server files.')}if(!r.ok)throw Error(data.error||'Request failed');return data}finally{clearTimeout(timer)}}
 function ckNotice(message,error=false){ckText('ckNotice',message);ckEl('ckNotice')?.classList.toggle('error',error)}
 async function ckConfirm(title,text){const d=ckEl('ckDialog');ckText('ckDialogTitle',title);ckText('ckDialogText',text);return new Promise(resolve=>{d.addEventListener('close',()=>resolve(d.returnValue==='confirm'),{once:true});d.showModal()})}
 async function ckAction(action,body={}){
@@ -2918,18 +2939,18 @@ function initCommodityTradeAIUI(){
   ckHTML('ckSettingsFields',ckFields.map(([k,label,min,max,step])=>k==='cooldown'?`<label>${ckEsc(label)}<input name="cooldown" type="text" inputmode="text" pattern="([0-9]+|[Nn]/?[Aa])" title="Enter 0 to 120 whole minutes, or NA" required></label>`:`<label>${ckEsc(label)}<input name="${k}" type="${k==='square_off'?'time':'number'}" ${min!=null?`min="${min}" max="${max}" step="${step}"`:''} required></label>`).join(''));
   document.querySelectorAll('#commoditydesk [data-view]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('#commoditydesk [data-view]').forEach(x=>{x.classList.toggle('selected',x===b);x.setAttribute('aria-current',x===b?'page':'false')});document.querySelectorAll('#commoditydesk [data-pane]').forEach(p=>p.hidden=p.dataset.pane!==b.dataset.view)}));
   [['ckLiveOverride','live-override'],['ckArm','arm'],['ckDisarm','disarm'],['ckClose','close'],['ckScan','scan'],['ckTrain','train'],['ckSync','sync'],['ckClear','clear-halt']].forEach(([id,a])=>ckEl(id).onclick=()=>ckAction(a));
-  ckEl('ckMode').onchange=async e=>{const mode=e.target.value;try{if(mode==='live'&&!await ckConfirm('Switch to live mode?','Live mode requires a qualifying forward paper record or an enabled manual override. Switching modes disarms entries; arming live requires a separate confirmation.')){e.target.value=commoditydeskState?.config.mode||'paper';return}await ckRequest('control/mode',{mode,ack:mode==='live'});await refreshCommodityTradeAI()}catch(err){ckNotice(err.message,true);e.target.value=commoditydeskState?.config.mode||'paper'}};
+  ckEl('ckMode').onchange=async e=>{const mode=e.target.value;try{if(mode==='live'){if(!await ckConfirm('Switch Commodity AI to live mode?','This enables real-order mode only. Entries remain DISARMED until you separately press Arm and confirm. If paper evidence is not ready, this selection explicitly enables the existing manual live override.')){e.target.value=commoditydeskState?.config.mode||'paper';return}if(!(commoditydeskState?.evidence?.ready||commoditydeskState?.config?.live_override)){await ckRequest('control/live-override',{enabled:true,ack:true})}}await ckRequest('control/mode',{mode,ack:mode==='live'});await refreshCommodityTradeAI()}catch(err){ckNotice(err.message,true);e.target.value=commoditydeskState?.config.mode||'paper'}};
   ckEl('ckSettings').oninput=()=>commoditydeskDirty=true;
   ckEl('ckSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='square_off'||k==='cooldown'?v:Number(v));await ckRequest('config',body);commoditydeskDirty=false;ckNotice('Risk settings saved.');await refreshCommodityTradeAI()}catch(err){ckNotice(err.message,true)}};
   ckEl('ckExport').onclick=()=>{if(!commoditydeskState)return;const keys=['ts','symbol','mode','contract','qty','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...commoditydeskState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='commodity-ai-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
-  refreshCommodityTradeAI();commoditydeskTimer=setInterval(()=>{if(!document.hidden&&ckEl('commoditydesk')?.getClientRects().length)refreshCommodityTradeAI()},8000);
+  refreshCommodityTradeAI();commoditydeskTimer=setInterval(()=>{if(!document.hidden&&ckEl('commoditydesk')?.getClientRects().length)refreshCommodityTradeAI()},12000);
 }
-async function refreshCommodityTradeAI(){if(commoditydeskBusy)return;commoditydeskBusy=true;try{commoditydeskState=await ckRequest('state');ckRender(commoditydeskState)}catch(e){ckNotice(e.name==='AbortError'?'Backend request timed out; displayed values may be stale.':e.message,true);ckText('ckPulse','OFFLINE');['ckArm','ckMode','ckLiveOverride'].forEach(id=>{if(ckEl(id))ckEl(id).disabled=true})}finally{commoditydeskBusy=false}}
+async function refreshCommodityTradeAI(){if(commoditydeskBusy)return;commoditydeskBusy=true;try{commoditydeskState=await ckRequest('state');ckRender(commoditydeskState)}catch(e){const delayed=e.name==='AbortError';ckNotice(delayed?'Commodity backend is busy; retrying automatically. Last displayed values are retained.':e.message,true);ckText('ckPulse',navigator.onLine===false?'OFFLINE':'RETRYING');if(!commoditydeskState)ckEl('ckArm').disabled=true}finally{commoditydeskBusy=false}}
 function ckRender(s){
   renderCommodityRisk('ck');
   if(!(s.signals||[]).some(x=>x.symbol===commoditydeskSymbol))commoditydeskSymbol=s.signals?.[0]?.symbol||'';
   const hb=s.history_backfill||{};
-  ckText('ckScanStatus',`${s.universe?.mode||'Universe pending'} · monitoring ${s.watchlist?.length||0}/${s.universe?.total_fo||0} MCX underlyings · ${s.scan?.status||'IDLE'} ${s.scan?.completed||0}/${s.scan?.total||0} · deep ${s.scan?.deep_completed||0}/${s.scan?.deep_total||0} · fresh ${s.scan?.fresh_universe||0} · READY ${s.scan?.ready||0} · history ${hb.status||'WAITING'} ${hb.archive_complete_symbols||0}/${hb.total||0} resolved (${hb.archive_full_year_symbols||0} full-year + ${hb.archive_max_available_symbols||0} max-available)${hb.pause_reason?' · '+hb.pause_reason:''} · execution ${s.execution?.status||'IDLE'}${s.execution?.best?' ('+s.execution.best+(s.execution.best_success_probability!=null?' · '+ckNum(s.execution.best_success_probability*100,1)+'% success':'')+')':''} · ${s.scan?.phase||''} · ${s.ban_status||''}`);
+  ckText('ckScanStatus',`${s.universe?.mode||'Universe pending'} · MCX master ${s.commodity_master?.ready?'READY':s.commodity_master?.loading?'LOADING':'WAITING'} · monitoring ${s.watchlist?.length||0}/${s.universe?.total_fo||0} MCX underlyings · ${s.scan?.status||'IDLE'} ${s.scan?.completed||0}/${s.scan?.total||0} · deep ${s.scan?.deep_completed||0}/${s.scan?.deep_total||0} · fresh ${s.scan?.fresh_universe||0} · READY ${s.scan?.ready||0} · history ${hb.status||'WAITING'} ${hb.archive_complete_symbols||0}/${hb.total||0} resolved (${hb.archive_full_year_symbols||0} full-year + ${hb.archive_max_available_symbols||0} max-available)${hb.pause_reason?' · '+hb.pause_reason:''} · execution ${s.execution?.status||'IDLE'}${s.execution?.best?' ('+s.execution.best+(s.execution.best_success_probability!=null?' · '+ckNum(s.execution.best_success_probability*100,1)+'% success':'')+')':''} · ${s.scan?.phase||''} · ${s.ban_status||''}`);
   ckHTML('ckRanking',ckTable(['Rank','Stock','Score / 100','Stage','CE / PE','Direction conf.','Historical setup','Live option','Combined success','Exp. R','Spread','Entry','Stop','Target','Status / reason'],(s.signals||[]).map(x=>[x.rank,x.symbol,ckNum(x.rank_score,1),x.scan_stage||'—',x.option_type||'—',x.confidence==null?'—':ckNum(x.confidence*100,1)+'%',x.historical_setup_probability==null?(x.historical_setup_status||'Learning'):ckNum(x.historical_setup_probability*100,1)+'%',x.live_success_probability==null?'Learning':ckNum(x.live_success_probability*100,1)+'%',x.success_probability==null?'Fallback':ckNum(x.success_probability*100,1)+'%',x.expected_r==null?'—':ckNum(x.expected_r,2)+'R',x.spread==null?'—':ckNum(x.spread)+'%',ckMoney(x.entry),ckMoney(x.stop),ckMoney(x.target),x.decision+' · '+(x.reason||'')])));
   const cfg=s.config||{},ev=s.evidence||{},model=s.model||{},obs=s.observations||{};
   const age=s.last_cycle?(Date.now()-new Date(s.last_cycle).getTime())/1000:Infinity;
@@ -2937,7 +2958,7 @@ function ckRender(s){
   ckText('ckClock',ckTime(s.timestamp)+' IST');ckText('ckUpdated','Updated '+ckTime(s.timestamp));ckText('ckPnl',ckMoney(s.pnl?.[cfg.mode]));ckEl('ckPnl').className=(s.pnl?.[cfg.mode]||0)<0?'negative':'positive';ckText('ckPnlMode',cfg.mode==='live'?'Live account · estimated costs':'Paper account · estimated costs');
   ckText('ckExposure',ckMoney((s.positions||[]).reduce((v,p)=>v+p.entry*p.qty,0)));ckText('ckPositionCount',`${s.positions.length} / ${cfg.max_positions} active positions`);ckText('ckEvidence',`${ev.trades||0} / 60`);ckText('ckPulse',age>180?'DELAYED':cfg.armed?'ARMED':'DISARMED');ckText('ckCycle',s.last_cycle?'Last engine cycle '+ckTime(s.last_cycle):'Awaiting engine heartbeat');
   ckNotice(age>180&&s.market_open?'Engine heartbeat delayed. Check the backend before arming.':s.block||'Engine active · qualifying signals can enter '+cfg.mode+' trades.',!!s.halt);
-  ckEl('ckMode').value=cfg.mode;ckEl('ckMode').disabled=false;ckEl('ckMode').querySelector('option[value="live"]').disabled=!(ev.ready||cfg.live_override);
+  ckEl('ckMode').value=cfg.mode;ckEl('ckMode').disabled=false;ckEl('ckMode').querySelector('option[value="live"]').disabled=false;
   ckEl('ckArm').disabled=!!cfg.armed||!s.connected||!s.model||!!s.halt||age>180;ckEl('ckDisarm').disabled=!cfg.armed;
   ckHTML('ckSymbols',(s.signals||[]).map(x=>`<button data-symbol="${ckEsc(x.symbol)}" class="${commoditydeskSymbol===x.symbol?'selected':''}"><b>${ckEsc(x.symbol)}</b><span>${x.p_up==null?'NO PREDICTION':ckNum(x.p_up*100,1)+'% UP'} · ${ckEsc(x.decision)}</span></button>`).join(''));
   document.querySelectorAll('#commoditydesk [data-symbol]').forEach(b=>b.onclick=()=>{commoditydeskSymbol=b.dataset.symbol;ckRender(commoditydeskState)});
