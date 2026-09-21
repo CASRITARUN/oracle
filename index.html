@@ -465,6 +465,25 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 
 
 
+<div id="autoLiveBar" role="region" aria-label="Automatic live schedule">
+<style>
+#autoLiveBar{margin:0;padding:12px 28px;border-bottom:1px solid var(--line);background:var(--panel);font-size:13px;line-height:1.5}
+#autoLiveBar .alb-row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;justify-content:space-between}
+#autoLiveBar .alb-badge{display:inline-block;padding:2px 9px;border-radius:999px;font-weight:700;font-size:12px;border:1px solid var(--line)}
+#autoLiveBar .alb-on{background:#3a1d20;color:#ffb8b4;border-color:#7a2b31}
+#autoLiveBar .alb-off{background:#1e2530;color:var(--muted)}
+#autoLiveBar button{background:#1b2230;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 12px;cursor:pointer;font:inherit}
+#autoLiveBar .alb-desks{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+#autoLiveBar .alb-desk{padding:3px 10px;border:1px solid var(--line);border-radius:7px;color:var(--muted)}
+#autoLiveBar .alb-desk.armed{color:#ffb8b4;border-color:#7a2b31}
+#autoLiveBar .alb-warn{color:#f5c26b;margin-top:6px}
+#autoLiveBar details{margin-top:8px;color:var(--muted)}
+</style>
+<div class="alb-row"><div><strong>Automatic live schedule</strong> <span id="albBadge" class="alb-badge alb-off">…</span> <span id="albText" style="color:var(--muted)">Loading…</span></div><div><button id="albToggle" type="button">…</button></div></div>
+<div id="albDesks" class="alb-desks"></div><div id="albProblems"></div>
+<details><summary>Schedule log</summary><div id="albLog" style="font-size:12px;margin-top:6px"></div></details>
+</div>
+
 <div class="tab-page active" id="tabPageCondor">
 <div class="wrap">
 
@@ -1051,6 +1070,11 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
     <section class="dk-panel"><div class="dk-title"><h2>Live readiness</h2><span id="dkLiveLock" class="dk-badge">Locked</span></div><div id="dkGates"></div><button id="dkLiveOverride" type="button">Enable manual override</button><p class="dk-footnote">Current-build paper trades determine automatic eligibility. Manual override bypasses paper evidence; fresh Kronos data, liquidity, position reconciliation and risk limits still apply.</p></section></aside></div>
   </section>
   <section class="dk-view" data-pane="learning" hidden><div class="dk-section-intro"><div><p class="dk-eyebrow">FORECAST LAB</p><h2>Kronos + price action</h2><p>Three five-minute forecast bars. Automatic index and CE/PE selection within your risk limits.</p></div><div class="dk-actions"><button id="dkSync">Sync recent history</button><button id="dkTrain" class="dk-primary">Refresh forecast</button></div></div>
+<section class="dk-panel" id="calxPanel"><h2>Signal calibration · does the score point the right way?</h2>
+<p class="dk-footnote">Every completed five-minute bar on every index is logged, qualified or not, and later compared with the real close about 15 minutes on. A hit means the close landed on the predicted side. Roughly 270 rows per group are needed to tell a 55% hit rate from 50%, and the four indices move together, so treat small groups as anecdotes.</p>
+<style>#calxPanel table{border-collapse:collapse;width:100%;margin:10px 0}#calxPanel th,#calxPanel td{padding:6px 10px;border-bottom:1px solid rgba(128,128,128,.28);text-align:left;font-variant-numeric:tabular-nums}#calxPanel .calx-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}#calxPanel h3{margin:16px 0 4px;font-size:15px}#calxPanel .calx-good{color:#4ea800;font-weight:600}#calxPanel .calx-bad{color:#d0453c;font-weight:600}</style>
+<div class="calx-bar"><button id="calxRefresh" type="button">Refresh calibration</button><select id="calxBuild" aria-label="Strategy build"><option value="">Current build only</option><option value="all">All builds</option></select><span id="calxStatus" class="dk-footnote"></span></div>
+<div id="calxBody"><p class="dk-footnote">Loading…</p></div></section>
 <section class="dk-panel"><h2>Forecast engine</h2><div id="dkKronosStatus"></div><p class="dk-footnote">Missing dependencies or stale forecasts pause new entries. Position supervision runs separately. Kronos is built into backend.py. One-time setup: python backend.py --setup-kronos.</p></section>
 <div class="dk-learning-grid"><section class="dk-panel"><h2>01 / Forecast</h2><p>Kronos-small reads the recent 5-minute market structure and projects the next 15 minutes. V7 scores the full forecast path instead of relying only on its final point.</p></section><section class="dk-panel"><h2>02 / Confirm</h2><p>The direction score blends 58% Kronos and 42% price action. Mild disagreement can qualify when one side clearly dominates; unresolved conflict, shocks and weak volatility-scaled edges still wait.</p></section><section class="dk-panel"><h2>03 / Manage</h2><p>Stops, targets and risk limits remain immediate. AI reversal exits use new-candle hysteresis: no same-candle flip exit, and normal reversals require persistence across distinct completed bars.</p></section></div>
 <section class="dk-panel"><h2>Selected forecast path</h2><div id="dkForecastPath"></div><p class="dk-footnote">The direction score is not calibrated probability. The delta-based option move is a rough cost screen; volatility changes and time decay can still cause losses. Kronos does not establish a trading edge by itself.</p></section><section class="dk-panel"><h2>Current-build paper results</h2><div id="dkPaperLearning"></div></section></section>
@@ -1072,10 +1096,10 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <p id="casFeed" role="status">Streaming feed: awaiting Kite login</p>
 <div id="casNotice" role="status">Connect Kite to begin collecting fresh market quotes.</div>
 <div class="cas-grid"><div class="metric"><small>Paper P&amp;L · after estimated fees</small><b id="casPaper">—</b></div><div class="metric"><small>Live P&amp;L · after estimated fees</small><b id="casLive">—</b></div><div class="metric"><small>Active positions</small><b id="casPositionsCount">0</b></div><div class="metric"><small>Settled learning observations</small><b id="casSamples">0</b></div></div>
-<div class="cas-panel"><h3>Live spike scanner</h3><p id="casWindow"></p><small>Four indices · nearest-expiry CE/PE · fresh timestamp confirmations · near-ATM option premium confirmation. FULL streaming updates wake the scanner; processing and broker latency still apply.</small><div id="casSignals"></div></div>
+<div class="cas-panel"><h3>Live spike scanner</h3><p id="casWindow"></p><small>Four indices · nearest-expiry CE/PE · the price signal is the nearest index future, because the cash index is frozen by the closing auction from 15:15 until about 15:35 · fresh timestamp confirmations · option premium confirmation · contracts whose lot risk exceeds your budget are skipped. FULL streaming updates wake the scanner; processing and broker latency still apply.</small><div id="casSignals"></div></div>
 <div class="cas-panel"><h3>Open positions &amp; exit supervision</h3><div id="casPositions"></div><small>Stops, trailing stops, targets, partial profit and scheduled square-off run in this backend. There is no fixed holding-time exit. Keep it connected. Unfilled exits and price gaps can exceed the planned loss.</small></div>
-<div class="cas-panel"><div class="cas-row"><h3>CAS learning &amp; forward evidence</h3><button data-cas-action="train">Train CAS model</button></div><p id="casLearning"></p><p id="casEvidence"></p><small>Paper starts with explicit momentum rules. Samples predict index direction 5 seconds ahead, not option profitability. Automatic training runs after enough new settled observations while disarmed and flat. Only a model that beats its chronological validation baseline is activated. Live additionally requires the paper-performance gate or a manual evidence override.</small><div class="cas-row" style="margin-top:14px"><button data-cas-action="live-override" id="casOverride">Enable paper-evidence override</button><small>The override cannot bypass the validated-model or session-verification requirements.</small></div></div>
-<details class="cas-panel"><summary><strong>Session timings &amp; risk settings</strong></summary><p style="margin-top:14px">All times are IST. Entries end at 15:38; exit attempts start at 15:39, ahead of the configured 15:40 close. New orders use NRML with IOC limit prices. Unfilled quantities cancel; fills are reconciled before another order. Failed exits may leave overnight exposure. Check today’s holiday schedule, NFO/BFO trading hours and Kite NRML cutoff before live trading. Saving any setting clears session verification.</p><form id="casSettings"><div class="cas-fields" id="casFields"></div><button class="primary" type="submit">Save settings</button></form><div class="cas-row" style="margin-top:18px"><button data-cas-action="verify-session">Verify today's session &amp; NRML cutoff</button><button data-cas-action="clear-halt">Recheck broker / clear resolved halt</button></div><small id="casVerified"></small></details>
+<div class="cas-panel"><div class="cas-row"><h3>CAS learning &amp; forward evidence</h3><button data-cas-action="train">Train CAS model</button></div><p id="casLearning"></p><p id="casEvidence"></p><small>Paper starts with explicit momentum rules. Samples predict index direction 5 seconds ahead, not option profitability. Automatic training runs after enough new settled observations while disarmed and flat. Only a model that beats its chronological validation baseline is activated. CAS live trading does not require a validated model or a paper record; the loss limits, broker reconciliation and data-freshness checks still apply.</small><div class="cas-row" style="margin-top:14px"><button data-cas-action="live-override" id="casOverride" hidden>Enable paper-evidence override</button><small>Paper evidence, model validation and daily session verification are no longer required for CAS live trading. Loss limits, broker reconciliation and data-freshness checks still apply.</small></div></div>
+<details class="cas-panel"><summary><strong>Session timings &amp; risk settings</strong></summary><p style="margin-top:14px">All times are IST. Since 3 August 2026 the closing auction freezes the cash index from 15:15 to about 15:35 while index futures and options trade until 15:40, so the desk reads the nearest index future. Entries end at 15:38; exit attempts start at 15:39, ahead of the configured 15:40 close. New orders use NRML with IOC limit prices. Unfilled quantities cancel; fills are reconciled before another order. Failed exits may leave overnight exposure. Check today’s holiday schedule, NFO/BFO trading hours and Kite NRML cutoff before live trading. Saving any setting clears session verification.</p><form id="casSettings"><div class="cas-fields" id="casFields"></div><div class="cas-fields" style="margin-top:12px"><label>Price signal source<select name="signal_source" id="casSignalSource"><option value="futures">Nearest index future (use this during the closing auction)</option><option value="spot">Cash index</option></select></label></div><button class="primary" type="submit">Save settings</button></form><div class="cas-row" style="margin-top:18px"><button data-cas-action="verify-session">Verify today's session &amp; NRML cutoff (optional)</button><button data-cas-action="clear-halt">Recheck broker / clear resolved halt</button></div><small id="casVerified"></small></details>
 <details class="cas-panel"><summary><strong>Trade journal &amp; broker orders</strong></summary><button id="casExport" style="margin-top:14px">Export CAS trades</button><div id="casTrades"></div><h3>Trade review · expected and observed</h3><div id="casReviewControls"></div><div id="casReviewOutput"></div><h3 style="margin-top:20px">Order reconciliation</h3><div id="casOrders"></div></details>
 <div class="cas-panel"><h3>Recent engine events</h3><div id="casEvents" class="cas-events"></div></div>
 <small>Uses KiteTicker FULL index and option streaming. Auction indicative equilibrium prices and auction imbalance are not supplied by this feed. Trades are continuous-market option orders, not cash-auction orders. <a href="https://www.nseindia.com/static/market-data/market-timings" target="_blank" rel="noopener">NSE timings</a> · <a href="https://kite.trade/docs/connect/v3/market-quotes/" target="_blank" rel="noopener">Quote fields</a></small>
@@ -1130,7 +1154,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
     <div class="ck-metrics"><article><span>Today's net P&amp;L · estimated costs</span><strong id="ckPnl">—</strong><small id="ckPnlMode">Paper account</small></article><article><span>Open exposure</span><strong id="ckExposure">—</strong><small id="ckPositionCount">No data yet</small></article><article><span>Forward paper evidence</span><strong id="ckEvidence">—</strong><small>Completed trades · separate from training</small></article><article><span>Engine pulse</span><strong id="ckPulse">—</strong><small id="ckCycle">Awaiting first scan</small></article></div>
     <div class="ck-workspace"><main><section class="ck-panel"><div class="ck-title"><div><p class="ck-eyebrow">MARKET OBSERVATORY</p><h2>Read the market. See the reason.</h2></div><button id="ckScan" class="ck-text-btn">Refresh scan ↻</button></div><div id="ckSymbols" class="ck-symbols"></div><div class="ck-chart-head"><div><span id="ckChartName">Select stock</span><strong id="ckSpot">—</strong></div><span id="ckChartMeta">Completed 5-minute candles</span></div><div id="ckPriceChart" class="ck-chart"><div class="ck-empty">Current-market history will appear after connection.</div></div><div class="ck-chart-caption"><span>STOCK CLOSE · LAST 60 BARS</span><span id="ckBarTime">No candle received</span></div></section>
     <section class="ck-panel ck-positions"><div class="ck-title"><div><p class="ck-eyebrow">POSITION MONITOR</p><h2>Capital at work</h2></div><button id="ckClose" class="ck-danger">Close all & disarm</button></div><div id="ckPositions" class="ck-table-wrap"><div class="ck-empty">No position data yet.</div></div></section>
-    <section class="ck-panel"><div class="ck-title"><div><p class="ck-eyebrow">LIVE DECISION LOG</p><h2>What the engine is doing</h2></div><span class="ck-muted">Latest activity</span></div><div id="ckEvents"></div></section></main>
+    <section class="ck-panel"><div class="ck-title"><div><p class="ck-eyebrow">LIVE DECISION LOG</p><h2>What the engine is doing</h2></div><span class="ck-muted">Latest activity</span></div><div id="ckEvents"></div></section><section class="ck-panel" id="ckFunnelPanel"><div class="ck-title"><div><p class="ck-eyebrow">WHY NO ENTRIES</p><h2>Where candidates are being stopped</h2></div><button id="ckFunnelRefresh" class="ck-text-btn" type="button">Refresh</button></div><p class="ck-muted">Reasons are tallied over the latest scan cycles. Read from the top: the biggest line is the gate stopping most symbols.</p><div id="ckFunnelBody"><p class="ck-muted">Loading…</p></div></section></main>
     <aside><section class="ck-panel ck-signal"><p class="ck-eyebrow">DIRECTIONAL READ</p><div class="ck-signal-title"><h2 id="ckDirection">Awaiting data</h2><span id="ckRegime" class="ck-badge">—</span></div><div class="ck-prob"><strong id="ckProbability">—</strong><span>probability of an upward move<br>over the next 15 minutes</span></div><div class="ck-prob-track"><i id="ckProbFill"></i><b></b></div><div class="ck-prob-labels"><span>DOWN</span><span>UP</span></div><div id="ckReason" class="ck-reason">A completed model, fresh data and executable quotes are needed.</div><div id="ckModels" class="ck-models"></div><h3>Drivers of this prediction</h3><div id="ckFactors" class="ck-muted">Feature contributions appear with a prediction.</div></section>
     <section class="ck-panel ck-order-plan"><p class="ck-eyebrow">PROPOSED TRADE</p><h2 id="ckContract">No qualified contract</h2><div id="ckPlan"></div><p class="ck-footnote">A qualified signal is not a fill. Execution must pass the account, risk and order checks.</p></section>
     <section class="ck-panel"><div class="ck-title"><h2>Live readiness</h2><span id="ckLiveLock" class="ck-badge">Locked</span></div><div id="ckGates"></div><button id="ckLiveOverride" type="button">Enable manual override</button><p class="ck-footnote">Only forward paper trades count toward automatic eligibility. Manual override unlocks live selection; all other trading controls still apply.</p></section></aside></div>
@@ -2781,7 +2805,7 @@ function dkRender(s){
   dkHTML('dkPositions',dkTable(['Index / option','Mode','Qty','Entry','Bid','Open P&L','Status / action'],(s.positions||[]).map(p=>[p.symbol+' / '+p.contract,p.mode,p.qty,dkNum(p.entry),dkNum(p.bid),dkMoney(p.unrealized),p.status+' · '+(p.reason||'Reconciling')])));
   dkHTML('dkEvents',(s.events||[]).slice(0,8).map(e=>`<div class="dk-event"><time>${dkTime(e.ts)}</time><b>${dkEsc(e.kind)}</b><span>${dkEsc((e.symbol?e.symbol+' · ':'')+e.detail)}</span></div>`).join('')||'<div class="dk-empty">The next scan will add its decision and reason here.</div>');
   const train=s.training||{},training=train.status==='SYNCING RECENT HISTORY';dkEl('dkSync').disabled=training;dkEl('dkTrain').disabled=false;
-  dkHTML('dkKronosStatus',dkKV('Build',s.build)+dkKV('Worker',s.kronos?.status||'IDLE')+dkKV('Model',s.kronos?.model||'Kronos-small')+dkKV('Fresh forecasts',`${s.kronos?.fresh_results??0} / 4`)+dkKV('Queued symbols',s.kronos?.pending??0)+dkKV('Active batch',(s.kronos?.active||[]).join(', ')||'—')+dkKV('Batch / lookback',`${s.kronos?.batch_size??'—'} symbols / ${s.kronos?.lookback??'—'} bars`)+dkKV('History sync',train.status||'IDLE')+dkKV('Details',s.kronos?.error||train.error||(s.kronos?.active_seconds!=null?`Inference running ${dkNum(s.kronos.active_seconds,0)}s`:'Ready for the next completed candle')));
+  dkHTML('dkKronosStatus',dkKV('Build',s.build)+dkKV('Worker',s.kronos?.status||'IDLE')+dkKV('Model',s.kronos?.model||'Kronos-small')+dkKV('Fresh forecasts',`${s.kronos?.fresh_results??0} / 4`)+dkKV('Queued symbols',s.kronos?.pending??0)+dkKV('Active batch',(s.kronos?.active||[]).join(', ')||'—')+dkKV('Batch / lookback',`${s.kronos?.batch_size??'—'} symbols / ${s.kronos?.lookback??'—'} bars`)+dkKV('Samples per forecast',s.kronos?.samples!=null?`${s.kronos.samples} · split-half agreement gate ${s.kronos?.split_agreement_gate?'ON':'OFF'}`:'—')+dkKV('History sync',train.status||'IDLE')+dkKV('Details',s.kronos?.error||train.error||(s.kronos?.active_seconds!=null?`Inference running ${dkNum(s.kronos.active_seconds,0)}s`:'Ready for the next completed candle')));
   dkHTML('dkForecastPath',dkTable(['Forecast candle · IST','Forecast close'],(sig.forecast||[]).map((v,i)=>[dkDate(sig.forecast_timestamps?.[i]),dkNum(v,2)])));
   dkHTML('dkPaperLearning',dkKV('Current strategy closed trades',ev.trades||0)+dkKV('Net result',dkMoney(ev.net))+dkKV('Observed win rate',dkNum(ev.win_rate,1)+'%')+dkKV('Live eligibility',cfg.live_override?'Manual paper-evidence override':ev.ready?'Paper thresholds met':'Building paper record'));
   dkHTML('dkEquity',dkLineChart(ev.equity,'pnl','Close at least two paper trades to draw the equity curve.'));
@@ -3576,7 +3600,7 @@ function initCASUI(){if(casInitialized){casRefresh();return}casInitialized=true;
  casEl('casFields').innerHTML=casFields.map(([k,label,min,max])=>'<label>'+casEsc(label)+'<input name="'+k+'" type="'+(min==='time'?'time':'number')+'" '+(min==='time'?'':'min="'+min+'" max="'+max+'" step="any"')+' required></label>').join('');
  document.querySelectorAll('[data-cas-action]').forEach(b=>b.onclick=()=>casAction(b.dataset.casAction));
  casEl('casSettings').oninput=()=>casDirty=true;
- casEl('casSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=casFields.find(f=>f[0]===k)[2]==='time'?v:Number(v));await casRequest('config',body);casDirty=false;await casRefresh();casText('casNotice','CAS settings saved; session verification cleared.')}catch(e){casText('casNotice',e.message)}};
+ casEl('casSettings').onsubmit=async e=>{e.preventDefault();try{const body={};new FormData(e.target).forEach((v,k)=>body[k]=k==='signal_source'?v:(casFields.find(f=>f[0]===k)[2]==='time'?v:Number(v)));await casRequest('config',body);casDirty=false;await casRefresh();casText('casNotice','CAS settings saved; session verification cleared.')}catch(e){casText('casNotice',e.message)}};
  casEl('casMode').onchange=async e=>{try{const mode=e.target.value;if(mode==='live'&&!confirm('Switch CAS to Live? Entries stay disarmed until you explicitly arm.')){e.target.value=casState?.config.mode||'paper';return}await casRequest('control/mode',{mode,ack:mode==='live'});await casRefresh()}catch(err){e.target.value=casState?.config.mode||'paper';casText('casNotice',err.message)}};
  casEl('casDownloadDiagnostics').onclick=()=>{if(!casState)return;const data={timestamp:casState.timestamp,readiness:casState.live_readiness,stream:casState.stream,block:casState.block,halt:casState.halt,config:casState.config,training:casState.training,observations:casState.observations,signals:casState.signals};const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='cas-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
  casEl('casExport').onclick=()=>{if(!casState)return;const keys=['ts','symbol','mode','contract','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...casState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='cas-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
@@ -3584,22 +3608,22 @@ function initCASUI(){if(casInitialized){casRefresh();return}casInitialized=true;
 }
 async function casRefresh(){if(casBusy)return;casBusy=true;try{const s=await casRequest('state');casState=s;const c=s.config,age=s.last_cycle?(Date.now()-new Date(s.last_cycle))/1000:Infinity;
  casEl('casReadiness').innerHTML=casTable(['Check','Status','Explanation / next step'],(s.live_readiness||[]).map(x=>[x.check,x.passed?'PASS':'WAIT / BLOCKED',x.detail]));
- casText('casFeed',s.stream?.status+' · '+(s.stream?.subscriptions||0)+' instruments · latest arrival '+(s.stream?.last_tick_age_seconds??'—')+'s ago');
+ casText('casFeed',s.stream?.status+' · '+(s.stream?.subscriptions||0)+' instruments · latest arrival '+(s.stream?.last_tick_age_seconds??'—')+'s ago'+' · signal: '+(s.stream?.signal_source==='spot'?'cash index':'index futures'+(s.stream?.futures&&Object.keys(s.stream.futures).length?' ('+Object.values(s.stream.futures).join(', ')+')':' (loading)'))+(s.stream?.setup_errors&&Object.keys(s.stream.setup_errors).length?' · SETUP ISSUE: '+Object.entries(s.stream.setup_errors).map(([k,v])=>k+': '+v).join('; '):''));
  casText('casHeartbeat',(age>20?'DELAYED · ':c.armed?'ARMED · ':'DISARMED · ')+c.mode.toUpperCase());casText('casNotice',s.halt||s.block||'Scanning within the configured CAS window');casEl('casMode').value=c.mode;
  document.querySelectorAll('[data-cas-action="arm"]').forEach(b=>b.disabled=age>20||!s.connected);
  casText('casPaper','₹ '+casNum(s.pnl.paper));casText('casLive','₹ '+casNum(s.pnl.live));casText('casPositionsCount',s.positions.length+' / '+c.max_positions);casText('casSamples',s.observations.settled||0);
  casText('casWindow',`${c.entry_start}–${c.entry_end} entries · ${c.square_off} square-off · FULL streaming · tick-triggered scans · all times IST`);
  casEl('casSignals').innerHTML=casTable(['Index','Spot','Move · bps','Direction','Confirmations','Model UP %','Decision','Contract','Reason'],s.signals.map(x=>[x.symbol,casNum(x.spot),casNum(x.move_bps),x.direction,x.confirmations,casNum(x.p_up==null?null:x.p_up*100),x.decision,x.contract,x.reason]));
  casEl('casPositions').innerHTML=casTable(['Index','Contract','Qty','Entry','Bid','Stop','Target','Unrealized','Status / action'],s.positions.map(p=>[p.symbol,p.contract+' · '+p.product,p.qty,casNum(p.entry),casNum(p.bid),casNum(p.stop),casNum(p.target),casNum(p.unrealized),p.status+' · '+(p.reason||'Awaiting quote')]));
- casText('casLearning',`${s.model?'Model '+s.model.id+' · validation '+casNum(s.model.accuracy)+'% vs baseline '+casNum(s.model.baseline)+'%':'No validated model · rule-based paper bootstrap'} · ${s.training.status}${s.training.error?' · '+s.training.error:''}`);
- casText('casEvidence',(s.evidence.ready?'Paper gate PASSED':'Paper gate collecting')+' · '+s.evidence.checks.map(x=>x.name+': '+casNum(x.value)+' / '+x.required).join(' · '));
- casText('casOverride',c.live_override?'Disable paper-evidence override':'Enable paper-evidence override');casText('casVerified',c.verified_date?'Session verified: '+c.verified_date:'Session not verified for live trading.');
+ casText('casLearning',`${s.model?'Model '+s.model.id+' · validation '+casNum(s.model.accuracy)+'% vs baseline '+casNum(s.model.baseline)+'%':'No validated model · rule-based momentum signals (live trading does not require a model)'} · ${s.training.status}${s.training.error?' · '+s.training.error:''}`);
+ casText('casEvidence',(s.evidence.ready?'Paper record meets the reference thresholds':'Paper record still building (not required for CAS live)')+' · '+s.evidence.checks.map(x=>x.name+': '+casNum(x.value)+' / '+x.required).join(' · '));
+ casText('casOverride',c.live_override?'Disable paper-evidence override':'Enable paper-evidence override');casText('casVerified','Session verification is optional; CAS live trading no longer requires it.');
  renderSharedRisk('cas');
  renderTradeReviewControls('cas','cas',s.trades||[],s.recorder_error);
  casEl('casTrades').innerHTML=casTable(['Entry time','Index','Mode','Contract','Entry','Status','Net P&L','Exit reason'],s.trades.map(p=>[p.ts,p.symbol,p.mode,p.contract,casNum(p.entry),p.status,casNum(p.pnl-p.fees),p.exit_reason]));
  casEl('casOrders').innerHTML=casTable(['Time','Side','Requested / filled','Status','Broker ID','Reason / error'],s.orders.map(o=>[o.ts,o.side,o.qty+' / '+o.filled,o.status,o.broker_id,o.error||o.reason]));
  casText('casEvents',s.events.slice(0,30).map(e=>e.ts+' · '+e.kind+' · '+e.detail).join('\n')||'No events yet.');
- if(!casDirty)casFields.forEach(([k])=>casEl('casSettings').elements.namedItem(k).value=c[k]);
+ if(!casDirty){casFields.forEach(([k])=>casEl('casSettings').elements.namedItem(k).value=c[k]);const ss=casEl('casSettings').elements.namedItem('signal_source');if(ss)ss.value=c.signal_source||'futures'}
 }catch(e){casText('casHeartbeat','OFFLINE');casText('casNotice',e.name==='AbortError'?'Backend timeout; displayed values may be stale.':e.message);document.querySelectorAll('[data-cas-action="arm"]').forEach(b=>b.disabled=true)}finally{casBusy=false}}
 
 </script>
@@ -3783,6 +3807,147 @@ async function refreshCommodityRisk(){
  }catch(e){for(const p of commodityRiskPanels.values())p.info.textContent='Commodity risk status unavailable: '+e.message+' · previous displayed values must not be treated as current.'}finally{commodityRiskBusy=false}
 }
 
+</script>
+<script>
+/* v6 diagnostics: signal calibration (Index desk) and entry funnel (Commodity desk). Read-only; they never change desk state. */
+(function(){
+  const esc=v=>String(v??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const pct=v=>v==null?'—':(v*100).toFixed(1)+'%';
+  const num=(v,d=3)=>v==null?'—':Number(v).toFixed(d);
+  const ci=a=>a&&a[0]!=null?pct(a[0])+' – '+pct(a[1]):'—';
+  const visible=el=>!!(el&&el.getClientRects().length);
+  async function getJSON(url){
+    const r=await fetch(url,{headers:{Accept:'application/json'}});
+    let j=null;try{j=await r.json()}catch(e){}
+    if(!r.ok)throw new Error((j&&(j.error||j.message))||('HTTP '+r.status));
+    return j;
+  }
+
+  /* ---- Index desk: signal calibration ---- */
+  const calx={busy:false,last:0};
+  function verdict(o){
+    if(!o||!o.n)return '—';
+    if(o.hit_ci90&&o.hit_ci90[0]!=null){
+      if(o.hit_ci90[0]>0.5)return '<span class="calx-good">above chance</span>';
+      if(o.hit_ci90[1]<0.5)return '<span class="calx-bad">worse than chance</span>';
+    }
+    return 'not yet distinguishable';
+  }
+  function calRow(label,o){
+    o=o||{};return '<tr><td>'+esc(label)+'</td><td>'+esc(o.n)+'</td><td>'+pct(o.hit_rate)+'</td><td>'+ci(o.hit_ci90)+'</td><td>'+num(o.avg_dir_move_atr)+'</td><td>'+verdict(o)+'</td></tr>';
+  }
+  const calHead='<thead><tr><th>Group</th><th>Rows</th><th>Hit rate</th><th>90% range</th><th>Avg move in ATR</th><th>vs a coin flip</th></tr></thead>';
+  function renderCal(d){
+    const parts=[];
+    parts.push('<p><b>'+esc(d.settled)+'</b> settled rows · '+esc(d.pending_open)+' waiting for their target bar · market rose in <b>'+pct(d.base_rate_market_up)+'</b> of rows (a signal must beat what drift alone gives) · build <code>'+esc(d.build)+'</code></p>');
+    if(d.signal_log_error)parts.push('<p class="calx-bad">Logger error: '+esc(d.signal_log_error)+'</p>');
+    parts.push('<h3>By score strength</h3><table>'+calHead+'<tbody>'+(d.by_margin_bucket||[]).filter(b=>b.n).map(b=>calRow('score '+b.margin_from.toFixed(2)+' – '+b.margin_to.toFixed(2),b)).join('')+'</tbody></table>');
+    const c=d.components||{};
+    parts.push('<h3>Which part carries the signal</h3><table>'+calHead+'<tbody>'+calRow('Blended score',c.blend)+calRow('Kronos alone',c.kronos_sign)+calRow('Price action alone',c.technical_sign)+'</tbody></table>');
+    parts.push('<h3>Gates</h3><table>'+calHead+'<tbody>'+calRow('Every logged bar',d.overall)+calRow('Passed the direction gate',d.passed_direction_gate)+calRow('Became READY',d.became_ready)+'</tbody></table>');
+    const sh=d.split_half||{};
+    parts.push('<h3>Kronos sample halves</h3><table>'+calHead+'<tbody>'+calRow('Halves agree',sh.agree)+calRow('Halves disagree',sh.disagree)+calRow('Not available',sh.not_available)+'</tbody></table>');
+    const bs=d.by_symbol||{};
+    if(Object.keys(bs).length)parts.push('<h3>By index</h3><table>'+calHead+'<tbody>'+Object.entries(bs).map(([k,v])=>calRow(k,v)).join('')+'</tbody></table>');
+    const cm=d.by_cache_mode||{};
+    if(Object.keys(cm).length)parts.push('<h3>Fresh vs rolled-forward forecast</h3><table>'+calHead+'<tbody>'+Object.entries(cm).map(([k,v])=>calRow(k,v)).join('')+'</tbody></table>');
+    const fd=d.final_decisions||{};
+    if(Object.keys(fd).length)parts.push('<p class="dk-footnote">Final decisions: '+Object.entries(fd).map(([k,v])=>esc(k)+' '+esc(v)).join(' · ')+'</p>');
+    if(d.note)parts.push('<p class="dk-footnote">'+esc(d.note)+'</p>');
+    return parts.join('');
+  }
+  async function loadCal(){
+    const body=document.getElementById('calxBody');if(!body||calx.busy)return;
+    calx.busy=true;const st=document.getElementById('calxStatus');if(st)st.textContent='Loading…';
+    try{
+      const b=document.getElementById('calxBuild')?.value;
+      const d=await getJSON('/api/ai-desk/signal-calibration'+(b?'?build='+encodeURIComponent(b):''));
+      body.innerHTML=renderCal(d);calx.last=Date.now();
+      if(st)st.textContent='Updated '+new Date().toLocaleTimeString();
+    }catch(e){body.innerHTML='<p class="calx-bad">Calibration unavailable: '+esc(e.message)+'</p>';if(st)st.textContent=''}
+    finally{calx.busy=false}
+  }
+
+  /* ---- Commodity desk: entry funnel ---- */
+  const fun={busy:false,last:0};
+  function renderFunnel(d){
+    const parts=[],desk=d.desk||{},dir=d.direction||{},mod=d.model||{},siz=d.sizing||{},set=d.settings||{};
+    parts.push('<p><b>'+esc((desk.mode||'').toUpperCase())+'</b> · '+(desk.armed?'armed':'<b>not armed</b>')+' · market '+(desk.market_open?'open':'closed')+' · universe '+esc(desk.universe)+' contracts'+(desk.entry_block?' · <b>entry block:</b> '+esc(desk.entry_block):'')+'</p>');
+    const rows=d.reasons_last_cycles||[];
+    parts.push('<table><thead><tr><th>Stage · decision · reason</th><th>Symbol scans</th><th>Share</th></tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr><td>'+esc(r.gate)+'</td><td>'+esc(r.symbol_scans)+'</td><td>'+pct(r.share)+'</td></tr>').join(''):'<tr><td colspan="3">No completed scan yet. Keep the desk connected during market hours.</td></tr>')+'</tbody></table>');
+    parts.push('<p><b>Direction confidence</b> (needs '+esc(dir.threshold)+'): min '+esc(dir.confidence_min)+' · median '+esc(dir.confidence_median)+' · 90th pct '+esc(dir.confidence_p90)+' · max '+esc(dir.confidence_max)+' · '+esc(dir.at_or_above_threshold)+' of '+esc(dir.symbols)+' symbols at or above the threshold.</p>');
+    parts.push('<p><b>Model</b> '+esc(mod.id)+' · AUC '+esc(mod.auc)+' · accuracy '+esc(mod.accuracy)+' vs baseline '+esc(mod.baseline)+' · contracts with enough history '+esc(mod.contracts_with_enough_history)+(mod.contracts_missing_history&&mod.contracts_missing_history.length?' · missing: '+esc(mod.contracts_missing_history.join(', ')):'')+'</p>');
+    parts.push('<p><b>Sizing limit</b> · capital ₹'+esc(siz.capital)+' · risk ₹'+esc(siz.risk)+' · stop '+esc(siz.stop_pct)+'% → one lot may cost at most about <b>₹'+esc(siz.max_premium_per_lot)+'</b> of premium.'+((siz.seen||[]).length?' Seen: '+siz.seen.map(x=>esc(x.symbol)+' lot ≈ ₹'+esc(x.lot_premium)).join(' · '):'')+'</p>');
+    parts.push('<p class="ck-muted">Settings in force: max spread '+esc(set.max_spread)+'% · square-off '+esc(set.square_off)+' · IV stress '+esc(set.iv_stress_fraction)+' · min scenario R '+esc(set.min_scenario_r)+'</p>');
+    if((d.reached_deep_check||[]).length)parts.push('<p class="ck-muted">Reached the option check: '+esc(d.reached_deep_check.join(', '))+'</p>');
+    if((d.ready_now||[]).length)parts.push('<p><b>READY now:</b> '+esc(d.ready_now.join(', '))+'</p>');
+    return parts.join('');
+  }
+  async function loadFunnel(){
+    const body=document.getElementById('ckFunnelBody');if(!body||fun.busy)return;
+    fun.busy=true;
+    try{body.innerHTML=renderFunnel(await getJSON('/api/commodity-ai/funnel'));fun.last=Date.now()}
+    catch(e){body.innerHTML='<p class="ck-muted">Funnel unavailable: '+esc(e.message)+'</p>'}
+    finally{fun.busy=false}
+  }
+
+  document.addEventListener('click',e=>{
+    if(e.target&&e.target.id==='calxRefresh')loadCal();
+    if(e.target&&e.target.id==='ckFunnelRefresh')loadFunnel();
+  });
+  document.addEventListener('change',e=>{if(e.target&&e.target.id==='calxBuild')loadCal()});
+  // Load when a panel becomes visible, then refresh slowly while it stays visible.
+  setInterval(()=>{
+    if(document.hidden)return;
+    if(visible(document.getElementById('calxPanel'))&&Date.now()-calx.last>60000)loadCal();
+    if(visible(document.getElementById('ckFunnelPanel'))&&Date.now()-fun.last>15000)loadFunnel();
+  },2000);
+})();
+</script>
+<script>
+/* v7: automatic live schedule. Index/Stock/Commodity go live at 09:15; one minute before the CAS window they are
+   disarmed and CAS goes live; Commodity is armed again after CAS. The bar only reads state and sends the on/off switch. */
+(function(){
+  const esc=v=>String(v??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const NAMES={index:'Index',stock:'Stock',commodity:'Commodity',cas:'CAS'};
+  let state=null,busy=false;
+  async function req(path,body){
+    const r=await fetch('/api/auto-live/'+path,body===undefined?{headers:{Accept:'application/json'}}:{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body)});
+    let j=null;try{j=await r.json()}catch(e){}
+    if(!r.ok)throw new Error((j&&(j.error||j.message))||('HTTP '+r.status));
+    return j;
+  }
+  function render(s){
+    state=s;const on=!!s.config.enabled;
+    const badge=document.getElementById('albBadge');badge.textContent=on?'ON':'OFF';badge.className='alb-badge '+(on?'alb-on':'alb-off');
+    const phaseText={BEFORE:'waiting for '+s.live_start,DAY:'day session',CAS:'CAS window',AFTER:'after CAS',WEEKEND:'weekend',OFF:'switched off',IDLE:'starting'}[s.phase]||s.phase;
+    document.getElementById('albText').textContent=on
+      ?('Real orders: Index, Stock and Commodity go live at '+s.live_start+'; at '+s.cas_switch.slice(0,5)+' they are disarmed and CAS goes live; Commodity is armed again after '+s.cas_end+'. Now: '+phaseText+(s.kite_connected?'':' · log in to Kite to start')+'.')
+      :'Nothing is armed automatically. Arm each desk yourself.';
+    document.getElementById('albToggle').textContent=on?'Turn off':'Turn on';
+    document.getElementById('albDesks').innerHTML=Object.entries(s.desks||{}).map(([k,d])=>{
+      const armed=d&&d.armed;const label=NAMES[k]||k;
+      return '<span class="alb-desk'+(armed&&d.mode==='live'?' armed':'')+'">'+esc(label)+': '+(d&&d.error?'unavailable':esc((d.mode||'').toUpperCase())+' · '+(armed?'ARMED':'not armed')+(d.halt?' · HALTED':''))+'</span>';
+    }).join('');
+    const probs=Object.entries(s.desks||{}).filter(([k,d])=>d&&d.problem).map(([k,d])=>'<div class="alb-warn">'+esc(NAMES[k]||k)+': not armed yet — '+esc(d.problem.text)+'</div>');
+    document.getElementById('albProblems').innerHTML=probs.join('');
+    document.getElementById('albLog').innerHTML=(s.log||[]).map(l=>'<div>'+esc(l.ts.slice(11))+' · '+esc(l.kind)+' · '+esc(l.text)+'</div>').join('')||'No schedule activity yet.';
+  }
+  async function refresh(){
+    if(busy)return;busy=true;
+    try{render(await req('state'))}
+    catch(e){document.getElementById('albText').textContent='Schedule status unavailable: '+e.message}
+    finally{busy=false}
+  }
+  document.addEventListener('click',async e=>{
+    if(!e.target||e.target.id!=='albToggle'||!state)return;
+    const enable=!state.config.enabled;
+    if(enable&&!confirm('Turn the automatic live schedule ON?\n\nOn every trading day, once you are logged in to Kite, the Index, Stock and Commodity desks will be set to LIVE and armed from '+state.live_start+', and CAS will be set to LIVE and armed for its window. These desks then place real-money orders on their own. Loss limits and broker checks still apply.'))return;
+    if(!enable&&!confirm('Turn the automatic live schedule off? Desks that are already armed stay armed until you disarm them.'))return;
+    try{const j=await req('config',{enabled:enable,ack:enable?true:undefined});render(j.state)}catch(err){alert(err.message)}
+  });
+  refresh();setInterval(()=>{if(!document.hidden)refresh()},5000);
+})();
 </script>
 </body>
 </html>
