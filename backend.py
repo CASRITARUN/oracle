@@ -31,353 +31,6 @@ IMPORTANT
   try/except around kite.place_order() in place_basket_orders() for the fallback behavior.
 """
 
-# Kronos integration and installer are embedded: no extra application .py files required.
-# Heavy ML imports execute only in the isolated worker, before any broker/app imports.
-import sys as _kronos_sys
-import types as _kronos_types
-
-_INDEX_KRONOS_SOURCE = r'''"""Kronos inference isolated from Flask and broker/risk threads; no broker imports."""
-import hashlib
-import json
-import math
-import os
-from pathlib import Path
-import queue
-import subprocess
-import sys
-import threading
-import time
-from datetime import datetime
-
-# v4: average several samples per forecast, in two independent halves.  The halves are
-# averaged for the forecast and compared with each other as a reliability check.
-# CPU cost grows with KRONOS_SAMPLES; watch kronos.active_seconds in the desk state.
-KRONOS_SAMPLES = max(2, min(20, int(os.environ.get('KRONOS_SAMPLES', '6'))))
-KRONOS_SAMPLES -= KRONOS_SAMPLES % 2
-KRONOS_HALF = KRONOS_SAMPLES // 2
-REQUIRE_SPLIT_AGREEMENT = os.environ.get('KRONOS_REQUIRE_SPLIT_AGREEMENT', '1').lower() not in ('0', 'false', 'no')
-
-
-def blend_signal(rows, forecast):
-    """Blend Kronos and price action with soft disagreement and hysteresis-friendly diagnostics.
-
-    This remains a directional score, NOT a calibrated probability.  V7 deliberately
-    avoids treating every model disagreement as a hard WAIT: a setup may qualify when
-    one component is materially dominant and the combined edge is still strong.  Very
-    weak forecasts, shock bars and genuinely directionless price action still wait.
-    """
-    close=[float(r['close']) for r in rows]
-    tr=[max(float(b['high'])-float(b['low']),abs(float(b['high'])-a['close']),
-            abs(float(b['low'])-a['close'])) for a,b in zip(rows[-21:-1],rows[-20:])]
-    # Exclude the latest bar from the baseline ATR so a single shock does not immediately
-    # inflate the denominator and erase an otherwise useful forecast.
-    atr=sum(tr[:-1])/max(1,len(tr)-1)
-    if not math.isfinite(atr) or atr<=0:raise ValueError('No measurable index movement')
-    predicted=[float(x) for x in (forecast.get('close') or [])]
-    if len(predicted)!=3 or not all(math.isfinite(x) for x in predicted):raise ValueError('Non-finite forecast')
-    # Weight the whole 15-minute path rather than only its last point.  This is less
-    # brittle when the third forecast point mean-reverts slightly after a directional move.
-    path_moves=[x-close[-1] for x in predicted]
-    move=.20*path_moves[0]+.30*path_moves[1]+.50*path_moves[2]
-    def ema(values,n):
-        v=values[0]
-        for x in values[1:]:v+=2/(n+1)*(x-v)
-        return v
-    trend=(ema(close[-60:],9)-ema(close[-60:],21))/atr
-    momentum=(close[-1]-close[-4])/atr
-    micro=(close[-1]-close[-2])/atr
-    technical=.50*math.tanh(trend)+.35*math.tanh(momentum/1.75)+.15*math.tanh(micro)
-    # Split-half reliability: two independent sample groups should point the same way.
-    split_agree=None;split_gap_atr=None
-    half_a=forecast.get('close_a');half_b=forecast.get('close_b')
-    if isinstance(half_a,list) and isinstance(half_b,list) and len(half_a)==3 and len(half_b)==3:
-        move_a=sum(w*(float(x)-close[-1]) for w,x in zip((.20,.30,.50),half_a))
-        move_b=sum(w*(float(x)-close[-1]) for w,x in zip((.20,.30,.50),half_b))
-        if math.isfinite(move_a) and math.isfinite(move_b):
-            split_agree=(move_a>0 and move_b>0) or (move_a<0 and move_b<0)
-            split_gap_atr=abs(move_a-move_b)/atr
-    kronos=math.tanh(move/atr)
-    score=.58*kronos+.42*technical
-    path=sum(abs(b-a) for a,b in zip(close[-7:-1],close[-6:]))
-    efficiency=abs(close[-1]-close[-7])/max(path,1e-9)
-    forecast_move_atr=abs(move)/atr
-    agree=(kronos==0 or technical==0 or kronos*technical>0)
-    dominant=max(abs(kronos),abs(technical));opposing=min(abs(kronos),abs(technical))
-    soft_disagreement=(not agree and dominant>=.26 and dominant>=1.75*max(.04,opposing) and abs(score)>=.13)
-    if agree:agreement='AGREE'
-    elif soft_disagreement:agreement='DOMINANT_KRONOS' if abs(kronos)>=abs(technical) else 'DOMINANT_PRICE_ACTION'
-    else:agreement='CONFLICT'
-    # Trend-efficient tapes can act on a somewhat smaller forecast; choppy tapes need a
-    # larger projected move.  A strong technical impulse may carry a modest Kronos move,
-    # but only when the blended score remains meaningful.
-    min_move_atr=.12 if efficiency>=.48 and abs(technical)>=.20 else .16
-    reason=None;note=None
-    if REQUIRE_SPLIT_AGREEMENT and split_agree is False:reason='Kronos sample halves disagree on direction; forecast not reliable'
-    elif tr[-1]>3.25*atr and abs(score)<.45:reason='Exceptional last-bar move; wait for stabilisation'
-    elif efficiency<.18 and abs(score)<.34:reason='Choppy index: directional edge is not persistent enough'
-    elif forecast_move_atr<min_move_atr and abs(technical)<.32:reason='Forecast edge too small after volatility scaling'
-    elif not agree and not soft_disagreement:reason='Kronos / price-action conflict without a dominant edge'
-    elif soft_disagreement:note='Mild model disagreement accepted because one directional component is dominant'
-    else:note='Kronos and price action are directionally aligned'
-    return dict(p_up=.5+.5*score,confidence=.5+.5*abs(score),direction='UP' if score>0 else 'DOWN',
-                regime='TREND' if reason is None else 'WAIT',forecast_move=move,atr=atr,
-                split_agree=split_agree,split_gap_atr=split_gap_atr,kronos_samples=forecast.get('samples'),
-                forecast_move_atr=forecast_move_atr,min_forecast_atr=min_move_atr,
-                kronos_score=.5+.5*kronos,technical_score=.5+.5*technical,
-                efficiency=efficiency,agreement=agreement,signal_margin=abs(score),
-                signal_wait=reason,signal_note=note,
-                factors=[dict(name='Kronos forecast',impact=.58*kronos),dict(name='Price action',impact=.42*technical)])
-
-
-class KronosService:
-    """Asynchronous, coalescing Kronos service.
-
-    The UI/scanner may ask for the same symbol every 15 seconds while a CPU forecast is
-    still running.  Queue SYMBOLS rather than frozen candle payloads, so a queued symbol
-    always uses its newest completed candle when inference actually begins.  A small
-    batch is used when several indices are waiting.  This avoids a permanent WAIT loop
-    on slower VMs where four sequential forecasts can take longer than one 5-minute bar.
-    """
-    def __init__(self):
-        self.lock=threading.Lock();self.jobs=queue.Queue(maxsize=8)
-        self.results={};self.pending=set();self.latest={};self.retry={};self.process=None
-        self.status='IDLE';self.error=None;self.active_symbols=[];self.active_since=None
-        self.last_completed=None;self.completed_count=0
-        self.lookback=max(64,min(160,int(os.environ.get('KRONOS_LOOKBACK','96'))))
-        self.batch_size=max(1,min(4,int(os.environ.get('KRONOS_BATCH_SIZE','2'))))
-        self.timeout=max(90,min(600,int(os.environ.get('KRONOS_TIMEOUT_SECONDS','300'))))
-        threading.Thread(target=self._loop,daemon=True,name='kronos-inference-dispatch').start()
-
-    @staticmethod
-    def _parse_ts(value):
-        text=str(value or '').replace('Z','+00:00')
-        try:return datetime.fromisoformat(text)
-        except ValueError:
-            try:return datetime.strptime(text[:19],'%Y-%m-%d %H:%M:%S')
-            except ValueError:return None
-
-    def _queue_locked(self,symbol):
-        if symbol in self.pending or time.monotonic()<self.retry.get(symbol,0):return
-        try:
-            self.jobs.put_nowait(symbol);self.pending.add(symbol)
-        except queue.Full:
-            self.error='Kronos queue full; newest candle retained for retry'
-
-    def request(self,symbol,rows):
-        # Keep a compact, fixed lookback.  The official predictor supports much longer
-        # contexts, but intraday direction only needs enough recent structure here and a
-        # smaller context materially improves CPU latency on the trading VM.
-        compact=[dict(r) for r in rows[-self.lookback:]]
-        payload=json.dumps(compact,sort_keys=True,default=str,allow_nan=False)
-        key=hashlib.sha256(payload.encode()).hexdigest()
-        with self.lock:
-            self.latest[symbol]=(key,compact)
-            result=self.results.get(symbol)
-            if not result or result.get('key')!=key:self._queue_locked(symbol)
-            if result:
-                exact=result.get('key')==key
-                # A forecast generated from the previous completed candle is still useful
-                # while its future horizon has not expired.  Return it immediately and let
-                # the newest candle refresh continue in the background instead of forcing
-                # the desk back to NO PREDICTION every five minutes.
-                current_ts=self._parse_ts(compact[-1].get('ts')) if compact else None
-                final_ts=self._parse_ts((result.get('timestamps') or [None])[-1])
-                remaining=None
-                if current_ts and final_ts:
-                    if current_ts.tzinfo is not None:current_ts=current_ts.replace(tzinfo=None)
-                    if final_ts.tzinfo is not None:final_ts=final_ts.replace(tzinfo=None)
-                    remaining=(final_ts-current_ts).total_seconds()/60
-                if exact or (remaining is not None and remaining>=5 and time.time()-float(result.get('completed',0))<=600):
-                    out=dict(result);out['cache_mode']='EXACT' if exact else 'ROLLING'
-                    out['remaining_horizon_minutes']=15 if exact else max(5,int(round(remaining)))
-                    return out
-            active=', '.join(self.active_symbols) if self.active_symbols else None
-            reason=self.error or ('Kronos inference running: '+active if active else 'Kronos inference queued / running')
-            return dict(status='WAIT',reason=reason)
-
-    def snapshot(self):
-        with self.lock:
-            age=round(time.time()-self.active_since,1) if self.active_since else None
-            fresh=sum(1 for r in self.results.values() if time.time()-float(r.get('completed',0))<=600)
-            return dict(status=self.status,error=self.error,pending=len(self.pending),active=list(self.active_symbols),
-                        active_seconds=age,last_completed=self.last_completed,completed_count=self.completed_count,
-                        fresh_results=fresh,batch_size=self.batch_size,lookback=self.lookback,
-                        model='NeoQuasar/Kronos-small',context=self.lookback,horizon_minutes=15,
-                        samples=KRONOS_SAMPLES,split_agreement_gate=REQUIRE_SPLIT_AGREEMENT)
-
-    def _start(self):
-        self.process=subprocess.Popen([sys.executable,'-u',str(Path(__file__).resolve()),'--kronos-worker'],
-            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,bufsize=1)
-        answers=queue.Queue();proc=self.process
-        def reader():
-            try:
-                for line in proc.stdout:
-                    try:answers.put(json.loads(line))
-                    except ValueError:continue
-            finally:answers.put({'error':'Kronos worker exited; check installation'})
-        threading.Thread(target=reader,daemon=True,name='kronos-output').start()
-        self.answers=answers
-
-    def _take_batch(self,first_symbol):
-        symbols=[first_symbol]
-        while len(symbols)<self.batch_size:
-            try:sym=self.jobs.get_nowait()
-            except queue.Empty:break
-            if sym not in symbols:symbols.append(sym)
-            else:self.jobs.task_done()
-        with self.lock:
-            jobs=[]
-            for sym in symbols:
-                item=self.latest.get(sym)
-                if item:jobs.append((sym,item[0],item[1]))
-            self.active_symbols=[x[0] for x in jobs];self.active_since=time.time();self.status='RUNNING'
-        return symbols,jobs
-
-    def _loop(self):
-        while True:
-            first=self.jobs.get();symbols,jobs=self._take_batch(first)
-            try:
-                if not jobs:continue
-                if self.process is None or self.process.poll() is not None:self._start()
-                payload={'batch':[dict(symbol=s,key=k,rows=r) for s,k,r in jobs]}
-                self.process.stdin.write(json.dumps(payload,default=str,allow_nan=False)+'\n');self.process.stdin.flush()
-                answer=self.answers.get(timeout=self.timeout)
-                if answer.get('error'):raise RuntimeError(answer['error'])
-                returned=answer.get('batch')
-                if not isinstance(returned,list):raise RuntimeError('Kronos worker returned malformed batch response')
-                by_symbol={str(x.get('symbol')):x for x in returned if isinstance(x,dict)}
-                now=time.time()
-                with self.lock:
-                    for symbol,key,rows in jobs:
-                        result=by_symbol.get(symbol)
-                        if not result:continue
-                        if result.get('error'):
-                            self.error=f"{symbol}: {result['error']}";self.retry[symbol]=time.monotonic()+30;continue
-                        values=result.get('close',[])
-                        if len(values)!=3 or not all(math.isfinite(float(v)) and float(v)>0 for v in values):
-                            self.error=f'{symbol}: Kronos returned invalid forecast prices';self.retry[symbol]=time.monotonic()+30;continue
-                        self.results[symbol]=dict(result,key=key,status='READY',completed=now,source_bar_ts=rows[-1].get('ts'))
-                        self.retry.pop(symbol,None);self.completed_count+=1;self.last_completed=now
-                    self.error=None if any(s in by_symbol and not by_symbol[s].get('error') for s,_,_ in jobs) else self.error
-            except Exception as e:
-                if self.process is not None:
-                    try:self.process.kill();self.process.wait(timeout=5)
-                    except Exception:pass
-                    self.process=None
-                with self.lock:
-                    self.status='UNAVAILABLE';self.error=str(e) or 'Kronos inference timed out'
-                    for symbol,_,_ in jobs:self.retry[symbol]=time.monotonic()+45
-            finally:
-                with self.lock:
-                    self.active_symbols=[];self.active_since=None
-                    for symbol in symbols:self.pending.discard(symbol)
-                    # If a newer candle arrived while this batch was running, enqueue the
-                    # symbol once more.  The queue will use only the newest payload.
-                    for symbol,key,_ in jobs:
-                        latest=self.latest.get(symbol)
-                        if latest and latest[0]!=key:self._queue_locked(symbol)
-                    if self.status!='UNAVAILABLE':self.status='READY' if self.results else 'IDLE'
-                for _ in symbols:self.jobs.task_done()
-
-
-def worker():
-    # Heavy dependencies are imported only in this isolated subprocess.
-    import contextlib
-    with contextlib.redirect_stdout(sys.stderr):
-        source=Path(os.environ.get('KRONOS_SOURCE',str(Path(__file__).resolve().parent/'vendor'/'Kronos')))
-        if not (source/'model'/'__init__.py').exists():
-            raise RuntimeError('Kronos not installed. Run: python backend.py --setup-kronos')
-        import pandas as pd
-        import torch
-        sys.path.insert(0,str(source))
-        from model import Kronos, KronosTokenizer, KronosPredictor
-        torch.set_num_threads(max(1,min(4,os.cpu_count() or 1)))
-        device=os.environ.get('KRONOS_DEVICE','cpu')
-        tokenizer=KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base')
-        model=Kronos.from_pretrained('NeoQuasar/Kronos-small')
-        model.eval();tokenizer.eval()
-        predictor=KronosPredictor(model,tokenizer,device=device,max_context=max(96,min(160,int(os.environ.get('KRONOS_LOOKBACK','96')))))
-    for line in sys.stdin:
-        try:
-            req=json.loads(line);items=req.get('batch') or []
-            if not items:raise ValueError('Empty Kronos batch')
-            frames=[];timestamps=[];futures=[];symbols=[]
-            for item in items:
-                df=pd.DataFrame(item['rows'][-160:])
-                ts=pd.to_datetime(df['ts']);future=pd.Series(pd.date_range(ts.iloc[-1]+pd.Timedelta(minutes=5),periods=3,freq='5min'))
-                frames.append(df[['open','high','low','close','volume']]);timestamps.append(ts);futures.append(future);symbols.append(str(item['symbol']))
-            results=[]
-            def run_half(n):
-                # sample_count is averaged inside the predictor, so each call returns a mean forecast.
-                if len(frames)>1 and len({len(x) for x in frames})==1 and hasattr(predictor,'predict_batch'):
-                    return predictor.predict_batch(df_list=frames,x_timestamp_list=timestamps,y_timestamp_list=futures,
-                        pred_len=3,T=1.0,top_p=.9,sample_count=n,verbose=False)
-                return [predictor.predict(df=df,x_timestamp=ts,y_timestamp=fut,pred_len=3,T=1.0,top_p=.9,sample_count=n,verbose=False)
-                        for df,ts,fut in zip(frames,timestamps,futures)]
-            with contextlib.redirect_stdout(sys.stderr),torch.inference_mode():
-                torch.manual_seed(int(hashlib.sha256(line.encode()).hexdigest()[:8],16))
-                outs_a=run_half(KRONOS_HALF);outs_b=run_half(KRONOS_HALF)
-            for symbol,oa,ob,future in zip(symbols,outs_a,outs_b,futures):
-                ca=[float(x) for x in oa['close']];cb=[float(x) for x in ob['close']]
-                results.append(dict(symbol=symbol,close=[(x+y)/2 for x,y in zip(ca,cb)],close_a=ca,close_b=cb,
-                                    samples=2*KRONOS_HALF,timestamps=[str(t) for t in future]))
-            print(json.dumps(dict(batch=results),allow_nan=False),flush=True)
-        except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
-
-if __name__=='__main__':
-    try:worker()
-    except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
-'''
-_KRONOS_SETUP_SOURCE = r'''"""Run once with the SAME Python environment as backend.py. Never accesses Kite."""
-from pathlib import Path
-import subprocess
-import sys
-
-
-def main():
-    if sys.version_info<(3,10):raise SystemExit('Kronos needs Python 3.10 or newer.')
-    root=Path(__file__).resolve().parent
-    source=root/'vendor'/'Kronos'
-    source.parent.mkdir(exist_ok=True)
-    if not source.exists():
-        subprocess.run(['git','clone','--depth','1','https://github.com/shiyu-coder/Kronos.git',str(source)],check=True)
-    if not (source/'model'/'__init__.py').exists():raise SystemExit('vendor/Kronos exists but does not contain the official model package.')
-    subprocess.run([sys.executable,'-m','pip','install','-r',str(source/'requirements.txt')],check=True)
-    commit=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
-    (root/'kronos_source_revision.txt').write_text(commit+'\n')
-    code="from model import Kronos,KronosTokenizer; KronosTokenizer.from_pretrained('NeoQuasar/Kronos-Tokenizer-base'); Kronos.from_pretrained('NeoQuasar/Kronos-small'); print('Kronos weights cached successfully')"
-    subprocess.run([sys.executable,'-c',code],cwd=source,check=True)
-    print('Setup complete. Start backend.py using this Python environment. Entries remain disarmed.')
-
-if __name__=='__main__':
-    try:main()
-    except (OSError,subprocess.CalledProcessError) as e:raise SystemExit('Kronos setup failed: '+str(e))
-'''
-
-def _load_embedded_kronos():
-    module = _kronos_types.ModuleType('index_kronos')
-    module.__file__ = __file__
-    _kronos_sys.modules['index_kronos'] = module
-    exec(compile(_INDEX_KRONOS_SOURCE, __file__ + ':kronos', 'exec'), module.__dict__)
-    return module
-
-_embedded_kronos = _load_embedded_kronos()
-if __name__ == '__main__' and '--setup-kronos' in _kronos_sys.argv:
-    _setup_scope = {'__name__': 'kronos_setup', '__file__': __file__}
-    exec(compile(_KRONOS_SETUP_SOURCE, __file__ + ':setup', 'exec'), _setup_scope)
-    try:
-        _setup_scope['main']()
-    except Exception as exc:
-        raise SystemExit('Kronos setup failed: ' + str(exc))
-    raise SystemExit(0)
-if __name__ == '__main__' and '--kronos-worker' in _kronos_sys.argv:
-    try:
-        _embedded_kronos.worker()
-    except Exception as exc:
-        import json as _worker_json
-        print(_worker_json.dumps({'error': type(exc).__name__ + ': ' + str(exc)}), flush=True)
-    raise SystemExit(0)
-
 import os
 import math
 import time
@@ -411,7 +64,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -942,7 +595,7 @@ class BrokerRequestGate:
         bucket='write' if method.upper() not in ('GET','HEAD') else 'quote' if route.startswith('market.quote') else 'history' if 'historical' in route else 'read'
         # Only share short-lived read-only account snapshots; never share order mutations.
         cacheable=method.upper()=='GET' and route in ('orders','trades','portfolio.positions')
-        key=(getattr(getattr(fn,'__self__',None),'access_token',None),route,json.dumps([args,kwargs],sort_keys=True,default=str))
+        key=(route,json.dumps([args,kwargs],sort_keys=True,default=str))
         deadline=time.monotonic()+1.5
         while True:
             with self.lock:
@@ -2259,53 +1912,37 @@ def callback():
     if not request_token:
         return "Login failed: no request_token received.", 400
     data = kite.generate_session(request_token, api_secret=API_SECRET)
-    with _SESSION_CHECK_LOCK:
-        SESSION["access_token"] = data["access_token"]
-        SESSION["logged_in_at"] = now_ist().isoformat()
-        kite.set_access_token(SESSION["access_token"])
-    # Do not wait for the next scanner tick after login. Wake each AI desk independently
-    # so the UI gets live data promptly; the desk's normal locks/risk gates still apply.
-    for _name,_thread_name in (('STOCK_DESK','stock-ai-login-wake'),('COMMODITY_DESK','commodity-ai-login-wake'),('DESK','index-ai-login-wake')):
-        try:
-            _desk=globals().get(_name)
-            if _desk is not None:threading.Thread(target=_desk.cycle,daemon=True,name=_thread_name).start()
-        except Exception:
-            pass
+    SESSION["access_token"] = data["access_token"]
+    SESSION["logged_in_at"] = now_ist().isoformat()
+    kite.set_access_token(SESSION["access_token"])
+    # Do not wait for the next 30-second scanner tick: wake Stock AI immediately so
+    # full-F&O discovery and resumable deep-history collection begin after login.
+    try:
+        if 'STOCK_DESK' in globals():threading.Thread(target=STOCK_DESK.cycle,daemon=True,name='stock-ai-login-wake').start()
+    except Exception:pass
     return redirect("/")
 
 
-_SESSION_CHECK_LOCK = threading.Lock()
-_SESSION_CHECK = {'token': None, 'at': 0., 'valid': False}
-
-def validate_kite_session(force=False):
-    """Only a profile check of the current token may expire the shared session.
-    A segment/endpoint error is not, by itself, evidence that login is invalid.
-    Dedicated client prevents in-flight checks from changing the trading client.
-    """
-    with _SESSION_CHECK_LOCK:
-        token=SESSION.get('access_token')
-        if not token:return dict(logged_in=False,logged_in_at=None)
-        if not force and _SESSION_CHECK['token']==token and time.monotonic()-_SESSION_CHECK['at']<30:
-            return dict(logged_in=True,logged_in_at=SESSION.get('logged_in_at'))
-        try:
-            client=KiteConnect(api_key=API_KEY,access_token=token,timeout=8)
-            client.profile()
-        except TokenException:
-            if SESSION.get('access_token')==token:
-                SESSION.update(access_token=None,logged_in_at=None)
-                _SESSION_CHECK.update(token=None,at=0.,valid=False)
-                return dict(logged_in=False,logged_in_at=None,session_expired=True)
-            return dict(logged_in=bool(SESSION.get('access_token')),logged_in_at=SESSION.get('logged_in_at'))
-        except Exception:
-            return dict(logged_in=True,logged_in_at=SESSION.get('logged_in_at'),
-                        warning='Broker session verification temporarily unavailable')
-        if SESSION.get('access_token')==token:
-            _SESSION_CHECK.update(token=token,at=time.monotonic(),valid=True)
-        return dict(logged_in=bool(SESSION.get('access_token')),logged_in_at=SESSION.get('logged_in_at'))
-
 @app.route("/api/session-status")
 def session_status():
-    return jsonify(validate_kite_session())
+    """Actively validates the token (not just checks it's present) so a stale/expired token
+    can't keep showing 'Connected' after it's no longer valid — this is the fix for the tool
+    showing 'connected' even when Zerodha has actually invalidated the session."""
+    if not SESSION["access_token"]:
+        return jsonify({"logged_in": False, "logged_in_at": None})
+    try:
+        kite.set_access_token(SESSION["access_token"])
+        kite.profile()  # cheap call just to confirm the token still actually works
+        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"]})
+    except TokenException:
+        SESSION["access_token"] = None
+        SESSION["logged_in_at"] = None
+        return jsonify({"logged_in": False, "logged_in_at": None, "session_expired": True})
+    except Exception:
+        # network hiccup or similar — don't log the user out for a transient error,
+        # just report what we last knew
+        return jsonify({"logged_in": True, "logged_in_at": SESSION["logged_in_at"],
+                         "warning": "Could not verify token freshness right now (network issue?)."})
 
 
 def require_session():
@@ -2319,22 +1956,23 @@ def require_session():
 def logout():
     """Clears the stored session so the dashboard stops using this token — does NOT invalidate
     the token on Zerodha's side (Kite has no logout API), it just makes this app forget it."""
-    with _SESSION_CHECK_LOCK:
-        SESSION["access_token"] = None
-        SESSION["logged_in_at"] = None
+    SESSION["access_token"] = None
+    SESSION["logged_in_at"] = None
     logger.info("User logged out — session cleared.")
     return jsonify({"ok": True})
 
 
 @app.errorhandler(TokenException)
 def handle_token_exception(e):
-    status=validate_kite_session(force=True)
-    if status.get('session_expired') or not status.get('logged_in'):
-        return jsonify(dict(error='session_expired',session_expired=True,
-                            message='Kite session expired. Please reconnect.')),401
-    logger.warning('Broker endpoint authentication failed; profile did not confirm session expiry')
-    return jsonify(dict(error='broker_endpoint_access',session_expired=False,
-                        message='Broker request denied. Check MCX segment access / API permissions; login retained.')),503
+    """Catches an expired/invalid token from ANY route (whichever endpoint happened to hit
+    Zerodha with a stale token), clears the stored session, and tells the frontend to show the
+    login button again — instead of a generic 500 error or a UI that silently keeps showing
+    'Connected' while every data call quietly fails."""
+    SESSION["access_token"] = None
+    SESSION["logged_in_at"] = None
+    logger.warning("TokenException caught — clearing session and asking frontend to reconnect.")
+    return jsonify({"error": "session_expired", "session_expired": True,
+                     "message": "Your Zerodha session has expired. Please reconnect."}), 401
 
 
 @app.errorhandler(Exception)
@@ -9493,7 +9131,7 @@ def _get_recent_index_bars(symbol, n):
     snapshot cache."""
     c = ai_db()
     rows = c.execute(
-        "SELECT ts,open,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
+        "SELECT ts,close,high,low,volume FROM ai_hist_candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
         (symbol, AI_HIST_INTERVAL, int(n))).fetchall()
     c.close()
     return list(reversed(rows))
@@ -12472,7 +12110,7 @@ def _build_desk_engine_class():
                   lots=(0,50),cooldown=(0,120),slippage_bps=(1,100),fee_per_order=(1,500),partial_take_r=(.5,3))
                 for k,v in body.items():
                     if k=='square_off':
-                        if not isinstance(v,str) or len(v)!=5 or not '10:00'<=v<=getattr(self.a,'latest_square_off','15:20'):raise ValueError('Square-off outside supported session')
+                        if not isinstance(v,str) or len(v)!=5 or not '10:00'<=v<='15:20':raise ValueError('Square-off must be 10:00–15:20 IST')
                         datetime.strptime(v,'%H:%M');cfg[k]=v
                     elif k in bounds:
                         if isinstance(v,bool):raise ValueError('Invalid '+k)
@@ -12573,7 +12211,7 @@ def _build_desk_engine_class():
             if age<0 or age>max_bar_age:s['reason']='Stale index candles';return s
             # Forward labels accrue without requiring a trade, breaking the no-trades/no-learning loop.
             target=dt(last['ts'])+timedelta(minutes=15)
-            if record_observation and self.a.market_open() and target.date()==dt(last['ts']).date() and target.strftime('%H:%M')<=getattr(self.a,'observation_end','15:25'):
+            if record_observation and self.a.market_open() and target.date()==dt(last['ts']).date() and target.strftime('%H:%M')<='15:25':
                 key=symbol+dt(last['ts']).isoformat()
                 with self.db() as c:c.execute('INSERT OR IGNORE INTO desk_observations VALUES(?,?,?,?,?,?,?,?,NULL,NULL)',
                     (key,symbol,dt(last['ts']).isoformat(),target.isoformat(),float(last['close']),json.dumps(x),m['id'],p))
@@ -12810,47 +12448,29 @@ def _build_desk_engine_class():
                     self.put('halt','Broker reconciliation: '+str(e))
                     with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
             # A remaining uncertainty blocks entries, while verified positions are managed.
-        def clear_position_halt(self):
-            # Clear only this reconciliation block, never daily/risk/order stops.
-            halt=self.get('halt') or ''
-            if not halt.startswith(('Broker/local position mismatch','CAS broker/product quantity mismatch')):return
-            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):return
-            cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-            self.put('halt',None)
-            self.event('RECOVERY','Broker quantities now match the local ledger. Entries remain disarmed; re-arm when ready.')
         def verify_positions(self):
             live=[p for p in self.active() if p['mode']=='live']
-            if not live:
-                self.mismatches=set();self.clear_position_halt();return
-            try:
-                holdings=self.a.holdings()
-                if not isinstance(holdings,list):raise ValueError('Invalid broker position snapshot')
-                actual={}
-                for p in holdings:
-                    key=(p.get('exchange'),p.get('tradingsymbol'),p.get('product'))
-                    actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
-            except Exception:
-                # A deferred or failed read is not evidence of matching quantities.
+            if not live:self.mismatches=set();return
+            actual={}
+            try:holdings=self.a.holdings()
+            except Exception as e:
+                if type(e).__name__=='BrokerDeferred':return
                 self.mismatches={p['id'] for p in live}
                 raise
+            self.mismatches=set()
+            for p in holdings:
+                if p.get('product')=='MIS':
+                    key=(p.get('exchange'),p.get('tradingsymbol'))
+                    actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
             expected={}
             for p in live:
-                key=(p['exchange'],p['contract'],p.get('product') or 'MIS')
-                expected[key]=expected.get(key,0)+p['qty']
-            previous=set(self.mismatches);self.mismatches=set();details=[]
+                key=(p['exchange'],p['contract']);expected[key]=expected.get(key,0)+p['qty']
             for key,qty in expected.items():
-                broker_qty=actual.get(key,0)
-                affected=[p for p in live if (p['exchange'],p['contract'],p.get('product') or 'MIS')==key]
-                if broker_qty!=qty:
-                    reason=f"{key[0]}:{key[1]} {key[2]}: local {qty}, broker {broker_qty}; automated exit suspended"
-                    details.append(reason)
-                    for p in affected:
-                        self.mismatches.add(p['id']);self.health[p['id']]={'reason':reason}
-            for pid in previous-self.mismatches:
-                if 'quantity' in str(self.health.get(pid,{}).get('reason','')).lower() or 'automated exit suspended' in str(self.health.get(pid,{}).get('reason','')):self.health.pop(pid,None)
+                if actual.get(key,0)!=qty:
+                    self.mismatches.update(p['id'] for p in live if (p['exchange'],p['contract'])==key)
             if self.mismatches:
-                self.put('halt','Broker/local position mismatch · '+'; '.join(details)+' · check Kite Orders/Trades/Positions, then recheck')
-            else:self.clear_position_halt()
+                self.put('halt','Broker/local position mismatch · reconcile in Kite before continuing')
+                for pid in self.mismatches:self.health[pid]={'reason':'Broker quantity mismatch; automated exit suspended'}
 
         def enter(self,s):
             cfg=self.config()
@@ -12913,14 +12533,8 @@ def _build_desk_engine_class():
                 elif datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
                 elif cfg.get('max_hold') is not None and (datetime.now(IST)-dt(p['ts'])).total_seconds()>=cfg['max_hold']*60:reason='Maximum holding time'
                 elif self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
-                elif hasattr(self,'reversal_exit_reason'):
-                    try:reason=self.reversal_exit_reason(p,setup,sig,bid,q)
-                    except Exception as exc:self.record_trade(p['id'],'REVERSAL_FILTER_UNAVAILABLE',dict(error=str(exc)))
                 elif sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
-                if reason is None and hasattr(self,'additional_exit_reason'):
-                    try:reason=self.additional_exit_reason(p,q)
-                    except Exception as exc:self.record_trade(p['id'],'EXIT_FILTER_UNAVAILABLE',dict(error=str(exc)))
-                if reason is None and not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-p['stop'])*cfg['partial_take_r']:reason='Partial profit at planned R'
+                elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-p['stop'])*cfg['partial_take_r']:reason='Partial profit at planned R'
                 self.record_observation(p,q,decision=reason or 'HOLD')
                 if reason:
                     self.health[p['id']]['reason']=reason
@@ -13000,7 +12614,7 @@ def _build_desk_engine_class():
                         if blocked:raise ValueError(blocked)
                     if not self.a.connected():raise ValueError('Connect Kite first')
                     if self.get('halt'):raise ValueError(self.get('halt'))
-                    if not self.model() and not getattr(self,'direction_engine_ready',lambda:False)():raise ValueError('Direction engine not ready; check model / Kronos status')
+                    if not self.model():raise ValueError('Train a model first')
                     if cfg['mode']=='live' and (not (cfg.get('live_override') is True or self.evidence()['ready']) or body.get('ack') is not True):raise ValueError('Live evidence or manual override / acknowledgement missing')
                     if self.a.legacy_open():raise ValueError('Legacy positions must be reconciled and closed first')
                     cfg['armed']=True
@@ -13015,7 +12629,6 @@ def _build_desk_engine_class():
                             if o['broker_id']:self.a.cancel(o['broker_id'])
                     if self.a.connected() and self.a.market_open():self.manage(close_all=True)
                 elif action=='clear-halt':
-                    self.reconcile()
                     if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):raise ValueError('Broker orders still unresolved')
                     self.verify_positions()
                     if self.mismatches:raise ValueError('Broker positions still differ from the desk ledger')
@@ -13080,8 +12693,7 @@ def _build_desk_engine_class():
                 'Maximum holding time':'The holding-time setting triggered the exit. A timed exit can close either a profit or a loss.',
                 'Intraday square-off':'The configured square-off time triggered the exit; this was not necessarily a stop or target.',
                 'Manual close all':'A manual close-all request triggered the exit.',
-                'Direction reversed':'Legacy reversal rule.',
-                'Confirmed direction reversal':'A materially stronger opposite signal persisted on a new completed candle under the V7 reversal filter.',
+                'Direction reversed':'The monitored direction signal changed enough to meet the reversal-exit rule.',
                 'Partial profit at planned R':'The engine requested a partial profit exit; remaining quantity is recorded separately.'}
             why=interpretations.get(recorded_reason,recorded_reason)
             changed=' '.join(x for x in explanations if x.startswith(('Largest recorded','A monitored direction')))
@@ -13482,7 +13094,7 @@ class StockDeskEngine(DeskEngine):
             refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat()))
         self.signals={k:v for k,v in self.signals.items() if k in selected}
         self.refresh_cursor=0
-        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} MCX underlyings; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
+        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} stocks; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
         return selected
     def _sync_full_universe_membership(self):
         if not self._full_mode():return
@@ -13492,7 +13104,7 @@ class StockDeskEngine(DeskEngine):
         info=self.get('stock_universe_info',{});info.update(mode='Full F&O universe',total_fo=len(universe),selected=len(universe),
             deep_check=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat())
         self.put('stock_universe_info',info);self.signals={k:v for k,v in self.signals.items() if k in universe}
-        self.event('UNIVERSE',f'MCX option universe refreshed: {len(universe)} underlyings')
+        self.event('UNIVERSE',f'F&O membership refreshed: {len(universe)} stocks')
     @staticmethod
     def rank_signal(s,max_spread):
         confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
@@ -13581,12 +13193,12 @@ class StockDeskEngine(DeskEngine):
         """Heavy history work yields whenever any automated live desk may need Kite."""
         try:
             cfg=self.config()
-            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Commodity AI live entries armed'
-            if any(p.get('mode')=='live' for p in self.active()):return 'Commodity AI live position active'
+            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
+            if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
             if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
-                return 'Commodity AI live order unresolved'
+                return 'Stock AI live order unresolved'
         except Exception:
-            return 'Commodity AI live-state check unavailable'
+            return 'Stock AI live-state check unavailable'
         for name,label in (('DESK','Index AI'),('CAS_DESK','CAS AI')):
             desk=globals().get(name)
             if not desk or desk is self:continue
@@ -14069,7 +13681,7 @@ class StockDeskEngine(DeskEngine):
         s=super().state()
         s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.success_model();hm=self.historical_success_model()
+        sm=self.train_success_model();hm=self.historical_success_model()
         if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
@@ -14146,1358 +13758,6 @@ def stock_ai_control(action):
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
-# Commodity V2: conservative rule defaults, not backtested optimal thresholds.
-COMMODITY_POLICY=dict(min_range_bps=8.,min_efficiency=.30,min_relative_volume=.70,
-    max_flat_fraction=.50,shock_atr=4.,quote_age_seconds=30,trade_age_seconds=120,
-    premium_confirmation_seconds=5,
-    # v5: a 10% relative IV crush inside a one-hour window exceeds the gain from a typical favourable move,
-    # so the scenario could not pass in ordinary conditions.  3% keeps a real IV/decay penalty.
-    iv_stress_fraction=float(os.environ.get('COMMODITY_IV_STRESS','0.03')),
-    min_scenario_r=float(os.environ.get('COMMODITY_MIN_SCENARIO_R','0.20')),
-    stall_after_minutes=30,stall_confirmation_seconds=300,min_contract_training_bars=300,
-    # v5: option-demand confirmation compares against a baseline up to this old (scan cycles are minutes apart).
-    premium_baseline_seconds=int(os.environ.get('COMMODITY_PREMIUM_BASELINE_SECONDS','600')),
-    require_bid_improvement=os.environ.get('COMMODITY_REQUIRE_BID_IMPROVEMENT','0')=='1',
-    # v5: futures/option mapping freshness (parity still has to identify exactly one future).
-    map_option_age_seconds=int(os.environ.get('COMMODITY_MAP_OPTION_AGE_SECONDS','90')),
-    map_stale_competitors=os.environ.get('COMMODITY_MAP_STALE_OK','1')=='1',
-    refresh_seconds=int(os.environ.get('COMMODITY_REFRESH_SECONDS','60')))
-# v5: the inherited 1% spread cap comes from NSE index options and rejects typical MCX option books; the cost scenario
-# already charges half the spread.  Applied once, and only if the setting is still at the old default.
-COMMODITY_DEFAULT_OVERRIDES=dict(max_spread=2.5)
-COMMODITY_NSE_DEFAULTS=dict(max_spread=1.)
-
-def commodity_black76(future,strike,years,sigma,kind,rate=0.):
-    if kind not in ('CE','PE') or min(future,strike)<=0 or years<0 or sigma<0:raise ValueError('Invalid Black-76 inputs')
-    sign=1 if kind=='CE' else -1
-    if years==0 or sigma==0:return math.exp(-rate*years)*max(sign*(future-strike),0.)
-    root=sigma*math.sqrt(years);d1=(math.log(future/strike)+.5*sigma*sigma*years)/root;d2=d1-root
-    normal=lambda x:.5*(1+math.erf(x/math.sqrt(2)))
-    return math.exp(-rate*years)*sign*(future*normal(sign*d1)-strike*normal(sign*d2))
-
-def commodity_iv(future,strike,years,premium,kind):
-    if min(future,strike,years,premium)<=0:raise ValueError('Invalid option valuation inputs')
-    lower=commodity_black76(future,strike,years,0.,kind,RISK_FREE_RATE)
-    upper=math.exp(-RISK_FREE_RATE*years)*(future if kind=='CE' else strike)
-    if not lower<premium<upper:raise ValueError('Option premium outside Black-76 bounds')
-    lo,hi=.00001,5.
-    if commodity_black76(future,strike,years,hi,kind,RISK_FREE_RATE)<premium:raise ValueError('IV above supported model range')
-    for _ in range(70):
-        mid=(lo+hi)/2
-        if commodity_black76(future,strike,years,mid,kind,RISK_FREE_RATE)<premium:lo=mid
-        else:hi=mid
-    return (lo+hi)/2
-
-def commodity_regime(rows,direction,tick,now=None):
-    """Completed contiguous candles only. No forward values or synthetic rollover bars."""
-    now=now or now_ist();valid=[]
-    for row in rows:
-        ts=_ai_ts_naive(row.get('ts'))
-        if ts is None or ts+timedelta(minutes=5)>now:continue
-        vals=[float(row.get(k) or 0) for k in ('close','high','low','volume')]
-        if not all(math.isfinite(x) for x in vals) or min(vals[:3])<=0 or vals[1]<vals[2] or not vals[2]<=vals[0]<=vals[1] or vals[3]<0:continue
-        valid.append(dict(row,ts=ts,close=vals[0],high=vals[1],low=vals[2],volume=vals[3]))
-    result=dict(status='WAIT',reason='Need 13 completed five-minute futures candles in this session',ready=False)
-    if len(valid)<13:return result
-    tail=[valid[-1]]
-    for row in reversed(valid[:-1]):
-        if len(tail)>=25 or row['ts'].date()!=now.date() or (tail[0]['ts']-row['ts']).total_seconds()!=300:break
-        tail.insert(0,row)
-    if len(tail)<13:return dict(result,reason='Futures candle gap / session warm-up')
-    if tail[-1]['ts'].date()!=now.date() or (now-tail[-1]['ts']).total_seconds()>600:return dict(result,reason='Stale completed futures candles')
-    close=[r['close'] for r in tail];recent=tail[-6:];base=tail[:-6];last=tail[-1]
-    tr=[max(r['high']-r['low'],abs(r['high']-prev['close']),abs(r['low']-prev['close'])) for prev,r in zip(tail[:-1],tail[1:])]
-    atr=float(np.mean(tr[-15:-1]));span=max(r['high'] for r in recent)-min(r['low'] for r in recent)
-    path=sum(abs(b-a) for a,b in zip(close[-7:-1],close[-6:]));net=close[-1]-close[-7]
-    efficiency=abs(net)/max(path,tick);flat=sum(r['high']-r['low']<=tick for r in recent)/6
-    # Prefer this contract's matching time-of-day volume across prior sessions.
-    minute=last['ts'].hour*60+last['ts'].minute
-    matching=[r['volume'] for r in valid[:-25] if r['ts'].date()<now.date() and abs(r['ts'].hour*60+r['ts'].minute-minute)<=30]
-    baseline=float(np.median(matching)) if len(matching)>=20 else float(np.median([r['volume'] for r in base]))
-    rv=float(np.mean([r['volume'] for r in recent]))/max(1.,baseline)
-    result.update(atr=atr,range_bps=span/close[-1]*10000,efficiency=efficiency,flat_fraction=flat,
-        relative_volume=rv,volume_baseline='same time of day' if len(matching)>=20 else 'recent candles',
-        bar_ts=str(last['ts']),momentum_points=net)
-    if flat>=COMMODITY_POLICY['max_flat_fraction'] or span<max(3*tick,close[-1]*COMMODITY_POLICY['min_range_bps']/10000) or atr<=tick:
-        return dict(result,status='STAGNANT',reason='No entry: futures movement is too small')
-    if baseline<=0 or rv<COMMODITY_POLICY['min_relative_volume'] or any(r['volume']<=0 for r in recent[-3:]):return dict(result,status='THIN',reason='No entry: weak recent futures trading activity')
-    if tr[-1]>COMMODITY_POLICY['shock_atr']*max(atr,tick):return dict(result,status='SHOCK',reason='No entry: exceptional last-bar move; wait for normalisation')
-    sign=1 if direction=='UP' else -1
-    prior=tail[-14:-2];level=max(r['high'] for r in prior) if sign==1 else min(r['low'] for r in prior)
-    breakout=all(sign*(r['close']-level)>tick for r in tail[-2:]) and rv>=1.3
-    aligned=sign*net>0 and sign*(close[-1]-close[-13])>0
-    result.update(momentum_30=net,momentum_60=close[-1]-close[-13],model_direction=direction)
-    # A confirmed short-term reversal need not wait for the full hour to turn.
-    reversal_level=max(r['high'] for r in tail[-6:-2]) if sign==1 else min(r['low'] for r in tail[-6:-2])
-    reversal_breakout=all(sign*(r['close']-reversal_level)>tick for r in tail[-2:])
-    reversal=not aligned and reversal_breakout and sign*net>0 and rv>=1.5 and efficiency>=.45
-    if reversal:return dict(result,status='REVERSAL',reason='Two-close breakout confirms reversal despite lagging 60-minute trend',ready=True)
-    if not aligned:return dict(result,status='CONFLICT',reason=f'Waiting for confirmation: ML {direction}, 30m {net:+.2f}, 60m {close[-1]-close[-13]:+.2f}; no confirmed reversal')
-    if not breakout and efficiency<COMMODITY_POLICY['min_efficiency']:return dict(result,status='CHOPPY',reason='No entry: back-and-forth movement without directional progress')
-    return dict(result,status='BREAKOUT' if breakout else 'TREND',reason='Futures activity and direction qualify',ready=True)
-
-def commodity_move_scenario(rows,horizon,now=None):
-    """Empirical absolute move scenario; not a forecast or probability of profit."""
-    now=now or now_ist();clean=[]
-    for r in rows:
-        ts=_ai_ts_naive(r.get('ts'))
-        if ts and ts+timedelta(minutes=5)<=now and float(r.get('close') or 0)>0:clean.append((ts,float(r['close'])))
-    moves=[];matched=[];horizon=max(1,min(12,int(horizon)))
-    for i in range(horizon,len(clean)):
-        a,x=clean[i-horizon];b,y=clean[i]
-        if a.date()!=b.date() or (b-a).total_seconds()!=horizon*300:continue
-        if any((clean[j][0]-clean[j-1][0]).total_seconds()!=300 for j in range(i-horizon+1,i+1)):continue
-        v=abs(y/x-1);moves.append(v)
-        if abs(a.hour*60+a.minute-(now.hour*60+now.minute))<=60:matched.append(v)
-    chosen=matched if len(matched)>=30 else moves
-    if len(chosen)<30:raise ValueError('Need at least 30 historical move windows for option cost assessment')
-    return float(np.percentile(chosen,60)),len(chosen),'same time of day' if chosen is matched else 'all retained sessions'
-
-# Commodity prices in this ledger are INR per broker quantity (quote × multiplier).
-# Broker quantities remain unchanged; normalize at the adapter boundary only.
-_MCX_AUTO_LINKS={}
-def commodity_premium_multiplier(responses,contract,prices,quantity):
-    if not isinstance(responses,list) or len(responses)!=2:raise ValueError('Incomplete broker premium calculation')
-    ratios=[]
-    for r,price in zip(responses,prices):
-        if r.get('exchange')!='MCX' or r.get('tradingsymbol')!=contract:raise ValueError('Broker calculation contract mismatch')
-        value=float(r.get('option_premium') or 0)/(quantity*price)
-        if not math.isfinite(value) or value<=0:raise ValueError('Broker premium multiplier unavailable')
-        ratios.append(value)
-    multiplier=round(ratios[0])
-    if multiplier<1 or multiplier>100000 or any(abs(x-multiplier)>max(.0001,multiplier*.0001) for x in ratios):
-        raise ValueError('Broker premium does not scale consistently with requested LIMIT prices')
-    return float(multiplier)
-
-def commodity_parity_match(pairs,futures,years):
-    # Bid/ask put-call parity intervals corroborate mapping; ambiguous curves wait.
-    if len(pairs)<3:raise ValueError('Need three fresh call/put strike pairs to resolve underlying automatically')
-    intervals=[(p['strike']+(p['call_bid']-p['put_ask'])*math.exp(RISK_FREE_RATE*years),
-                p['strike']+(p['call_ask']-p['put_bid'])*math.exp(RISK_FREE_RATE*years)) for p in pairs]
-    matches=[]
-    for f in futures:
-        price=f['price'];pad=max(float(f['tick_size']),price*.0002)
-        if sum(lo-pad<=price<=hi+pad for lo,hi in intervals)>=3:matches.append(f['tradingsymbol'])
-    if len(matches)!=1:raise ValueError('Underlying futures mapping ambiguous or inconsistent with fresh option prices; retrying automatically')
-    return matches[0]
-
-_MCX_MASTER={'rows':None,'at':0.0,'day':None,'loading':False,'error':None}
-_MCX_MASTER_LOCK=threading.Lock()
-def commodity_instruments():
-    today=now_ist().date().isoformat()
-    if _MCX_MASTER['rows'] is not None and _MCX_MASTER.get('day')==today:
-        return _MCX_MASTER['rows']
-    with _MCX_MASTER_LOCK:
-        if _MCX_MASTER['rows'] is not None and _MCX_MASTER.get('day')==today:
-            return _MCX_MASTER['rows']
-        _MCX_MASTER.update(loading=True,error=None)
-        try:
-            rows=kite.instruments('MCX')
-            if not isinstance(rows,list) or not rows:raise ValueError('MCX instrument master unavailable')
-            _MCX_MASTER.update(rows=rows,at=time.monotonic(),day=today,error=None)
-            return rows
-        except Exception as exc:
-            _MCX_MASTER['error']=str(exc)
-            raise
-        finally:
-            _MCX_MASTER['loading']=False
-def commodity_future(symbol):
-    name=symbol.removeprefix('MCX:')
-    matches=[r for r in commodity_instruments() if r.get('tradingsymbol')==name and r.get('instrument_type')=='FUT']
-    if len(matches)!=1:raise ValueError('MCX futures contract unavailable: '+symbol)
-    return matches[0]
-def commodity_token(symbol):
-    try:return int(commodity_future(symbol)['instrument_token']),None
-    except Exception as e:return None,str(e)
-def commodity_universe():
-    rows=commodity_instruments();today=now_ist().date();selected=[]
-    names=sorted({r['name'] for r in rows if r.get('instrument_type') in ('CE','PE') and r.get('expiry') and (r['expiry']-today).days>=7})
-    for name in names:
-        options=sorted((r for r in rows if r.get('name')==name and r.get('instrument_type') in ('CE','PE') and (r['expiry']-today).days>=7),key=lambda r:r['expiry'])
-        if not options:continue
-        futures=sorted((r for r in rows if r.get('name')==name and r.get('instrument_type')=='FUT' and r['expiry']>=options[0]['expiry']),key=lambda r:r['expiry'])
-        if futures:
-            link=_MCX_AUTO_LINKS.get((name,str(options[0]['expiry'])))
-            chosen=link['future'] if link and link['day']==today.isoformat() and any(f['tradingsymbol']==link['future'] for f in futures) else futures[0]['tradingsymbol']
-            selected.append('MCX:'+chosen)
-    return selected
-
-class CommodityDeskAdapter(DeskAdapter):
-    def __init__(self):
-        self.symbols=()
-        self.refreshed={}
-        self.option_samples={};self.option_meta={};self.sample_lock=threading.RLock()
-        self.history_lock=threading.Lock();self.discovery_lock=threading.RLock();self.discovery_errors={}
-    @contextmanager
-    def db(self):
-        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'commodity_options_ai.db'),timeout=30)
-        c.row_factory=sqlite3.Row
-        try:
-            c.execute('PRAGMA journal_mode=WAL')
-            yield c
-            c.commit()
-        except Exception:
-            c.rollback();raise
-        finally:c.close()
-    def refresh(self,symbol):
-        # Fast tail refresh used by the live scanner. Deep history is collected by the
-        # independent resumable backfill worker below so a one-year archive never blocks
-        # entry execution or the 5-second position supervisor.
-        with self.history_lock:
-            if time.monotonic()-self.refreshed.get(symbol,-1e9)<COMMODITY_POLICY['refresh_seconds']:return
-            token,err=commodity_token(symbol)
-            if err:raise ValueError(err)
-            end=now_ist()
-            recent=self.bars(symbol,1)
-            start=end-timedelta(days=20)
-            if recent:
-                last=_ai_ts_naive(recent[-1]['ts'])
-                if last:start=max(start,last-timedelta(minutes=10))
-            candles,err=_hist_fetch_chunk(token,start,end)
-            if err:raise ValueError(str(err))
-            _hist_insert_candles(symbol,candles)
-            self.refreshed[symbol]=time.monotonic()
-    def history_bounds(self,symbol):
-        c=ai_db()
-        try:
-            r=c.execute("SELECT COUNT(*) n,MIN(ts) first_ts,MAX(ts) last_ts FROM ai_hist_candles WHERE symbol=? AND interval=?",(symbol,AI_HIST_INTERVAL)).fetchone()
-            return dict(n=int(r['n'] or 0),first_ts=r['first_ts'],last_ts=r['last_ts']) if r else dict(n=0,first_ts=None,last_ts=None)
-        finally:c.close()
-    def backfill_history(self,symbol,target_days=STOCK_HISTORY_BACKFILL_DAYS,progress=None,pause_check=None):
-        """Resumably fill older 5-minute stock history, newest missing chunk first.
-
-        This intentionally uses the shared historical-data request gate. It never holds
-        the live refresh lock across the long backfill and persists every successful chunk
-        immediately, so a disconnect/restart simply resumes from the oldest stored candle.
-        """
-        token,err=commodity_token(symbol)
-        if err:raise ValueError(err)
-        now=now_ist();target_start=now-timedelta(days=int(target_days));bounds=self.history_bounds(symbol)
-        first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
-        # Work backwards so the most recent missing months become usable first.
-        cursor_end=(first-timedelta(minutes=1)) if first else now
-        if cursor_end<=target_start:
-            return dict(symbol=symbol,status='COMPLETE',rows_added=0,chunks=0,bounds=bounds)
-        added_total=0;chunks=0;fetched_total=0;error=None;max_available=False
-        while cursor_end>target_start:
-            if pause_check:
-                reason=pause_check()
-                if reason:
-                    bounds=self.history_bounds(symbol)
-                    return dict(symbol=symbol,status='PAUSED_LIVE_PRIORITY',rows_added=added_total,fetched=fetched_total,
-                        chunks=chunks,error=None,bounds=bounds,target_start=str(target_start),pause_reason=str(reason))
-            start=max(target_start,cursor_end-timedelta(days=STOCK_HISTORY_BACKFILL_CHUNK_DAYS))
-            candles,fetch_err=_hist_fetch_chunk(token,start,cursor_end)
-            if fetch_err:
-                error=str(fetch_err);break
-            # A legal historical request that returns no candles immediately before an
-            # already-populated archive means Kite has no older data for this current
-            # instrument/symbol.  Treat that as MAX_AVAILABLE rather than retrying forever.
-            # We require an existing usable archive so a totally empty/mis-mapped symbol
-            # is still treated as an error and remains visible for investigation.
-            if not candles:
-                current=self.history_bounds(symbol)
-                if int(current.get('n') or 0)>=240 and current.get('first_ts'):
-                    max_available=True
-                    break
-                error='No historical candles returned for current instrument';break
-            added=_hist_insert_candles(symbol,candles);added_total+=added;fetched_total+=len(candles);chunks+=1
-            if progress:
-                try:progress(dict(symbol=symbol,start=str(start),end=str(cursor_end),rows_added=added_total,chunks=chunks))
-                except Exception:pass
-            # Do not skip across a failed window: next run resumes exactly at the oldest
-            # successfully persisted boundary.
-            cursor_end=start-timedelta(seconds=1)
-            time.sleep(STOCK_HISTORY_BACKFILL_PACE_SECONDS)
-        bounds=self.history_bounds(symbol)
-        first=_ai_ts_naive(bounds.get('first_ts')) if bounds.get('first_ts') else None
-        complete=bool(first and first<=target_start+timedelta(days=3))
-        # If every legal older-history window down to the target was checked without an
-        # API error, but the archive still cannot reach the one-year boundary, the current
-        # instrument simply has no more usable older candles.  Resolve it as MAX_AVAILABLE
-        # rather than retrying the same zero-progress windows forever.  Genuine request/
-        # token errors remain ERROR/PARTIAL and are surfaced in the UI for investigation.
-        exhausted_without_error=bool(error is None and cursor_end<=target_start and int(bounds.get('n') or 0)>=240 and first)
-        if not complete and exhausted_without_error:max_available=True
-        status='COMPLETE' if complete else 'MAX_AVAILABLE' if max_available else ('PARTIAL' if chunks else 'ERROR')
-        return dict(symbol=symbol,status=status,rows_added=added_total,fetched=fetched_total,chunks=chunks,error=error,
-            bounds=bounds,target_start=str(target_start),available_from=str(first) if first else None)
-    latest_square_off='23:00'
-    observation_end='23:00'
-    def settings(self):
-        with self.db() as c:
-            row=c.execute("SELECT value FROM desk_meta WHERE key='commodity_setup'").fetchone()
-        return json.loads(row[0]) if row else {}
-    def market_open(self):
-        now=now_ist()
-        return now.weekday()<5 and '09:00'<=now.strftime('%H:%M')<='23:15'
-    def exchange(self,symbol):return 'MCX'
-    def legacy_open(self):return []
-    def _auto_records(self):
-        with self.db() as db:
-            row=db.execute("SELECT value FROM desk_meta WHERE key='commodity_auto_contracts'").fetchone()
-        return json.loads(row[0]) if row else {}
-    def _save_auto_records(self,records):
-        with self.db() as db:db.execute("INSERT OR REPLACE INTO desk_meta VALUES('commodity_auto_contracts',?)",(json.dumps(records),))
-    def multiplier(self,contract):
-        with self.discovery_lock:
-            records=self._auto_records();record=records.get(contract);today=now_ist().date().isoformat()
-            with self.db() as db:
-                held=db.execute("SELECT id FROM desk_positions WHERE contract=? AND status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING') LIMIT 1",(contract,)).fetchone()
-            if record and (held or record.get('day')==today):return float(record['multiplier'])
-            row=next((r for r in commodity_instruments() if r.get('tradingsymbol')==contract),None)
-            if not row or row.get('instrument_type') not in ('CE','PE'):raise ValueError('MCX option metadata unavailable')
-            # Preserve original accounting units for positions created by earlier versions.
-            legacy=self.settings().get('multipliers',{})
-            previous=legacy.get(contract,legacy.get(row.get('name')))
-            if held and previous is not None:
-                value=float(previous)
-                if not math.isfinite(value) or value<=0:raise ValueError('Invalid retained position multiplier')
-                records[contract]=dict(multiplier=value,day=today,source='retained existing-position accounting')
-                self._save_auto_records(records);return value
-            failure=self.discovery_errors.get(contract)
-            if failure and time.monotonic()-failure['at']<60:raise ValueError(failure['reason'])
-            try:
-                key='MCX:'+contract;q=kite_quote_bulk([key],force_refresh=True).get(key) or {}
-                ts=_ai_ts_naive(q.get('timestamp'));st=quote_stats(q);tick=float(row.get('tick_size') or 0)
-                if not ts or not -5<=(now_ist()-ts).total_seconds()<=30 or not st.get('ask') or tick<=0:raise ValueError('Waiting for fresh option price to discover multiplier')
-                first=round(math.ceil(st['ask']/tick)*tick,8);second=round(first+max(10,math.ceil(first*.1/tick))*tick,8)
-                qty=int(row.get('lot_size') or 0)
-                if qty<=0:raise ValueError('Invalid broker lot quantity')
-                requests=[dict(exchange='MCX',tradingsymbol=contract,transaction_type='BUY',variety='regular',product='NRML',
-                    order_type='LIMIT',quantity=qty,price=price,trigger_price=0) for price in (first,second)]
-                # Calculation endpoint only. No test orders are submitted.
-                responses=kite.order_margins(requests)
-                value=commodity_premium_multiplier(responses,contract,(first,second),qty)
-                records[contract]=dict(multiplier=value,day=today,source='Kite margin premium / quantity / LIMIT price; two-price check',instrument_token=row['instrument_token'])
-                self._save_auto_records(records);self.discovery_errors.pop(contract,None)
-                return value
-            except Exception as exc:
-                self.discovery_errors[contract]=dict(at=time.monotonic(),reason='Automatic multiplier discovery waiting: '+str(exc))
-                raise ValueError(self.discovery_errors[contract]['reason'])
-    def resolve_underlying(self,opts,futures,quotes,expiry):
-        now=now_ist();pairs={};future_prices=[]
-        def fresh(q):
-            ts=_ai_ts_naive((q or {}).get('timestamp'));trade=_ai_ts_naive((q or {}).get('last_trade_time'))
-            return ts and trade and -5<=(now-ts).total_seconds()<=30 and -5<=(now-trade).total_seconds()<=120
-        def book_fresh(q):
-            # Put-call parity uses bid/ask, so a live resting book is enough; it need not have traded in the last 2 minutes.
-            ts=_ai_ts_naive((q or {}).get('timestamp'))
-            return bool(ts and -5<=(now-ts).total_seconds()<=COMMODITY_POLICY['map_option_age_seconds'])
-        for o in opts:
-            q=quotes.get('MCX:'+o['tradingsymbol'])
-            if not book_fresh(q):continue
-            st=quote_stats(q)
-            if not st.get('bid') or not st.get('ask') or st['bid']>st['ask'] or st['spread_pct']>3:continue
-            pairs.setdefault(float(o['strike']),{})[o['instrument_type']]=st
-        complete=[dict(strike=k,call_bid=v['CE']['bid'],call_ask=v['CE']['ask'],put_bid=v['PE']['bid'],put_ask=v['PE']['ask']) for k,v in pairs.items() if 'CE' in v and 'PE' in v]
-        for f in futures:
-            q=quotes.get('MCX:'+f['tradingsymbol'])
-            # If a competing future is unobserved, uniqueness cannot be established.
-            if not fresh(q):
-                if not COMMODITY_POLICY['map_stale_competitors']:raise ValueError('Waiting for fresh competing futures quotes to resolve option mapping')
-                # An illiquid far-month contract is only a competitor.  Its last known price is enough to rule it out,
-                # and if that price still fits the parity intervals the mapping is reported ambiguous and no trade is taken.
-                stale_price=extract_price(q) if q else None
-                if not stale_price or not math.isfinite(float(stale_price)) or stale_price<=0:
-                    raise ValueError('No price available for competing futures '+str(f['tradingsymbol']))
-                future_prices.append(dict(tradingsymbol=f['tradingsymbol'],price=float(stale_price),tick_size=float(f['tick_size'])))
-                continue
-            st=quote_stats(q);price=st.get('mid') or extract_price(q)
-            if not price or not math.isfinite(float(price)) or price<=0:raise ValueError('Missing underlying futures price')
-            future_prices.append(dict(tradingsymbol=f['tradingsymbol'],price=float(price),tick_size=float(f['tick_size'])))
-        chosen=commodity_parity_match(complete,future_prices,(expiry-now.date()).days/365.)
-        return chosen
-    def _option_tick(self,contract):
-        cache=self.__dict__.setdefault('_tick_cache',{})
-        if contract not in cache:
-            row=next((r for r in commodity_instruments() if r.get('tradingsymbol')==contract),None)
-            cache[contract]=float(row.get('tick_size') or 0) if row else 0.
-        return cache[contract]
-    def quote(self,exchange,contract):
-        try:
-            key=f'{exchange}:{contract}';raw=kite_quote_bulk([key],force_refresh=True).get(key)
-            if not raw:return None,'Missing MCX option quote'
-            ts=_ai_ts_naive(raw.get('timestamp'));trade=_ai_ts_naive(raw.get('last_trade_time'));now=now_ist()
-            if ts is None or not -5<=(now-ts).total_seconds()<=COMMODITY_POLICY['quote_age_seconds']:return None,'Stale MCX option book'
-            q=quote_stats(raw)
-            if not q.get('bid') or not q.get('ask') or q['bid']>q['ask'] or not all(math.isfinite(float(q[k])) and float(q[k])>0 for k in ('bid','ask')):return None,'No executable MCX bid/ask'
-            m=self.multiplier(contract);q=dict(q)
-            for key in ('bid','ask','mid','ltp'):
-                if q.get(key) is not None:q[key]=float(q[key])*m
-            q.update(quote_ts=ts.isoformat(),last_trade_age=(now-trade).total_seconds() if trade else None,multiplier=m)
-            with self.sample_lock:
-                samples=self.option_samples.setdefault(contract,[]);mono=time.monotonic()
-                if not samples or mono-samples[-1]['mono']>=1:
-                    samples.append(dict(mono=mono,bid=q['bid'],volume=float(raw.get('volume') or 0),ts=ts.isoformat()))
-                    # v5: keep a time window (not 90 samples) because scan cycles can be minutes apart.
-                    keep=max(120.,float(COMMODITY_POLICY['premium_baseline_seconds'])*1.5)
-                    samples[:]=[r for r in samples if mono-r['mono']<=keep][-240:]
-                old=next((r for r in reversed(samples) if COMMODITY_POLICY['premium_confirmation_seconds']<=mono-r['mono']<=COMMODITY_POLICY['premium_baseline_seconds']),None)
-                volume_now=float(raw.get('volume') or 0)
-                # Demand evidence = new traded volume since the baseline and a bid that has not deteriorated.
-                # (v4 demanded a strictly higher bid on every look, which an illiquid book rarely gives.)
-                if COMMODITY_POLICY['require_bid_improvement']:bid_ok=bool(old and q['bid']>old['bid'])
-                else:bid_ok=bool(old and q['bid']>=old['bid']-self._option_tick(contract)*m)
-                q['premium_confirmed']=bool(old and bid_ok and volume_now>old['volume'] and ts.isoformat()!=old['ts'])
-                q['premium_baseline_age']=round(mono-old['mono'],1) if old else None
-            return q,None
-        except Exception as e:return None,str(e)
-    def place(self,exchange,contract,side,qty,price,tag):
-        if exchange!='MCX':raise ValueError('Commodity desk accepts MCX only')
-        row=next((r for r in commodity_instruments() if r.get('tradingsymbol')==contract),None)
-        if not row or row.get('instrument_type') not in ('CE','PE'):raise ValueError('Only commodity option orders allowed')
-        if side=='BUY':
-            link=self.option_meta.get(contract,{}).get('mapping_verified_at',0)
-            if time.monotonic()-link>30:raise ValueError('Automatic futures mapping requires a fresh check')
-            if (row['expiry']-now_ist().date()).days<7:raise ValueError('Expiry buffer: no new entry within seven calendar days')
-        tick=float(row['tick_size']);raw=float(price)/self.multiplier(contract)
-        raw=round(round(raw/tick)*tick,8)
-        return kite.place_order(variety='regular',exchange='MCX',tradingsymbol=contract,transaction_type=side,
-            quantity=int(qty),product='NRML',order_type='LIMIT',validity='DAY',price=raw,tag=tag)
-    def _normalize_order(self,row):
-        row=dict(row)
-        if row.get('exchange')=='MCX' and row.get('average_price'):
-            row['average_price']=float(row['average_price'])*self.multiplier(row['tradingsymbol'])
-        return row
-    def orders(self):
-        # Normalize owned contracts only; unrelated commodity orders need no setup.
-        with self.db() as c:owned={r[0] for r in c.execute("SELECT DISTINCT contract FROM desk_positions WHERE status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING')")}
-        return [self._normalize_order(r) if r.get('tradingsymbol') in owned else dict(r) for r in kite.orders()]
-    def order_history(self,order_id):return [self._normalize_order(r) for r in kite.order_history(order_id)]
-    def chain(self,symbol):
-        future=commodity_future(symbol);rows=commodity_instruments();today=now_ist().date()
-        futures=sorted([r for r in rows if r.get('name')==future['name'] and r.get('instrument_type')=='FUT' and r['expiry']>=today],key=lambda r:r['expiry'])
-        eligible=[o for o in rows if o.get('name')==future['name'] and o.get('instrument_type') in ('CE','PE') and (o['expiry']-today).days>=7]
-        if not eligible:return None,'No option expiry outside seven-day expiry buffer'
-        expiry=min(o['expiry'] for o in eligible);opts=[o for o in eligible if o['expiry']==expiry]
-        key='MCX:'+future['tradingsymbol'];fq=kite_quote_bulk([key],force_refresh=True).get(key)
-        ts=_ai_ts_naive((fq or {}).get('timestamp'))
-        if ts is None or not -5<=(now_ist()-ts).total_seconds()<=30:return None,'Stale underlying futures quote'
-        trade=_ai_ts_naive((fq or {}).get('last_trade_time'))
-        if trade is None or not -5<=(now_ist()-trade).total_seconds()<=60:return None,'Underlying futures have not traded recently'
-        spot=extract_price(fq)
-        if not spot or spot<=0:return None,'Missing underlying futures price'
-        opts=[o for o in opts if abs(float(o['strike'])/spot-1)<=.2]
-        candidates=[f for f in futures if f['expiry']>=expiry]
-        quotes=kite_quote_bulk(['MCX:'+o['tradingsymbol'] for o in opts]+['MCX:'+f['tradingsymbol'] for f in candidates],force_refresh=True)
-        try:resolved=self.resolve_underlying(opts,candidates,quotes,expiry)
-        except ValueError as exc:return None,str(exc)
-        _MCX_AUTO_LINKS[(future['name'],str(expiry))]=dict(future=resolved,day=today.isoformat())
-        if resolved!=future['tradingsymbol']:return None,'Underlying resolved to '+resolved+'; universe will refresh automatically'
-        # Bound discovery traffic to three nearest strikes; broader universe scan continues.
-        strikes=sorted({float(o['strike']) for o in opts},key=lambda k:abs(k-spot))[:3]
-        opts=[o for o in opts if float(o['strike']) in strikes]
-        enriched=[];T=(expiry-today).days/365.
-
-        for o in opts:
-            q=quotes.get('MCX:'+o['tradingsymbol']);st=quote_stats(q)
-            if not st.get('bid') or not st.get('ask') or st['bid']>st['ask']:continue
-            if float(st.get('volume') or 0)<10 or float(st.get('oi') or 0)<20:continue
-            try:m=self.multiplier(o['tradingsymbol'])
-            except ValueError:continue
-            mid=(st['bid']+st['ask'])/2
-            # Explicit Black-76 valuation with bounded IV inversion.
-            try:iv=commodity_iv(spot,float(o['strike']),T,mid,o['instrument_type'])
-            except ValueError:continue
-            d1=(math.log(spot/float(o['strike']))+.5*iv*iv*T)/(iv*math.sqrt(T))
-            delta=math.exp(-RISK_FREE_RATE*T)*(.5*(1+math.erf(d1/math.sqrt(2)))-(1 if o['instrument_type']=='PE' else 0))
-            self.option_meta[o['tradingsymbol']]=dict(future=spot,strike=float(o['strike']),years=T,iv=iv,kind=o['instrument_type'],multiplier=m,observed=time.monotonic(),mapping_verified_at=time.monotonic(),underlying=resolved)
-            enriched.append({**o,'bid':st['bid']*m,'ask':st['ask']*m,'ltp':mid*m,'mid':mid*m,
-                'tick_size':float(o['tick_size'])*m,'delta':delta,'iv':iv*100,'volume':st['volume'],'oi':st['oi'],'spread_pct':st['spread_pct']})
-        return dict(symbol=symbol,exchange='MCX',spot=spot,expiry=expiry,T=T,chain=enriched,all_expiries=[str(expiry)]),None
-
-class CommodityDeskEngine(DeskEngine):
-    def __init__(self,adapter):
-        super().__init__(adapter)
-        self.a.symbols=tuple(self.get('commodity_universe',[]))
-        self.funnel_history=__import__('collections').deque(maxlen=60)
-        # One-time: move settings that were never customised off the NSE-shaped defaults.
-        if not self.get('commodity_defaults_v5'):
-            saved=dict(self.get('config',{}) or {})
-            for key,new in COMMODITY_DEFAULT_OVERRIDES.items():
-                if saved.get(key,COMMODITY_NSE_DEFAULTS[key])==COMMODITY_NSE_DEFAULTS[key]:saved[key]=new
-            self.put('config',saved);self.put('commodity_defaults_v5',now_ist().isoformat())
-        self.scan_status={'status':'IDLE','completed':0,'total':0,'deep_total':0,'deep_completed':0}
-        self.ban_checked=0;self.banned=set();self.ban_error='MCX: equity ban list does not apply'
-        self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
-        self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
-        self.execution_status={'status':'IDLE'};self.refresh_cursor=0;self.stall_watch={}
-        self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
-        self.hist_success_lock=threading.Lock();self.hist_success_model_cache=None;self.hist_success_model_cache_at=0.0
-        self.hist_success_thread=None;self.hist_success_last_attempt=0.0
-        self.history_backfill_thread=None;self.history_backfill_last_attempt=0.0;self.history_backfill_universe=()
-        self.history_backfill_status=dict(status='WAITING FOR KITE',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=0,rows_added=0)
-    def _full_mode(self):
-        return self.get('commodity_universe_info',{}).get('mode')!='Custom watchlist'
-    def select_universe(self,body=None):
-        body=body or {}
-        if self.config()['armed']:raise ValueError('Disarm entries before changing the scan universe')
-        universe=commodity_universe()
-        selected=body.get('symbols',[])
-        if not isinstance(selected,list) or any(not isinstance(x,str) for x in selected):raise ValueError('symbols must be a list of MCX underlying symbols')
-        if selected:
-            selected=list(dict.fromkeys(x.strip().upper() for x in selected if x.strip()))
-            if not 1<=len(selected)<=60 or any(x not in universe for x in selected):raise ValueError('Choose 1–60 current MCX futures underlyings; equities and indices are excluded')
-            mode='Custom watchlist'
-        else:
-            selected=list(universe);mode='Full MCX universe'
-        if not selected:raise ValueError('No current MCX futures underlyings found. Connect Kite and refresh instruments.')
-        self.a.symbols=tuple(selected)
-        self.put('commodity_universe',selected)
-        self.put('commodity_universe_info',dict(mode=mode,total_fo=len(universe),selected=len(selected),deep_check=STOCK_FULL_SCAN_DEEP_N,
-            refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat()))
-        self.signals={k:v for k,v in self.signals.items() if k in selected}
-        self.refresh_cursor=0
-        self.event('UNIVERSE',f'{mode}: monitoring {len(selected)} stocks; deep option checks top {min(STOCK_FULL_SCAN_DEEP_N,len(selected))}')
-        return selected
-    def _sync_full_universe_membership(self):
-        if not self._full_mode():return
-        universe=commodity_universe()
-        if tuple(universe)==tuple(self.a.symbols):return
-        self.a.symbols=tuple(universe);self.put('commodity_universe',universe)
-        info=self.get('commodity_universe_info',{});info.update(mode='Full MCX universe',total_fo=len(universe),selected=len(universe),
-            deep_check=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,updated=now_ist().isoformat())
-        self.put('commodity_universe_info',info);self.signals={k:v for k,v in self.signals.items() if k in universe}
-        self.event('UNIVERSE',f'F&O membership refreshed: {len(universe)} stocks')
-    @staticmethod
-    def rank_signal(s,max_spread):
-        confidence=max(0.,min(1.,float(s.get('confidence') or 0)))
-        base=100*confidence
-        if s.get('decision')!='READY':return round(base,2) if s.get('p_up') is not None else 0.
-        # Once the trade-success model is validated, learned probability dominates ranking.
-        if s.get('success_model_valid') and s.get('success_probability') is not None:
-            p=max(0.,min(1.,float(s['success_probability'])))
-            ev=float(s.get('expected_r') or 0)
-            ev_quality=max(0.,min(1.,(ev+0.5)/2.0))
-            spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
-            return round(85*p+10*ev_quality+5*spread,2)
-        spread=max(0.,min(1.,1-float(s.get('spread') or 0)/max_spread))
-        depth=min(1.,float(s.get('depth_qty') or 0)/max(1,float(s.get('qty') or 1))/3)
-        return round(90*confidence+7*spread+3*depth,2)
-    def _success_vector(self,s):
-        feats=list(s.get('features') or [])
-        def fidx(i,default=0.):
-            try:return float(feats[i]) if math.isfinite(float(feats[i])) else default
-            except Exception:return default
-        conf=max(0.,min(1.,float(s.get('confidence') or 0)))
-        hp=s.get('historical_probability');op=s.get('online_probability')
-        hs=abs(float(hp)-.5)*2 if hp is not None else conf
-        os=abs(float(op)-.5)*2 if op is not None else 0.
-        agree=1. if hp is not None and op is not None and (float(hp)>=.5)==(float(op)>=.5) else 0.5 if op is None else 0.
-        direction=s.get('direction');reg=s.get('regime')
-        align=1. if (direction=='UP' and reg=='UPTREND') or (direction=='DOWN' and reg=='DOWNTREND') else .5 if reg=='RANGE' else 0.
-        spread=float(s.get('spread') or 99);max_spread=max(.01,float(self.config().get('max_spread') or 1.))
-        spreadq=max(0.,min(1.,1-spread/max_spread))
-        qty=max(1.,float(s.get('qty') or 1));depth=max(0.,min(5.,float(s.get('depth_qty') or 0)/qty))/5
-        delta=abs(float(s.get('option_delta') or .5));deltaq=max(0.,1-abs(delta-.5)/.2)
-        vol=np.log1p(max(0.,float(s.get('option_volume') or 0)))/15.
-        oi=np.log1p(max(0.,float(s.get('option_oi') or 0)))/18.
-        dte=max(0.,min(60.,float(s.get('dte') or 0)))/60.
-        fresh=max(0.,min(1.,1-float(s.get('bar_age') or 15)/15.))
-        cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);stop=float(cfg.get('stop_pct') or 12)/40.
-        planned=max(.01,(float(s.get('entry') or 0)-float(s.get('stop') or 0))*max(1.,float(s.get('qty') or 1)))
-        cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
-        return [conf,hs,os,agree,fidx(11),fidx(12),fidx(8),fidx(9),fidx(10),align,spreadq,depth,deltaq,vol,oi,dte,fresh,reward,stop,cost_r]
-    def _historical_setup_vector_from_features(self,f,p,reward=None,stop_barrier=None):
-        direction=1. if float(p)>=.5 else -1.
-        conf=max(float(p),1-float(p))
-        reward=float(reward if reward is not None else self.config().get('reward_r',1.8))
-        if stop_barrier is None:
-            # This is an UNDERLYING-stock barrier, not an option-premium stop. It is
-            # deliberately volatility-scaled so historical candles can provide a
-            # useful setup prior without fabricating option-chain history.
-            vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0))
-            stop_barrier=max(.20,min(1.75,.55*vol+.35*rng))
-        return [
-            conf,
-            direction*float(f.get('ret_1') or 0),direction*float(f.get('ret_3') or 0),
-            direction*float(f.get('ret_5') or 0),direction*float(f.get('ret_20') or 0),
-            direction*float(f.get('ema_gap_9_20') or 0),direction*float(f.get('ema_gap_20_50') or 0),
-            direction*(float(f.get('rsi14') or 50)-50),
-            direction*(float(f.get('trend_score') or 12.5)-12.5),
-            direction*(float(f.get('momentum_score') or 12.5)-12.5),
-            float(f.get('volatility_10') or 0),float(f.get('range_20') or 0),float(f.get('volume_ratio') or 0),
-            float(f.get('time_sin') or 0),float(f.get('time_cos') or 0),float(stop_barrier),reward
-        ]
-    def _historical_setup_vector(self,s):
-        vals=list(s.get('features') or [])
-        f={name:(float(vals[i]) if i<len(vals) and math.isfinite(float(vals[i])) else 0.) for i,name in enumerate(STOCK_DIRECTION_FEATURES)}
-        p=s.get('p_up')
-        if p is None:return None
-        return self._historical_setup_vector_from_features(f,float(p))
-    @staticmethod
-    def _historical_barrier_outcome(rows,i,direction,stop_pct,target_pct,horizon_bars):
-        entry=float(rows[i]['close'] or 0)
-        if entry<=0:return None
-        stop=float(stop_pct)/100.;target=float(target_pct)/100.;end=min(len(rows)-1,i+int(horizon_bars))
-        for j in range(i+1,end+1):
-            hi=float(rows[j]['high'] or rows[j]['close'] or 0);lo=float(rows[j]['low'] or rows[j]['close'] or 0)
-            if direction>0:
-                fav=(hi/entry)-1;adv=1-(lo/entry)
-            else:
-                fav=1-(lo/entry);adv=(hi/entry)-1
-            hit_target=fav>=target;hit_stop=adv>=stop
-            # If both barriers occur inside the same five-minute candle, intrabar order
-            # is unknowable from OHLC. Count it conservatively as a failure.
-            if hit_target and hit_stop:return 0
-            if hit_stop:return 0
-            if hit_target:return 1
-        return None
-    def _live_execution_priority_reason(self):
-        """Heavy history work yields whenever any automated live desk may need Kite."""
-        try:
-            cfg=self.config()
-            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
-            if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
-            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
-                return 'Stock AI live order unresolved'
-        except Exception:
-            return 'Stock AI live-state check unavailable'
-        for name,label in (('DESK','Index AI'),('CAS_DESK','CAS AI')):
-            desk=globals().get(name)
-            if not desk or desk is self:continue
-            try:
-                cfg=desk.config()
-                if cfg.get('mode')=='live' and cfg.get('armed'):return label+' live entries armed'
-                if any(p.get('mode')=='live' for p in desk.active()):return label+' live position active'
-                if desk.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
-                    return label+' live order unresolved'
-            except Exception:
-                pass
-        try:
-            cfg=autotrade_ai_config()
-            if cfg.get('execution_mode')=='live' and cfg.get('armed'):return 'Auto Buy/Sell AI live entries armed'
-            if any(p.get('execution_mode')=='live' for p in autotrade_ai_open_positions()):
-                return 'Auto Buy/Sell AI live position active'
-        except Exception:
-            pass
-        return None
-    def _history_archive_coverage(self):
-        hb=self.history_backfill_status or {}
-        total=max(0,int(hb.get('total') or len(self.a.symbols) or 0))
-        complete=max(0,int(hb.get('archive_complete_symbols') or (total if hb.get('status')=='COMPLETE' else 0)))
-        ratio=(complete/total) if total else 0.0
-        return dict(complete=complete,total=total,ratio=ratio,ready=bool(total and ratio>=STOCK_HIST_MIN_ARCHIVE_COVERAGE),
-            required_ratio=STOCK_HIST_MIN_ARCHIVE_COVERAGE)
-    def _ensure_deep_history_backfill(self,force=False):
-        """Start/resume the one-year archive only when live execution has no priority."""
-        if not self.a.connected() or not self.a.symbols:return False
-        universe=tuple(self.a.symbols)
-        priority=self._live_execution_priority_reason()
-        if priority:
-            prior=self.history_backfill_status or {}
-            self.history_backfill_status={**prior,'status':'PAUSED · LIVE PRIORITY','pause_reason':priority,
-                'target_days':STOCK_HISTORY_BACKFILL_DAYS,'total':len(universe),'updated':now_ist().isoformat()}
-            self.history_backfill_last_attempt=0.
-            return False
-        if self.history_backfill_thread and self.history_backfill_thread.is_alive():return False
-        if not force and self.history_backfill_status.get('status')=='COMPLETE' and self.history_backfill_universe==universe:return False
-        now=time.monotonic()
-        if not force and now-self.history_backfill_last_attempt<STOCK_HISTORY_BACKFILL_RETRY_SECONDS:return False
-        self.history_backfill_last_attempt=now;self.history_backfill_universe=universe
-        def job():
-            total=len(universe);added_total=0;errors=[];archive_complete=0;full_year=0;max_available=0;max_available_names=[]
-            self.history_backfill_status=dict(status='BACKFILLING',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=total,
-                archive_complete_symbols=0,archive_full_year_symbols=0,archive_max_available_symbols=0,coverage_ratio=0.0,
-                required_coverage=STOCK_HIST_MIN_ARCHIVE_COVERAGE,rows_added=0,started=now_ist().isoformat(),symbol=None,pause_reason=None)
-            for i,symbol in enumerate(universe):
-                if self.stop_event.is_set():break
-                if not self.a.connected():
-                    self.history_backfill_status.update(status='PAUSED · KITE DISCONNECTED',completed=i,symbol=symbol);self.history_backfill_last_attempt=0.;return
-                priority=self._live_execution_priority_reason()
-                if priority:
-                    self.history_backfill_status.update(status='PAUSED · LIVE PRIORITY',pause_reason=priority,completed=i,symbol=symbol,
-                        archive_complete_symbols=archive_complete,coverage_ratio=round(archive_complete/max(1,total),4),updated=now_ist().isoformat())
-                    self.history_backfill_last_attempt=0.;return
-                self.history_backfill_status.update(symbol=symbol,completed=i,pause_reason=None)
-                def chunk_progress(info):
-                    self.history_backfill_status.update(symbol=symbol,current_chunk=info.get('chunks'),chunk_start=info.get('start'),chunk_end=info.get('end'),
-                        rows_added=added_total+int(info.get('rows_added') or 0))
-                try:
-                    r=self.a.backfill_history(symbol,STOCK_HISTORY_BACKFILL_DAYS,chunk_progress,self._live_execution_priority_reason)
-                    added_total+=int(r.get('rows_added') or 0)
-                    if r.get('status')=='PAUSED_LIVE_PRIORITY':
-                        self.history_backfill_status.update(status='PAUSED · LIVE PRIORITY',pause_reason=r.get('pause_reason') or 'Live execution priority',
-                            completed=i,symbol=symbol,rows_added=added_total,archive_complete_symbols=archive_complete,
-                            coverage_ratio=round(archive_complete/max(1,total),4),updated=now_ist().isoformat())
-                        self.history_backfill_last_attempt=0.;return
-                    if r.get('status')=='COMPLETE':
-                        archive_complete+=1;full_year+=1
-                    elif r.get('status')=='MAX_AVAILABLE':
-                        # No older candles exist for the current instrument. This is a
-                        # resolved archive, not an error; use all genuine available data.
-                        archive_complete+=1;max_available+=1;max_available_names.append(symbol)
-                    else:
-                        errors.append(symbol+': '+str(r.get('error') or r.get('status')))
-                except Exception as e:
-                    errors.append(symbol+': '+str(e))
-                self.history_backfill_status.update(completed=i+1,rows_added=added_total,last_symbol=symbol,error_count=len(errors),
-                    archive_complete_symbols=archive_complete,archive_full_year_symbols=full_year,archive_max_available_symbols=max_available,
-                    max_available_symbols=max_available_names[:20],coverage_ratio=round(archive_complete/max(1,total),4))
-            complete=(not self.stop_event.is_set() and self.a.connected() and not errors and archive_complete==total)
-            self.history_backfill_status.update(status='COMPLETE' if complete else 'PARTIAL · WILL RETRY',
-                completed=total if complete else self.history_backfill_status.get('completed',0),total=total,rows_added=added_total,
-                archive_complete_symbols=archive_complete,archive_full_year_symbols=full_year,archive_max_available_symbols=max_available,
-                max_available_symbols=max_available_names[:20],coverage_ratio=round(archive_complete/max(1,total),4),
-                finished=now_ist().isoformat(),errors=errors[:8],pause_reason=None)
-            self.event('HISTORY_BACKFILL',f"{self.history_backfill_status['status']} · {archive_complete}/{total} resolved ({full_year} full-year + {max_available} max-available) · added {added_total} rows")
-            if added_total>0 and not self.train_lock.locked() and not self._live_execution_priority_reason():self.train()
-            if self._history_archive_coverage()['ready'] and not self._live_execution_priority_reason():self._ensure_historical_success_training(force=True)
-        self.history_backfill_thread=threading.Thread(target=job,daemon=True,name='commodity-ai-deep-history')
-        self.history_backfill_thread.start();return True
-    def historical_success_model(self,force=False):
-        now=time.monotonic()
-        if not force and self.hist_success_model_cache is not None and now-self.hist_success_model_cache_at<30:return self.hist_success_model_cache
-        m=self.get('historical_setup_success_model')
-        self.hist_success_model_cache=m;self.hist_success_model_cache_at=now
-        return m
-    def train_historical_success_model(self,force=False):
-        if not self.hist_success_lock.acquire(False):return self.historical_success_model()
-        try:
-            direction_model=self.model()
-            if not direction_model or not direction_model.get('mu') or not direction_model.get('validation_start'):
-                m=dict(status='WAITING FOR DIRECTION MODEL',valid=False,samples=0,required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
-                    features=STOCK_HIST_SUCCESS_FEATURES,updated=now_ist().isoformat(),
-                    note='Train the stock directional model first; historical setup learning uses its unseen holdout period.')
-                self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic();return m
-            prior=self.historical_success_model();dm_id=direction_model.get('id')
-            if not force and prior and prior.get('direction_model_id')==dm_id and prior.get('valid'):
-                return prior
-            try:
-                holdout_start=datetime.fromisoformat(str(direction_model['validation_start']).replace('Z','+00:00'))
-                if holdout_start.tzinfo is None:holdout_start=holdout_start.replace(tzinfo=IST)
-                else:holdout_start=holdout_start.astimezone(IST)
-            except Exception:
-                holdout_start=None
-            if holdout_start is None:
-                raise ValueError('Directional model validation_start is missing or invalid')
-            cfg=self.config();reward=float(cfg.get('reward_r') or 1.8);horizon=max(3,min(24,int(float(cfg.get('max_hold') or 90)//5)))
-            covered={str(r.get('symbol')) for r in (direction_model.get('coverage') or []) if int(r.get('bars') or 0)>=300}
-            train_symbols=[sym for sym in self.a.symbols if not covered or sym in covered]
-            samples=[];per_symbol={};coverage=[]
-            for n,symbol in enumerate(train_symbols):
-                rows=self.a.bars(symbol,20000)
-                if len(rows)<240:continue
-                arr={k:np.asarray([float(r[k] or 0) for r in rows],float) for k in ('close','high','low','volume')};arr['ts']=[str(r['ts']) for r in rows]
-                made=[]
-                for i in range(200,len(rows)-horizon,3):
-                    try:
-                        t=datetime.fromisoformat(str(rows[i]['ts']).replace('Z','+00:00'))
-                        if t.tzinfo is None:t=t.replace(tzinfo=IST)
-                        else:t=t.astimezone(IST)
-                    except Exception:continue
-                    if t<holdout_start:continue
-                    f=self.a.features(rows,i,arr);x=[f.get(k,0) for k in STOCK_DIRECTION_FEATURES]
-                    if len(x)!=len(direction_model.get('mu') or []) or not all(math.isfinite(float(v)) for v in x):continue
-                    p=_stock_direction_predict(direction_model,x);conf=max(p,1-p)
-                    if conf<.55:continue
-                    vol=max(0.,float(f.get('volatility_10') or 0));rng=max(0.,float(f.get('range_20') or 0))
-                    stop_barrier=max(.20,min(1.75,.55*vol+.35*rng));target_barrier=stop_barrier*reward
-                    direction=1 if p>=.5 else -1
-                    label=self._historical_barrier_outcome(rows,i,direction,stop_barrier,target_barrier,horizon)
-                    if label is None:continue
-                    hv=self._historical_setup_vector_from_features(f,p,reward,stop_barrier)
-                    if all(math.isfinite(float(v)) for v in hv):
-                        end_t=t+timedelta(minutes=5*horizon);made.append((t.timestamp(),end_t.timestamp(),hv,int(label),symbol))
-                if len(made)>STOCK_HIST_SUCCESS_PER_SYMBOL:
-                    # Keep each stock balanced while spreading its samples across the whole
-                    # available holdout instead of retaining only the most recent tail.
-                    keep=np.linspace(0,len(made)-1,STOCK_HIST_SUCCESS_PER_SYMBOL,dtype=int)
-                    made=[made[int(k)] for k in keep]
-                samples.extend(made);per_symbol[symbol]=len(made);coverage.append(dict(symbol=symbol,samples=len(made),bars=len(rows)))
-                if n%12==0:time.sleep(.01)
-            samples.sort(key=lambda r:r[0])
-            if len(samples)>STOCK_HIST_SUCCESS_MAX_SAMPLES:
-                # Deterministic evenly-spaced downsample preserves chronology and coverage.
-                idx=np.linspace(0,len(samples)-1,STOCK_HIST_SUCCESS_MAX_SAMPLES,dtype=int);samples=[samples[int(i)] for i in idx]
-            if len(samples)<STOCK_HIST_SUCCESS_MIN_SAMPLES or len({r[3] for r in samples})<2:
-                m=dict(status='LEARNING',valid=False,samples=len(samples),required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
-                    features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),
-                    per_symbol=per_symbol,updated=now_ist().isoformat(),
-                    note='Historical stock setup samples are still building. Full-F&O recent history is collected progressively.')
-            else:
-                split=int(len(samples)*.8);cut=samples[split][0]
-                train=[r for r in samples[:split] if r[1]<cut];val=[r for r in samples[split:] if r[0]>=cut]
-                if len(train)<200 or len(val)<60 or len({r[3] for r in train})<2 or len({r[3] for r in val})<2:
-                    m=dict(status='LEARNING',valid=False,samples=len(samples),required=STOCK_HIST_SUCCESS_MIN_SAMPLES,
-                        train_samples=len(train),validation_samples=len(val),features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,
-                        holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),per_symbol=per_symbol,updated=now_ist().isoformat(),
-                        note='Need more chronological winners and failures for historical setup validation.')
-                else:
-                    X=[r[2] for r in train];Y=[r[3] for r in train];Xv=[r[2] for r in val];Yv=np.asarray([r[3] for r in val],int)
-                    m=_stock_success_fit(X,Y);pv=np.asarray(_stock_success_predict(m,Xv),float)
-                    aucv=_stock_success_auc(Yv,pv);acc=float(((pv>=.5)==Yv).mean()*100);baseline=float(max(Yv.mean(),1-Yv.mean())*100);brier=float(np.mean((pv-Yv)**2))
-                    valid=aucv is not None and aucv>=STOCK_HIST_SUCCESS_MIN_AUC and acc>=baseline-2
-                    m.update(status='VALIDATED' if valid else 'LEARNING',valid=bool(valid),samples=len(samples),train_samples=len(train),validation_samples=len(val),
-                        accuracy=acc,auc=aucv,brier=brier,baseline=baseline,features=STOCK_HIST_SUCCESS_FEATURES,direction_model_id=dm_id,
-                        holdout_start=holdout_start.isoformat(),direction_coverage_symbols=len(train_symbols),horizon_minutes=horizon*5,reward_r=reward,
-                        label_definition='Underlying target-before-stop using volatility-scaled barriers on the directional model holdout; not an historical option-P&L backtest.',
-                        per_symbol=per_symbol,coverage=coverage,updated=now_ist().isoformat())
-            self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic()
-            self.event('HIST_SUCCESS_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}")
-            return m
-        except Exception as e:
-            m=dict(status='ERROR',valid=False,samples=0,required=STOCK_HIST_SUCCESS_MIN_SAMPLES,features=STOCK_HIST_SUCCESS_FEATURES,
-                error=str(e),updated=now_ist().isoformat())
-            self.put('historical_setup_success_model',m);self.hist_success_model_cache=m;self.hist_success_model_cache_at=time.monotonic()
-            self.event('ERROR','Historical success model: '+str(e));return m
-        finally:self.hist_success_lock.release()
-    def _ensure_historical_success_training(self,force=False):
-        # Historical-success fitting is background research; live execution always wins.
-        if self._live_execution_priority_reason():return False
-        direction_model=self.model()
-        if not direction_model:return False
-        prior=self.historical_success_model()
-        same=prior and prior.get('direction_model_id')==direction_model.get('id')
-        if not force and same and prior.get('valid'):return False
-        if self.hist_success_thread and self.hist_success_thread.is_alive():return False
-        now=time.monotonic()
-        if not force and now-self.hist_success_last_attempt<STOCK_HIST_SUCCESS_RETRY_SECONDS:return False
-        self.hist_success_last_attempt=now
-        def job():self.train_historical_success_model(force=force)
-        self.hist_success_thread=threading.Thread(target=job,daemon=True,name='commodity-ai-historical-success')
-        self.hist_success_thread.start();return True
-    def success_model(self,force=False):
-        now=time.monotonic()
-        if not force and self.success_model_cache is not None and now-self.success_model_cache_at<30:return self.success_model_cache
-        m=self.get('trade_success_model')
-        self.success_model_cache=m;self.success_model_cache_at=now
-        return m
-    def train_success_model(self,force=False):
-        if not self.success_lock.acquire(False):return self.success_model()
-        try:
-            rows=self.rows("SELECT id,exit_ts,pnl,fees,setup FROM desk_positions WHERE status='CLOSED' AND mode='paper' AND setup IS NOT NULL ORDER BY exit_ts,id")
-            stamp_key=rows[-1]['exit_ts'] if rows else None;prior=self.success_model()
-            if not force and prior and prior.get('last_exit_ts')==stamp_key:return prior
-            X=[];Y=[]
-            for r in rows:
-                try:
-                    s=json.loads(r['setup'] or '{}')
-                    if s.get('decision')!='READY':continue
-                    x=self._success_vector(s)
-                    if len(x)==len(STOCK_SUCCESS_FEATURES) and all(math.isfinite(float(v)) for v in x):
-                        X.append(x);Y.append(1 if float(r['pnl'] or 0)-float(r['fees'] or 0)>0 else 0)
-                except Exception:continue
-            if len(X)<STOCK_SUCCESS_MIN_SAMPLES or len(set(Y))<2:
-                m=dict(status='LEARNING',valid=False,samples=len(X),required=STOCK_SUCCESS_MIN_SAMPLES,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat())
-                self.put('trade_success_model',m);self.success_model_cache=m;self.success_model_cache_at=time.monotonic();return m
-            split=max(25,int(len(X)*.8));split=min(split,len(X)-10)
-            Xt,Yt=X[:split],Y[:split];Xv,Yv=X[split:],Y[split:]
-            if len(set(Yt))<2 or len(set(Yv))<2:
-                m=dict(status='LEARNING',valid=False,samples=len(X),required=STOCK_SUCCESS_MIN_SAMPLES,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat(),note='Need wins and losses in both chronological train and validation sets')
-            else:
-                m=_stock_success_fit(Xt,Yt);pv=np.asarray(_stock_success_predict(m,Xv),float);yv=np.asarray(Yv,int)
-                aucv=_stock_success_auc(yv,pv);acc=float(((pv>=.5)==yv).mean()*100);baseline=float(max(yv.mean(),1-yv.mean())*100);brier=float(np.mean((pv-yv)**2))
-                valid=aucv is not None and aucv>=STOCK_SUCCESS_MIN_AUC and acc>=baseline-2
-                m.update(status='VALIDATED' if valid else 'LEARNING',valid=bool(valid),samples=len(X),train_samples=len(Xt),validation_samples=len(Xv),accuracy=acc,auc=aucv,brier=brier,baseline=baseline,features=STOCK_SUCCESS_FEATURES,last_exit_ts=stamp_key,updated=now_ist().isoformat())
-            self.put('trade_success_model',m);self.success_model_cache=m;self.success_model_cache_at=time.monotonic()
-            self.event('SUCCESS_MODEL',f"{m.get('status')} samples={m.get('samples',0)} auc={m.get('auc')}")
-            return m
-        finally:self.success_lock.release()
-    def _apply_success_intelligence(self,s):
-        if s.get('decision')!='READY':return s
-        live_model=self.success_model() or self.train_success_model()
-        hist_model=self.historical_success_model()
-        archive=self._history_archive_coverage()
-        live_valid=bool(live_model and live_model.get('valid') and live_model.get('w'))
-        hist_model_valid=bool(hist_model and hist_model.get('valid') and hist_model.get('w'))
-        hist_valid=bool(hist_model_valid and archive.get('ready'))
-        s['live_success_model_valid']=live_valid;s['historical_success_model_valid']=hist_valid
-        s['historical_success_model_trained']=hist_model_valid
-        s['historical_archive_coverage']=round(float(archive.get('ratio') or 0),4)
-        s['historical_archive_ready']=bool(archive.get('ready'))
-        cfg=self.config();planned=max(.01,(float(s['entry'])-float(s['stop']))*max(1,int(s['qty'])))
-        cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
-        hp=None;lp=None;raw_hist=None;raw_live=None
-        hv=self._historical_setup_vector(s)
-        if hist_valid and hv:
-            raw_hist=float(_stock_success_predict(hist_model,hv))
-            # Historical candles do not contain old option books. Treat the historical
-            # setup model as a conservative prior and shrink it toward 50%.
-            h_samples=float(hist_model.get('samples') or 0);h_auc=float(hist_model.get('auc') or .5)
-            coverage=float(archive.get('ratio') or 0)
-            coverage_factor=max(.50,min(1.,coverage))
-            h_shrink=min(.78,max(.30,.35+min(h_samples,6000)/6000*.25+max(0.,h_auc-.5)*1.2))*coverage_factor
-            hp=.5+(raw_hist-.5)*h_shrink
-            s['historical_setup_probability']=round(max(0.,min(1.,hp)),6)
-            s['historical_setup_probability_raw']=round(raw_hist,6)
-        else:
-            s['historical_setup_probability']=None
-            if hist_model_valid and not archive.get('ready'):
-                s['historical_setup_status']=f"WAITING FOR HISTORY COVERAGE · {float(archive.get('ratio') or 0)*100:.0f}% / {float(archive.get('required_ratio') or 0)*100:.0f}%"
-            elif not hist_model_valid:
-                s['historical_setup_status']='LEARNING'
-        if live_valid:
-            raw_live=float(_stock_success_predict(live_model,self._success_vector(s)))
-            l_samples=float(live_model.get('samples') or 0)
-            l_shrink=min(1.,max(.25,(l_samples-STOCK_SUCCESS_MIN_SAMPLES)/160.0+.25))
-            lp=.5+(raw_live-.5)*l_shrink
-            s['live_success_probability']=round(max(0.,min(1.,lp)),6)
-            s['live_success_probability_raw']=round(raw_live,6)
-        else:s['live_success_probability']=None
-        if hp is not None and lp is not None:
-            # Forward executable option outcomes gain authority as evidence accumulates.
-            live_weight=min(.75,max(.25,.25+(float(live_model.get('samples') or 0)-STOCK_SUCCESS_MIN_SAMPLES)/460*.50))
-            p=(1-live_weight)*hp+live_weight*lp
-            s['success_blend']=dict(historical_weight=round(1-live_weight,3),live_weight=round(live_weight,3))
-            s['selection_basis']=f"Historical setup + live option-success ML ({int(round((1-live_weight)*100))}/{int(round(live_weight*100))})"
-        elif hp is not None:
-            p=hp;s['success_blend']=dict(historical_weight=1.0,live_weight=0.0)
-            s['selection_basis']='Historical setup bootstrap · live option-success ML still learning'
-        elif lp is not None:
-            p=lp;s['success_blend']=dict(historical_weight=0.0,live_weight=1.0)
-            s['selection_basis']='Validated live option-success ML'
-        else:
-            p=None;s['success_blend']=None
-            s['selection_basis']='Directional-confidence fallback while success models learn'
-        s['success_model_valid']=p is not None
-        if p is not None:
-            s['success_probability']=round(max(0.,min(1.,p)),6)
-            s['expected_r']=round(p*float(cfg['reward_r'])-(1-p)-cost_r,4)
-        else:
-            s['success_probability']=None;s['expected_r']=None
-        s['rank_score']=self.rank_signal(s,cfg['max_spread'])
-        return s
-    def _sizing_reason(self,entry,per_risk,lot,ask_qty,bid_qty=None):
-        """Say WHICH limit stops the entry, with the numbers.  Prices are INR per broker quantity (1 quantity = 1 MCX lot)."""
-        cfg=self.config();lot=max(1,int(lot or 1))
-        lot_cost=float(entry)*lot;risk_lot=float(per_risk)*lot
-        by_capital=cfg['capital']/lot_cost if lot_cost>0 else 0.
-        by_risk=cfg['risk']/risk_lot if risk_lot>0 else 0.
-        depth=[float(ask_qty or 0)]+([float(bid_qty or 0)] if bid_qty is not None else [])
-        by_depth=min(depth)/lot
-        info=dict(lot_premium=round(lot_cost,2),risk_per_lot=round(risk_lot,2),lots_by_capital=round(by_capital,2),
-                  lots_by_risk=round(by_risk,2),lots_by_depth=round(by_depth,2),capital=cfg['capital'],risk=cfg['risk'],
-                  stop_pct=cfg['stop_pct'],max_premium_per_lot=round(min(cfg['capital'],cfg['risk']/(cfg['stop_pct']/100.)),2))
-        if by_risk<1:
-            text=(f"one lot costs about Rs {lot_cost:,.0f}; a {cfg['stop_pct']:g}% stop risks Rs {risk_lot:,.0f}, above the "
-                  f"Rs {cfg['risk']:,.0f} risk budget (raise risk to at least Rs {math.ceil(risk_lot):,} or skip this contract)")
-        elif by_capital<1:
-            text=f"one lot costs about Rs {lot_cost:,.0f}, above the Rs {cfg['capital']:,.0f} capital per trade"
-        elif by_depth<1:
-            text=f"visible book depth is below one lot (ask {ask_qty}, bid {bid_qty})"
-        else:
-            text=f"limits allow {int(min(by_capital,by_risk,by_depth))} lot(s); re-check on the next scan"
-        return text,info
-    def _explain_sizing(self,s):
-        if s.get('decision')=='WAIT' and s.get('reason')=='Budget or visible ask depth cannot fund one lot' and s.get('entry') and s.get('lot'):
-            cfg=self.config()
-            text,info=self._sizing_reason(s['entry'],s['entry']*cfg['stop_pct']/100.,s['lot'],s.get('depth_qty'))
-            return dict(s,reason='No entry: '+text,sizing=info)
-        return s
-    def _record_funnel(self):
-        """Tally why each symbol stopped in this scan (numbers masked so identical reasons group together)."""
-        try:
-            import re
-            counts={};conf=[]
-            for s in self.signals.values():
-                reason=re.sub(r'\d[\d,\.]*','#',str(s.get('reason') or s.get('decision') or ''))[:110]
-                key=str(s.get('scan_stage') or 'UNIVERSE')+' | '+str(s.get('decision'))+' | '+reason
-                counts[key]=counts.get(key,0)+1
-                if s.get('p_up') is not None:conf.append(float(s.get('confidence') or 0))
-            self.funnel_history.append(dict(ts=now_ist().isoformat(),symbols=len(self.signals),counts=counts,confidence=conf))
-        except Exception:pass
-    def funnel(self,cycles=30):
-        """Where entries die.  Read `reasons_last_cycles` from the top: the first big line is the binding gate."""
-        hist=list(self.funnel_history)[-max(1,min(60,int(cycles or 30))):]
-        cfg=self.config();model=self.model() or {}
-        need=int(COMMODITY_POLICY['min_contract_training_bars'])
-        latest=hist[-1] if hist else None
-        agg={}
-        for h in hist:
-            for k,v in h['counts'].items():agg[k]=agg.get(k,0)+v
-        total=float(sum(agg.values()) or 1)
-        conf=sorted(latest['confidence']) if latest else []
-        def quant(p):return round(conf[min(len(conf)-1,int(p*len(conf)))],4) if conf else None
-        cov={r.get('symbol'):int(r.get('bars') or 0) for r in model.get('coverage',[])}
-        signals=list(self.signals.values())
-        return dict(
-            desk=dict(mode=cfg['mode'],armed=cfg['armed'],entry_block=self.block(),market_open=self.a.market_open(),
-                      universe=len(self.a.symbols),scan=dict(self.scan_status)),
-            reasons_last_cycles=[dict(gate=k,symbol_scans=v,share=round(v/total,3)) for k,v in sorted(agg.items(),key=lambda kv:-kv[1])[:25]],
-            cycles_used=len(hist),
-            direction=dict(threshold=cfg['confidence'],confidence_min=quant(0.),confidence_median=quant(.5),confidence_p90=quant(.9),
-                           confidence_max=quant(.999),at_or_above_threshold=sum(1 for c in conf if c>=cfg['confidence']),symbols=len(conf)),
-            model=dict(id=model.get('id'),trained=model.get('ts'),auc=model.get('auc'),accuracy=model.get('accuracy'),baseline=model.get('baseline'),
-                       validation_samples=model.get('validation_samples'),contracts_with_enough_history=sum(1 for v in cov.values() if v>=need),
-                       contracts_missing_history=[k for k in self.a.symbols if cov.get(k,0)<need][:20]),
-            sizing=dict(capital=cfg['capital'],risk=cfg['risk'],stop_pct=cfg['stop_pct'],
-                        max_premium_per_lot=round(min(cfg['capital'],cfg['risk']/(cfg['stop_pct']/100.)),2),
-                        seen=[dict(symbol=s.get('symbol'),**s['sizing']) for s in signals if s.get('sizing')][:12]),
-            settings=dict(max_spread=cfg['max_spread'],square_off=cfg['square_off'],max_hold=cfg['max_hold'],
-                          iv_stress_fraction=COMMODITY_POLICY['iv_stress_fraction'],min_scenario_r=COMMODITY_POLICY['min_scenario_r']),
-            reached_deep_check=[s.get('symbol') for s in signals if s.get('scan_stage')=='DEEP'],
-            ready_now=[s.get('symbol') for s in signals if s.get('decision')=='READY'])
-    def maybe_train(self):
-        # v5: the inherited schedule retrains only after the market has closed (>=15:35 and closed).  MCX stays open until
-        # 23:15, so a contract that rolled or was newly added stayed at "Contract learning incomplete" all day.
-        if self.train_lock.locked() or self.training.get('status')=='ERROR':return
-        model=self.model()
-        last_gap_train=getattr(self,'_gap_train_at',None)
-        if model and (last_gap_train is None or time.monotonic()-last_gap_train>=1800):
-            need=int(COMMODITY_POLICY['min_contract_training_bars'])
-            cov={r.get('symbol'):int(r.get('bars') or 0) for r in model.get('coverage',[])}
-            ready=[x for x in self.a.symbols if cov.get(x,0)<need and int(self.a.history_bounds(x).get('n') or 0)>=need+20]
-            if ready:
-                self._gap_train_at=time.monotonic()
-                self.event('LEARN','Retraining: contracts now have enough candles: '+', '.join(ready[:6]))
-                if self.train():return
-        return super().maybe_train()
-    def contract_learning_block(self,symbol):
-        model=self.model() or {}
-        record=next((r for r in model.get('coverage',[]) if r.get('symbol')==symbol),None)
-        if not record or int(record.get('bars') or 0)<COMMODITY_POLICY['min_contract_training_bars']:
-            return 'Contract learning incomplete: sync and retrain with at least 300 candles for this exact futures contract'
-        return None
-    def additional_exit_reason(self,p,q):
-        """Never invent an exit fill. Return a reason to the normal order supervisor."""
-        pid=p['id'];now=now_ist();mono=time.monotonic()
-        if p['status']!='OPEN' or q['bid']>p['entry']:
-            self.stall_watch.pop(pid,None);return None
-        fills=self.rows("SELECT MIN(ts) ts FROM desk_trade_events WHERE position_id=? AND kind='FILL' AND json_extract(payload,'$.side')='BUY'",(pid,))
-        first=_ai_ts_naive(fills[0]['ts']) if fills and fills[0]['ts'] else None
-        if first is None or (now-first).total_seconds()<COMMODITY_POLICY['stall_after_minutes']*60:
-            self.stall_watch.pop(pid,None);return None
-        setup=json.loads(p.get('setup') or '{}');activity=self._activity(p['symbol'],setup.get('direction','UP'))
-        if activity.get('status') not in ('STAGNANT','THIN','CHOPPY') or not activity.get('bar_ts'):
-            self.stall_watch.pop(pid,None);return None
-        old=self.stall_watch.get(pid)
-        if old is None or mono-old['last_seen']>30:
-            self.stall_watch[pid]=dict(first=mono,bar=activity['bar_ts'],last_seen=mono)
-            return None
-        old['last_seen']=mono
-        if mono-old['first']<COMMODITY_POLICY['stall_confirmation_seconds'] or old['bar']==activity['bar_ts']:return None
-        return 'Commodity stalled: 30+ minutes since entry fill, premium not above entry, weak activity confirmed across completed candles'
-    def _activity(self,symbol,direction):
-        future=commodity_future(symbol)
-        return commodity_regime(self.a.bars(symbol,2500),direction,float(future.get('tick_size') or 1))
-    def _screen_direction(self,symbol):
-        s=self.direction_snapshot(symbol,refresh=False,record_observation=True,max_bar_age=10)
-        activity=self._activity(symbol,s.get('direction','UP'));s['commodity_activity']=activity
-        if not activity['ready']:s.update(decision='WAIT',reason=activity['reason'])
-        learning=self.contract_learning_block(symbol)
-        if learning and activity['ready']:s.update(decision='WAIT',reason=learning)
-        s['scan_stage']='UNIVERSE';s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
-        return s
-    def inspect(self,symbol):
-        # Reject stagnant/thin/choppy futures before costly option-chain work.
-        direction=self.direction_snapshot(symbol,refresh=True,record_observation=True,max_bar_age=10)
-        activity=self._activity(symbol,direction.get('direction','UP'))
-        if not activity['ready']:return dict(direction,decision='WAIT',reason=activity['reason'],commodity_activity=activity,scan_stage='ACTIVITY',rank_score=0)
-        learning=self.contract_learning_block(symbol)
-        if learning:return dict(direction,decision='WAIT',reason=learning,commodity_activity=activity,scan_stage='LEARNING',rank_score=0)
-        s=super().inspect(symbol)
-        if s.get('direction')!=direction.get('direction'):activity=self._activity(symbol,s.get('direction','UP'))
-        s['commodity_activity']=activity;s['scan_stage']='DEEP'
-        if not activity['ready']:return dict(s,decision='WAIT',reason=activity['reason'])
-        if s.get('decision')!='READY':return self._explain_sizing(s)
-        q,err=self.a.quote(s['exchange'],s['contract'])
-        if err:return dict(s,decision='WAIT',reason=err)
-        if q.get('last_trade_age') is None or not -5<=q['last_trade_age']<=COMMODITY_POLICY['trade_age_seconds']:
-            return dict(s,decision='WAIT',reason='No entry: option has not traded recently')
-        if not q.get('premium_confirmed'):return dict(s,decision='WAIT',reason='Waiting for option bid improvement and new traded volume across fresh samples')
-        cfg=self.config();tick=s['tick']
-        entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/tick)*tick,2)
-        per_risk=entry*cfg['stop_pct']/100
-        capacity=max(0,int(min(cfg['capital']/entry,cfg['risk']/per_risk,float(q.get('ask_qty') or 0),float(q.get('bid_qty') or 0))//s['lot']))
-        lots=cfg['lots'] or capacity
-        if lots<=0 or lots>capacity:
-            reason,info=self._sizing_reason(entry,per_risk,s['lot'],q.get('ask_qty'),q.get('bid_qty'))
-            return dict(s,decision='WAIT',reason='No entry: '+reason,sizing=info)
-        qty=lots*s['lot'];s.update(entry=entry,stop=entry-per_risk,target=entry+per_risk*cfg['reward_r'],lots=lots,qty=qty,bid=q['bid'],ask=q['ask'])
-        if q.get('spread_pct') is None or q['spread_pct']>cfg['max_spread']:return dict(s,decision='WAIT',reason='Option spread widened before entry')
-        meta=self.a.option_meta.get(s['contract'])
-        if not meta or time.monotonic()-meta['observed']>30:return dict(s,decision='WAIT',reason='Option valuation metadata stale')
-        try:
-            horizon=max(1,min(12,int(cfg['max_hold']//5)))
-            move,n,basis=commodity_move_scenario(self.a.bars(symbol,2500),horizon)
-            sign=1 if s['direction']=='UP' else -1;F=meta['future'];future=max(.01,F*(1+sign*move))
-            years=max(0.,meta['years']-horizon*5/(365*24*60))
-            raw_mid=(q['bid']+q['ask'])/(2*meta['multiplier'])
-            iv=commodity_iv(F,meta['strike'],meta['years'],raw_mid,meta['kind'])
-            stressed=commodity_black76(future,meta['strike'],years,iv*(1-COMMODITY_POLICY['iv_stress_fraction']),meta['kind'],RISK_FREE_RATE)*meta['multiplier']
-            exit_bid=max(0.,stressed-(q['ask']-q['bid'])/2)*(1-cfg['slippage_bps']/10000)
-            net=(exit_bid-entry)*qty-2*cfg['fee_per_order'];scenario_r=net/(per_risk*qty)
-            s['commodity_cost_check']=dict(scenario_net=round(net,2),scenario_r=round(scenario_r,3),move_bps=round(move*10000,2),
-                minutes=horizon*5,samples=n,basis=basis,iv=round(iv,5),iv_reduction=COMMODITY_POLICY['iv_stress_fraction'],
-                note='Favourable-move scenario after time decay, IV stress, spread, slippage and estimated fees; not expected profit')
-            if scenario_r<COMMODITY_POLICY['min_scenario_r']:return dict(s,decision='WAIT',reason='No entry: favourable-move scenario does not cover costs and IV/time stress sufficiently')
-        except ValueError as e:return dict(s,decision='WAIT',reason=str(e))
-        self._apply_success_intelligence(s)
-        s['rank_score']=round(.6*self.rank_signal(s,cfg['max_spread'])+20*min(1.,scenario_r)+20*activity['efficiency'],2)
-        s['reason']='Activity, fresh option demand and cost scenario qualify; execution/risk checks still apply'
-        return s
-    def _refresh_batch(self,names,screened):
-        if not names:return []
-        # Stale/missing symbols get first claim on the refresh budget; the rotating
-        # cursor then guarantees the rest of the universe is revisited continuously.
-        stale=[s for s in names if screened.get(s,{}).get('bar_age') is None or screened.get(s,{}).get('bar_age',999)>STOCK_FULL_SCAN_BAR_MAX_AGE]
-        chosen=[]
-        for s in stale:
-            if s not in chosen:chosen.append(s)
-            if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
-        if len(chosen)<STOCK_FULL_REFRESH_BATCH:
-            total=len(names);start=self.refresh_cursor%total
-            for step in range(total):
-                s=names[(start+step)%total]
-                if s not in chosen:chosen.append(s)
-                if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
-            self.refresh_cursor=(start+STOCK_FULL_REFRESH_BATCH)%total
-        # Always keep owned positions fresh even if they fall outside this cycle's batch.
-        for p in self.active():
-            if p['symbol'] in names and p['symbol'] not in chosen:chosen.append(p['symbol'])
-        return chosen
-    def enter(self,s):
-        # Reprice/revalidate immediately before the order.  A high universe rank never
-        # permits a stale option fill or bypasses the normal desk/shared risk gates.
-        # This method is called by the dedicated execution thread, never by the broad
-        # universe scanner, so slow scanning cannot hold up broker execution/supervision.
-        if s.get('decision')!='READY' or self.block() or self.get('close_requested'):return
-        fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
-        if fresh.get('decision')!='READY' or self.get('close_requested'):return
-        return super().enter(fresh)
-    def _publish_execution_candidates(self,ranked):
-        ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('symbol') in self.a.symbols]
-        with self.candidate_lock:
-            self.execution_generation+=1
-            self.execution_candidates=ready
-            self.execution_status=dict(status='CANDIDATES READY' if ready else 'NO READY CANDIDATE',generation=self.execution_generation,
-                count=len(ready),best=ready[0]['symbol'] if ready else None,
-                best_success_probability=ready[0].get('success_probability') if ready else None,best_expected_r=ready[0].get('expected_r') if ready else None,
-                updated=now_ist().isoformat())
-        if ready:self.execution_event.set()
-    def execute_candidates(self):
-        # Entry execution is serialized independently of both the scanner and the risk
-        # supervisor.  Existing positions/exits never wait for this entry lock.
-        if not self.entry_lock.acquire(False):return
-        try:
-            if not self.a.connected() or not self.a.market_open() or self.get('close_requested'):return
-            with self.candidate_lock:
-                candidates=[dict(s) for s in self.execution_candidates]
-                generation=self.execution_generation
-            if not candidates:return
-            self.execution_status=dict(status='EXECUTING',generation=generation,count=len(candidates),updated=now_ist().isoformat())
-            for seed in candidates:
-                if self.get('close_requested') or not self.config()['armed']:break
-                if self.block():break
-                try:self.enter(seed)
-                except Exception as e:self.event('ERROR','Commodity execution: '+str(e),seed.get('symbol',''))
-                # Re-evaluate limits after each admitted attempt.  If more positions are
-                # allowed, the next-ranked READY candidate may be considered.
-                if len(self.active())>=self.config()['max_positions']:break
-            self.execution_status=dict(status='IDLE',generation=generation,count=len(candidates),updated=now_ist().isoformat())
-        finally:self.entry_lock.release()
-    def cycle(self):
-        if not self.lock.acquire(False):return
-        try:
-            self.last_cycle=now_ist().isoformat()
-            if not self.a.connected():return
-            if not self.a.symbols:self.select_universe()
-            else:self._sync_full_universe_membership()
-            # First successful Kite connection immediately starts/resumes the deep
-            # historical archive in a separate thread. Normal scan/execution continues.
-            self._ensure_deep_history_backfill()
-            if time.monotonic()-self.ban_checked>1800:
-                self.banned,self.ban_error=(set(),None);self.ban_checked=time.monotonic()
-            self.supervise()
-            names=list(dict.fromkeys(list(self.a.symbols)+[p['symbol'] for p in self.active()]))
-            if not self.a.market_open():
-                self.scan_status=dict(status='MARKET CLOSED',phase='Full MCX scan resumes during market hours',completed=0,total=len(names),
-                    deep_completed=0,deep_total=0,finished=now_ist().isoformat())
-                self.settle_observations();self.maybe_train();self._ensure_historical_success_training();return
-            self.scan_status=dict(status='SCANNING MCX',phase='ML universe pass',completed=0,total=len(names),
-                deep_completed=0,deep_total=0,started=now_ist().isoformat())
-            screened={}
-            # Cheap pass: no option chain and no per-symbol history request.  This lets
-            # every F&O stock compete on the same model probability each cycle.
-            for i,symbol in enumerate(names):
-                try:screened[symbol]=self._screen_direction(symbol)
-                except Exception as e:screened[symbol]=dict(symbol=symbol,ts=now_ist().isoformat(),decision='WAIT',reason=str(e),rank_score=0,scan_stage='UNIVERSE')
-                if i%25==0:self.scan_status.update(completed=i+1,symbol=symbol)
-            # Rotate recent-history refreshes so the whole universe stays within the
-            # freshness window without a burst of ~200 historical-data requests.
-            refresh_names=self._refresh_batch(names,screened)
-            self.scan_status.update(phase='Refreshing market history',refreshing=len(refresh_names),completed=len(names))
-            for j,symbol in enumerate(refresh_names):
-                try:
-                    self.a.refresh(symbol);screened[symbol]=self._screen_direction(symbol)
-                except Exception as e:
-                    prior=screened.get(symbol,dict(symbol=symbol));prior.update(decision='WAIT',reason='History refresh: '+str(e),rank_score=0,scan_stage='UNIVERSE');screened[symbol]=prior
-                self.supervise()
-                if j+1<len(refresh_names):time.sleep(STOCK_HISTORY_PACE_SECONDS)
-            # Deep checks are deliberately limited to the strongest model candidates.
-            directional=[s for s in screened.values() if s.get('decision')=='CANDIDATE']
-            directional.sort(key=lambda s:(float(s.get('confidence') or 0),float(s.get('rank_score') or 0)),reverse=True)
-            shortlist=directional[:min(STOCK_FULL_SCAN_DEEP_N,len(directional))]
-            self.signals=dict(screened)
-            self.scan_status.update(phase='Deep option checks',deep_total=len(shortlist),deep_completed=0,
-                directional_candidates=len(directional),fresh_universe=sum(1 for s in screened.values() if s.get('bar_age') is not None and s.get('bar_age')<=STOCK_FULL_SCAN_BAR_MAX_AGE))
-            for i,seed in enumerate(shortlist):
-                symbol=seed['symbol']
-                try:self.signals[symbol]=self.inspect(symbol)
-                except Exception as e:self.signals[symbol]=dict(seed,decision='WAIT',reason='Deep check: '+str(e),scan_stage='DEEP')
-                self.scan_status.update(deep_completed=i+1,symbol=symbol)
-                self.supervise()
-            self._record_funnel()
-            ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',float(s.get('rank_score') or 0)),reverse=True)
-            # Scanner only publishes the ranked READY list.  A dedicated execution
-            # thread performs fresh pre-entry validation and broker submission.
-            self._publish_execution_candidates(ranked)
-            self.settle_observations();self.maybe_train();self.train_success_model();self._ensure_historical_success_training()
-            self.scan_status.update(status='COMPLETE',phase='Complete',completed=len(names),ready=sum(1 for s in self.signals.values() if s.get('decision')=='READY'),finished=now_ist().isoformat())
-            self.last_cycle=now_ist().isoformat()
-            if self.get('close_requested') and not self.active():self.put('close_requested',False)
-        except Exception as e:
-            self.scan_status.update(status='ERROR',error=str(e));self.event('ERROR','Commodity scan: '+str(e))
-        finally:self.lock.release()
-    def supervise(self):
-        if not self.risk_lock.acquire(False):return
-        try:
-            self.reconcile();self.verify_positions()
-            # Close requests have priority over scanning and new entries.  Cancel live
-            # BUYs that are still pending so a manual close cannot be followed by a
-            # late entry fill.  Filled quantity remains owned and is managed below.
-            if self.get('close_requested'):
-                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
-                    if o.get('broker_id'):
-                        try:self.a.cancel(o['broker_id'])
-                        except Exception as e:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(e)))
-            if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
-        except Exception as e:
-            self.put('halt','Position supervision error: '+str(e));self.event('ERROR',str(e))
-        finally:self.risk_lock.release()
-    def start(self):
-        if self.started:return
-        self.started=True
-        def scan_loop():
-            while not self.stop_event.is_set():self.cycle();self.stop_event.wait(30)
-        def risk_loop():
-            while not self.stop_event.wait(5):
-                if self.a.connected():self.supervise()
-        def execution_loop():
-            while not self.stop_event.is_set():
-                self.execution_event.wait(1)
-                if self.stop_event.is_set():break
-                if not self.execution_event.is_set():continue
-                self.execution_event.clear()
-                self.execute_candidates()
-        threading.Thread(target=scan_loop,daemon=True,name='commodity-ai-scan').start()
-        threading.Thread(target=risk_loop,daemon=True,name='commodity-ai-risk').start()
-        threading.Thread(target=execution_loop,daemon=True,name='commodity-ai-execution').start()
-    def state(self):
-        s=super().state()
-        s['signals'].sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
-        for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.success_model();hm=self.historical_success_model()
-        if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
-        if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
-        archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
-        selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(build='COMMODITY_AI_V5_FUNNEL_FIXES',universe=self.get('commodity_universe_info',{}),scan=dict(self.scan_status),ban_status='MCX: equity F&O ban list does not apply',watchlist=list(self.a.symbols),
-            full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
-            execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
-            historical_archive=archive,history_backfill=dict(self.history_backfill_status))
-        s['commodity_policy']=COMMODITY_POLICY
-        s['commodity_setup']=dict(mode='AUTOMATIC',contracts=self.a._auto_records(),errors=dict(self.a.discovery_errors))
-        # State reads are deliberately network-free. The scanner refreshes the MCX master
-        # in the background; the UI only reports whatever master is already cached.
-        cached_rows=_MCX_MASTER.get('rows') if _MCX_MASTER.get('day')==now_ist().date().isoformat() else None
-        s['commodity_master']=dict(ready=bool(cached_rows),loading=bool(_MCX_MASTER.get('loading')),error=_MCX_MASTER.get('error'),
-            age_seconds=(round(time.monotonic()-float(_MCX_MASTER.get('at') or 0),1) if cached_rows else None))
-        s['commodity_contracts']=[]
-        if cached_rows:
-            for symbol in self.a.symbols:
-                name=symbol.removeprefix('MCX:')
-                matches=[r for r in cached_rows if r.get('tradingsymbol')==name and r.get('instrument_type')=='FUT']
-                if len(matches)==1:
-                    f=matches[0];s['commodity_contracts'].append(dict(name=f['name'],future=f['tradingsymbol'],expiry=str(f['expiry'])))
-        s['price_basis']='INR per broker quantity = exchange premium × verified multiplier; quantities are broker quantities.'
-        return s
-    def control(self,action,body):
-        # Disarming is immediate even while a broad scan is running.
-        if action in ('disarm','close'):
-            with self.risk_lock:
-                cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-                if action=='close':
-                    self.put('close_requested',True)
-                    # Drop queued entries immediately; the risk thread performs broker
-                    # cancellation/reconciliation independently of the scan thread.
-                    with self.candidate_lock:self.execution_candidates=[]
-                    self.execution_event.clear()
-                self.event('CONTROL',action)
-            if action=='close' and self.a.connected():self.supervise()
-            return cfg
-        if not self.lock.acquire(False):raise ValueError('Scan in progress; retry after completion')
-        try:
-            with self.risk_lock:return super().control(action,body)
-        finally:self.lock.release()
-
-    def init_db(self):
-        super().init_db()
-        with self.db() as c:
-            if 'product' not in [r[1] for r in c.execute('PRAGMA table_info(desk_positions)')]:
-                c.execute("ALTER TABLE desk_positions ADD COLUMN product TEXT NOT NULL DEFAULT 'NRML'")
-    def config(self):
-        cfg=super().config()
-        if 'square_off' not in self.get('config',{}):cfg['square_off']='23:00'
-        return cfg
-    def block(self):
-        return super().block()
-
-COMMODITY_DESK=CommodityDeskEngine(CommodityDeskAdapter())
-@app.route('/api/commodity-ai/state')
-def commodity_ai_state():
-    if not require_session():return jsonify(error='Connect Kite first'),401
-    return jsonify(COMMODITY_DESK.state())
-
-@app.route('/api/commodity-ai/funnel')
-def commodity_ai_funnel():
-    # Where entries die: reasons tallied over the last scan cycles, direction confidence spread, sizing limits.
-    if not require_session():return jsonify(error='Connect Kite first'),401
-    return jsonify(COMMODITY_DESK.funnel(cycles=request.args.get('cycles',30,type=int)))
-
-@app.route('/api/commodity-ai/config',methods=['POST'])
-def commodity_ai_config():
-    if not require_session():return jsonify(error='Connect Kite first'),401
-    if not COMMODITY_DESK.lock.acquire(False):return jsonify(error='Scan in progress; retry after completion'),409
-    try:
-        with COMMODITY_DESK.risk_lock:return jsonify(ok=True,config=COMMODITY_DESK.save_config(request.get_json(silent=True) or {}))
-    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
-    finally:COMMODITY_DESK.lock.release()
-
-@app.route('/api/commodity-ai/control/<action>',methods=['POST'])
-def commodity_ai_control(action):
-    if not require_session():return jsonify(error='Connect Kite first'),401
-    body=request.get_json(silent=True) or {}
-    try:
-        if action in ('scan','universe','sync'):
-            if not COMMODITY_DESK.train_lock.acquire(False):return jsonify(error='Learning/universe job already running'),409
-            def job():
-                try:
-                    if action in ('universe','sync'):
-                        with COMMODITY_DESK.lock:
-                            if action=='universe' or not COMMODITY_DESK.a.symbols:COMMODITY_DESK.select_universe(body)
-                            if action=='sync':
-                                for i,symbol in enumerate(COMMODITY_DESK.a.symbols):
-                                    COMMODITY_DESK.training=dict(status='SYNCING HISTORY',progress=round(100*i/max(1,len(COMMODITY_DESK.a.symbols))))
-                                    COMMODITY_DESK.a.refresh(symbol)
-                                    if i+1<len(COMMODITY_DESK.a.symbols):time.sleep(STOCK_HISTORY_PACE_SECONDS)
-                                COMMODITY_DESK.training=dict(status='HISTORY READY',progress=100)
-                    COMMODITY_DESK.cycle()
-                    if action=='sync':
-                        COMMODITY_DESK._ensure_deep_history_backfill(force=True)
-                        COMMODITY_DESK._ensure_historical_success_training(force=True)
-                except Exception as e:
-                    COMMODITY_DESK.training=dict(status='ERROR',progress=0,error=str(e));COMMODITY_DESK.event('ERROR',str(e))
-                finally:COMMODITY_DESK.train_lock.release()
-            threading.Thread(target=job,daemon=True,name='commodity-ai-job').start()
-            return jsonify(ok=True,started=True)
-        if action=='train':return jsonify(ok=True,started=COMMODITY_DESK.train())
-        return jsonify(ok=True,config=COMMODITY_DESK.control(action,body))
-    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
-
-
 # ===========================================================================
 # INDEX AI V4 — hierarchical success intelligence beyond the Stock AI layer.
 #
@@ -15510,7 +13770,7 @@ def commodity_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-kronos-hysteresis-v8-20260920'
+INDEX_AI_BUILD = 'index-hierarchical-success-v4.1-audited-20260914'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -15793,8 +14053,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 elif cfg.get('max_hold') is not None and (now_ist()-opened).total_seconds()>=float(cfg['max_hold'])*60:reason='Maximum holding time'
                 else:
                     setup=json.loads(r['setup'] or '{}');sig=self.signals.get(r['symbol'],{})
-                    shadow_pos={'id':'shadow:'+str(r['id']),'entry':float(r['entry']),'stop':float(r['stop'])}
-                    reason=self.reversal_exit_reason(shadow_pos,setup,sig,bid,raw)
+                    if sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction') and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
                 if not reason:continue
                 tick=max(.01,float(r['tick'] or .05));exit_px=max(tick,math.floor((bid*(1-float(cfg['slippage_bps'])/10000))/tick)*tick);qty=int(r['qty'] or r['lot'] or 1)
                 pnl=(exit_px-float(r['entry']))*qty;fees=2*float(cfg['fee_per_order']);label=1 if pnl-fees>0 else 0
@@ -16025,349 +14284,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
 
 # Replace the base index desk before shared risk and worker startup. Flask routes
 # above resolve the global DESK at request time, so they automatically use V4.
-class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
-    """Forecast + price action; retains the existing durable execution/risk ledger."""
-    def __init__(self,adapter):
-        super().__init__(adapter)
-        from index_kronos import KronosService
-        self.kronos=KronosService()
-        # Per-position reversal confirmation memory.  Counts distinct completed candles,
-        # never repeated 15-second scans of the same candle.
-        self.reversal_memory={}
-        # v4: every scored completed bar is logged (qualified or not) and settled against the
-        # actual close, so direction calibration can be measured without needing a trade.
-        self._logged_signal_keys=set();self.signal_log_error=None
-        with self.db() as c:
-            c.executescript('''
-            CREATE TABLE IF NOT EXISTS index_signal_log(
-              id TEXT PRIMARY KEY,ts TEXT,symbol TEXT,bar_ts TEXT,target_ts TEXT,horizon_min INTEGER,spot REAL,
-              direction TEXT,score REAL,margin REAL,confidence REAL,kronos REAL,technical REAL,
-              forecast_move REAL,atr REAL,forecast_move_atr REAL,efficiency REAL,agreement TEXT,
-              split_agree INTEGER,split_gap_atr REAL,cache_mode TEXT,samples INTEGER,wait_reason TEXT,
-              build TEXT,gate_passed INTEGER DEFAULT 0,final_decision TEXT,final_reason TEXT,
-              fwd_close REAL,fwd_move REAL,hit INTEGER,settled_ts TEXT,status TEXT);
-            CREATE INDEX IF NOT EXISTS index_signal_log_status ON index_signal_log(status,target_ts);
-            CREATE INDEX IF NOT EXISTS index_signal_log_build ON index_signal_log(build,symbol);
-            ''')
-        if self.get('direction_build')!=INDEX_AI_BUILD:
-            cfg=self.config();cfg.update(armed=False,live_override=False)
-            # Retain execution mode for any existing positions; never rewrite broker holdings.
-            self.put('config',cfg);self.put('direction_build',INDEX_AI_BUILD)
-            self.event('STRATEGY_UPGRADE','Kronos direction installed; entries disarmed; prior override reset')
-
-    def direction_engine_ready(self):
-        now=now_ist()
-        return any(s.get('kronos_ready') and _ai_ts_naive(s.get('bar_ts')) is not None
-                   and 0<=(now-_ai_ts_naive(s['bar_ts'])).total_seconds()<=600 for s in self.signals.values())
-
-    def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=10):
-        from index_kronos import blend_signal
-        now=now_ist()
-        if refresh:self.a.refresh(symbol)
-        rows=[]
-        for row in self.a.bars(symbol,256):
-            ts=_ai_ts_naive(row.get('ts'))
-            if ts is None or ts+timedelta(minutes=5)>now:continue
-            vals={k:float(row.get(k) or 0) for k in ('open','high','low','close','volume')}
-            if not all(math.isfinite(v) for v in vals.values()) or min(vals[k] for k in ('open','high','low','close'))<=0 or vals['volume']<0:
-                return dict(symbol=symbol,decision='WAIT',reason='Invalid OHLCV history; refresh history')
-            if not vals['low']<=min(vals['open'],vals['close'])<=max(vals['open'],vals['close'])<=vals['high']:
-                return dict(symbol=symbol,decision='WAIT',reason='Inconsistent OHLC history')
-            rows.append(dict(vals,ts=ts.isoformat()))
-        s=dict(symbol=symbol,ts=now.isoformat(),decision='WAIT',reason='Need 64 completed OHLC candles',
-               chart=[dict(ts=r['ts'],close=r['close']) for r in rows[-60:]],strategy_version=INDEX_AI_BUILD)
-        if len(rows)<64:return s
-        stamps=[_ai_ts_naive(r['ts']) for r in rows]
-        if any(b<=a or (a.date()==b.date() and (b-a).total_seconds()!=300) for a,b in zip(stamps,stamps[1:])):
-            s['reason']='Index history contains duplicates or intraday gaps';return s
-        age=(now-stamps[-1]).total_seconds()/60
-        s.update(spot=rows[-1]['close'],bar_ts=rows[-1]['ts'],bar_age=round(age,1))
-        if not self.a.market_open():s['reason']='Market closed';return s
-        if age<5 or age>min(10,max_bar_age):s['reason']='Stale completed index candle';return s
-        if len([t for t in stamps[-13:] if t.date()==now.date()])<13:
-            s['reason']='Session warm-up: need 13 completed five-minute candles';return s
-        if (stamps[-1]+timedelta(minutes=15)).strftime('%H:%M')>='15:30':
-            s['reason']='Forecast would cross session close';return s
-        forecast=self.kronos.request(symbol,rows)
-        if forecast.get('status')!='READY':s['reason']=forecast.get('reason','Kronos unavailable');return s
-        if time.time()-forecast['completed']>600:s['reason']='Kronos forecast expired';return s
-        s.update(blend_signal(rows,forecast),kronos_ready=True,model_id=INDEX_AI_BUILD,
-                 forecast=forecast['close'],forecast_timestamps=forecast['timestamps'],
-                 forecast_horizon_minutes=int(forecast.get('remaining_horizon_minutes') or 15),
-                 forecast_cache_mode=forecast.get('cache_mode','EXACT'),forecast_source_bar=forecast.get('source_bar_ts'),
-                 score_kind='Uncalibrated directional score; not probability',selection_basis='58% Kronos + 42% price action · dominant-edge override')
-        self._log_signal(s)
-        if s['signal_wait']:s['reason']=s['signal_wait'];return s
-        configured=float(self.config()['confidence'])
-        # A dominant-edge disagreement already passed a stricter structural test above;
-        # allow a small confidence concession instead of converting every such case to WAIT.
-        required=max(.60,configured-.04) if str(s.get('agreement','')).startswith('DOMINANT_') else configured
-        s['required_confidence']=required
-        if s['confidence']<required:s['reason']='Blended direction score below adaptive threshold';return s
-        s.update(decision='CANDIDATE',direction_gate_passed=True,
-                 reason=(s.get('signal_note') or 'Directional edge qualifies')+'; checking CE/PE liquidity')
-        return s
-
-    def _log_signal(self,s):
-        """Record one row per (symbol, completed bar, cache mode).  Never raises: logging must not affect trading."""
-        try:
-            bar_ts=s.get('bar_ts');symbol=s.get('symbol')
-            if not bar_ts or not symbol or s.get('p_up') is None or not s.get('spot'):return
-            mode=str(s.get('forecast_cache_mode') or 'EXACT')
-            key=f"{symbol}|{bar_ts}|{mode}|{INDEX_AI_BUILD}"
-            if key in self._logged_signal_keys:return
-            t=_ai_ts_naive(bar_ts)
-            if t is None:return
-            horizon=int(s.get('forecast_horizon_minutes') or 15)
-            score=(float(s['p_up'])-.5)*2
-            kronos=(float(s.get('kronos_score',.5))-.5)*2;technical=(float(s.get('technical_score',.5))-.5)*2
-            split=s.get('split_agree')
-            with self.db() as c:
-                c.execute("""INSERT OR IGNORE INTO index_signal_log(id,ts,symbol,bar_ts,target_ts,horizon_min,spot,direction,score,margin,
-                    confidence,kronos,technical,forecast_move,atr,forecast_move_atr,efficiency,agreement,split_agree,split_gap_atr,
-                    cache_mode,samples,wait_reason,build,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (key,now_ist().isoformat(),symbol,str(bar_ts),(t+timedelta(minutes=horizon)).isoformat(),horizon,float(s['spot']),
-                     s.get('direction'),score,abs(score),float(s.get('confidence') or 0),kronos,technical,
-                     float(s.get('forecast_move') or 0),float(s.get('atr') or 0),float(s.get('forecast_move_atr') or 0),
-                     float(s.get('efficiency') or 0),s.get('agreement'),None if split is None else int(bool(split)),
-                     s.get('split_gap_atr'),mode,s.get('kronos_samples'),s.get('signal_wait'),INDEX_AI_BUILD,'OPEN'))
-            self._logged_signal_keys.add(key)
-            if len(self._logged_signal_keys)>4000:self._logged_signal_keys.clear()
-        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
-
-    def _mark_signal_final(self,s):
-        """Attach what finally happened to the signal (qualified? READY? why not?).  READY is never downgraded."""
-        try:
-            bar_ts=s.get('bar_ts');symbol=s.get('symbol')
-            if not bar_ts or not symbol or s.get('p_up') is None:return
-            key=f"{symbol}|{bar_ts}|{s.get('forecast_cache_mode') or 'EXACT'}|{INDEX_AI_BUILD}"
-            with self.db() as c:
-                c.execute("""UPDATE index_signal_log SET gate_passed=MAX(gate_passed,?),
-                    final_reason=CASE WHEN final_decision='READY' THEN final_reason ELSE ? END,
-                    final_decision=CASE WHEN final_decision='READY' THEN 'READY' ELSE ? END WHERE id=?""",
-                    (1 if s.get('direction_gate_passed') else 0,str(s.get('reason'))[:200],str(s.get('decision')),key))
-        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
-
-    def _settle_signal_log(self):
-        """Fill in the actual close for logged signals once their target bar is complete."""
-        try:
-            now=now_ist()
-            rows=self.rows("SELECT * FROM index_signal_log WHERE status='OPEN' ORDER BY ts LIMIT 800")
-            due=[]
-            for r in rows:
-                target=_ai_ts_naive(r['target_ts'])
-                # 6 minutes = 5-minute bar length + 1 minute for the bar refresh to land.
-                if target is not None and target+timedelta(minutes=6)<=now:due.append((r,target))
-            if not due:return
-            by_symbol={}
-            for r,target in due:by_symbol.setdefault(r['symbol'],[]).append((r,target))
-            for symbol,items in by_symbol.items():
-                lookup={}
-                for b in self.a.bars(symbol,3000):
-                    t=_ai_ts_naive(b.get('ts'))
-                    if t is not None:lookup[t.isoformat()]=b
-                for r,target in items:
-                    bar=lookup.get(r['target_ts'])
-                    with self.db() as c:
-                        if bar is not None:
-                            fwd=float(bar['close']);move=fwd-float(r['spot'])
-                            hit=1 if ((move>0 and r['direction']=='UP') or (move<0 and r['direction']=='DOWN')) else 0
-                            c.execute("UPDATE index_signal_log SET fwd_close=?,fwd_move=?,hit=?,status='SETTLED',settled_ts=? WHERE id=? AND status='OPEN'",
-                                      (fwd,move,hit,now.isoformat(),r['id']))
-                        elif target.date()<now.date():
-                            c.execute("UPDATE index_signal_log SET status='ABANDONED',settled_ts=? WHERE id=? AND status='OPEN'",(now.isoformat(),r['id']))
-        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
-
-    def signal_calibration(self,build=None,symbol=None):
-        """How often does the score point the right way, by score bucket, component and gate?
-
-        hit = the actual close at the forecast horizon is on the predicted side of the signal bar's close
-        (exact ties count as misses).  Intervals are 90% Wilson intervals.  The base rate (share of rows
-        where the market simply rose) is reported so drift is not mistaken for skill.
-        """
-        build=build or INDEX_AI_BUILD
-        sql="SELECT * FROM index_signal_log WHERE status='SETTLED'";args=[]
-        if build!='all':sql+=' AND build=?';args.append(build)
-        if symbol:sql+=' AND symbol=?';args.append(str(symbol).upper())
-        rows=self.rows(sql,tuple(args))
-        pending=self.rows("SELECT COUNT(*) n FROM index_signal_log WHERE status='OPEN'")[0]['n']
-
-        def wilson(k,n,z=1.645):
-            if not n:return [None,None]
-            p=k/n;d=1+z*z/n;c=p+z*z/(2*n);m=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n))
-            return [round((c-m)/d,4),round((c+m)/d,4)]
-        def side(r):return 1 if r['direction']=='UP' else -1
-        def summarize(items):
-            n=len(items);k=sum(int(r['hit'] or 0) for r in items)
-            dm=[side(r)*r['fwd_move']/r['atr'] for r in items if r['atr']]
-            dp=[side(r)*r['fwd_move']/r['spot']*100 for r in items if r['spot']]
-            return dict(n=n,hit_rate=round(k/n,4) if n else None,hit_ci90=wilson(k,n),
-                        avg_dir_move_atr=round(sum(dm)/len(dm),4) if dm else None,
-                        avg_dir_move_pct=round(sum(dp)/len(dp),5) if dp else None)
-        def component(items,key):
-            used=[r for r in items if r[key] and r['fwd_move']]
-            k=sum(1 for r in used if (r[key]>0)==(r['fwd_move']>0))
-            return dict(n=len(used),hit_rate=round(k/len(used),4) if used else None,hit_ci90=wilson(k,len(used)))
-        edges=[0.,.08,.16,.24,.32,.45,1.01]
-        buckets=[]
-        for lo,hi in zip(edges,edges[1:]):
-            part=[r for r in rows if lo<=(r['margin'] or 0)<hi]
-            buckets.append(dict(margin_from=lo,margin_to=min(hi,1.0),**summarize(part)))
-        def part_by(key,values):
-            return {str(v):summarize([r for r in rows if r[key]==v]) for v in values}
-        splits={'agree':summarize([r for r in rows if r['split_agree']==1]),
-                'disagree':summarize([r for r in rows if r['split_agree']==0]),
-                'not_available':summarize([r for r in rows if r['split_agree'] is None])}
-        funnel={}
-        for r in rows:
-            k=str(r['final_decision'] or 'UNMARKED');funnel[k]=funnel.get(k,0)+1
-        up_rate=round(sum(1 for r in rows if r['fwd_move']>0)/len(rows),4) if rows else None
-        return dict(build=build,settled=len(rows),pending_open=int(pending or 0),base_rate_market_up=up_rate,
-            overall=summarize(rows),by_margin_bucket=buckets,
-            components=dict(blend=summarize(rows),kronos_sign=component(rows,'kronos'),technical_sign=component(rows,'technical')),
-            passed_direction_gate=summarize([r for r in rows if r['gate_passed']]),
-            became_ready=summarize([r for r in rows if r['final_decision']=='READY']),
-            split_half=splits,by_symbol=part_by('symbol',sorted({r['symbol'] for r in rows})),
-            by_cache_mode=part_by('cache_mode',sorted({r['cache_mode'] for r in rows if r['cache_mode']})),
-            final_decisions=funnel,signal_log_error=self.signal_log_error,
-            note="About 270 settled rows per group are needed to tell a 55% hit rate from 50% at 90% confidence. "
-                 "Rows overlap in time and the four indices are correlated, so treat small groups as anecdotes.")
-
-    def inspect(self,symbol):
-        s=DeskEngine.inspect(self,symbol)
-        if s.get('decision')=='READY':
-            # A conservative first-order option move scenario, not a profit forecast.
-            costs=float(s['ask'])-float(s['bid'])+2*self.config()['fee_per_order']/max(1,s['qty'])+s['entry']*2*self.config()['slippage_bps']/10000
-            move=abs(s.get('option_delta',0)*s.get('forecast_move',0))
-            s.update(option_move_scenario=move,estimated_roundtrip_cost=costs)
-            s['edge_cost_ratio']=move/max(costs,.01)
-            # Avoid spending spread/fees on tiny projected moves.  This gate is intentionally
-            # stronger in V7 because the user observed trades closing around break-even while
-            # costs dominated the realised result.
-            if move<=2.0*costs:s.update(decision='WAIT',reason='Projected option move does not clear 2× spread and estimated costs')
-        s['execution_quality_pass']=s.get('decision')=='READY'
-        s['execution_quality_reason']=s.get('reason')
-        s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
-        self._mark_signal_final(s)
-        return s
-
-    def enter(self,s):
-        if s.get('decision')!='READY' or self.block():return
-        fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
-        if fresh.get('decision')=='READY':return DeskEngine.enter(self,fresh)
-
-    def block(self):
-        reason=DeskEngine.block(self)
-        if reason:return reason
-        if not self.direction_engine_ready():return 'Kronos has no fresh forecast; entries paused'
-        return None
-
-    def reversal_exit_reason(self,p,setup,sig,bid,q=None):
-        """Index-only reversal exit with candle confirmation and asymmetric hysteresis.
-
-        Stops, targets, square-off and portfolio risk exits are handled before this method
-        and remain immediate.  A model flip is intentionally harder to exit on than it is
-        to display: the signal must come from a NEW completed candle, be materially strong,
-        and normally persist across two distinct candles.  There is no fixed minimum hold.
-        """
-        pid=p.get('id');entry_direction=setup.get('direction');current=sig.get('direction')
-        bar_ts=_ai_ts_naive(sig.get('bar_ts'));entry_bar=_ai_ts_naive(setup.get('bar_ts'))
-        if not pid or not entry_direction or not current or bar_ts is None:return None
-        # Never reverse a trade from a recomputation of the same candle that created it.
-        if entry_bar is not None and bar_ts<=entry_bar:
-            self.reversal_memory.pop(pid,None);return None
-        if sig.get('bar_age',999)>10 or not sig.get('kronos_ready'):
-            return None
-        if current==entry_direction:
-            self.reversal_memory.pop(pid,None);return None
-        cfg=self.config();confidence=float(sig.get('confidence') or 0)
-        margin=float(sig.get('signal_margin') or max(0.,(confidence-.5)*2))
-        move_atr=abs(float(sig.get('forecast_move_atr') or 0));agreement=str(sig.get('agreement') or '')
-        entry_conf=float(setup.get('confidence') or cfg.get('confidence') or .65)
-        normal_gate=max(.68,min(.80,max(float(cfg.get('confidence') or .65)+.04,entry_conf+.02)))
-        qualifies=confidence>=normal_gate and margin>=.30 and move_atr>=.14 and agreement!='CONFLICT'
-        if not qualifies:
-            self.reversal_memory.pop(pid,None)
-            if pid in self.health:self.health[pid]['reason']='HOLD · opposite read is not strong enough to confirm reversal'
-            return None
-        # Count completed candles, not scanner cycles.
-        key=bar_ts.isoformat();mem=self.reversal_memory.get(pid,{})
-        if mem.get('direction')!=current:mem={'direction':current,'bars':[]}
-        bars=list(mem.get('bars') or [])
-        if key not in bars:bars.append(key)
-        mem={'direction':current,'bars':bars[-3:]};self.reversal_memory[pid]=mem
-        risk_per_unit=max(.01,float(p.get('entry') or 0)-float(p.get('stop') or 0))
-        trade_r=(float(bid)-float(p.get('entry') or 0))/risk_per_unit
-        # An exceptionally strong, aligned opposite signal can exit on the first NEW bar.
-        # A losing trade also needs only one strong confirmed bar once it has moved -0.35R.
-        hard=confidence>=.80 and margin>=.60 and move_atr>=.25 and agreement=='AGREE'
-        adverse_confirm=trade_r<=-.35 and confidence>=.73 and margin>=.46 and move_atr>=.18 and agreement=='AGREE'
-        needed=1 if (hard or adverse_confirm) else 2
-        if len(mem['bars'])>=needed:
-            self.reversal_memory.pop(pid,None)
-            return 'Confirmed direction reversal'
-        if pid in self.health:self.health[pid]['reason']=f'HOLD · reversal confirmation {len(mem["bars"])}/{needed} completed bars'
-        return None
-
-    def supervise(self):
-        # Do not allow a cached signal to trigger reversal exits after it has aged.
-        now=now_ist()
-        for symbol,s in list(self.signals.items()):
-            ts=_ai_ts_naive(s.get('bar_ts'))
-            if ts is None or (now-ts).total_seconds()>600:
-                self.signals[symbol]=dict(s,confidence=0,bar_age=999,kronos_ready=False)
-        return super().supervise()
-
-    def cycle(self):
-        if not self.lock.acquire(False):return
-        try:
-            self.last_cycle=now_ist().isoformat()
-            if not self.a.connected():return
-            self.supervise()
-            self.scan_status=dict(status='SCANNING',phase='Kronos + price action + option costs',total=len(self.a.symbols),completed=0)
-            for i,symbol in enumerate(self.a.symbols):
-                try:self.signals[symbol]=self.inspect(symbol)
-                except Exception as e:self.signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e))
-                self.scan_status['completed']=i+1
-            ranked=sorted(self.signals.values(),key=lambda s:s.get('rank_score',0),reverse=True)
-            self._publish_execution_candidates(ranked)
-            self._settle_signal_log()
-            self.scan_status.update(status='COMPLETE',ready=sum(s.get('decision')=='READY' for s in ranked),finished=now_ist().isoformat())
-            if self.get('close_requested') and not self.active():self.put('close_requested',False)
-        finally:self.lock.release()
-
-    def _ensure_historical_success_training(self,force=False):return False
-    def train(self,*args,**kwargs):
-        # Pretrained Kronos is loaded by its worker, never trained on the UI thread.
-        threading.Thread(target=self.cycle,daemon=True,name='kronos-refresh').start()
-        return True
-
-    def state(self):
-        s=DeskEngine.state(self)
-        s['signals'].sort(key=lambda x:x.get('rank_score',0),reverse=True)
-        for i,row in enumerate(s['signals'],1):row['rank']=i
-        s.update(build=INDEX_AI_BUILD,kronos=self.kronos.snapshot(),direction_engine_ready=self.direction_engine_ready(),
-                 scan=dict(self.scan_status),execution=dict(self.execution_status),
-                 live_model_validation_ready=self.direction_engine_ready(),
-                 live_model_validation_reason='Fresh Kronos forecast required',success_selector_status='KRONOS + PRICE ACTION',
-                 quality_gate={},shadow={})
-        return s
-
-    def control(self,action,body):
-        if action in ('disarm','close'):return IndexAdvancedDeskEngine.control(self,action,body)
-        if action=='arm' and not self.direction_engine_ready():raise ValueError('Kronos not ready: install dependencies, sync OHLC history, and wait for a fresh forecast')
-        # Explicit manual override bypasses paper evidence only; data, risk and broker checks remain.
-        return DeskEngine.control(self,action,body)
-
-DESK = IndexKronosDeskEngine(DeskAdapter())
-
-
-@app.route('/api/ai-desk/signal-calibration')
-def desk_signal_calibration_route():
-    # ?build=all for every strategy build, ?symbol=NIFTY for one index.
-    if not require_session():return jsonify({"error":"Connect Kite using the login button above."}),401
-    return jsonify(DESK.signal_calibration(build=request.args.get('build'),symbol=request.args.get('symbol')))
-
+DESK = IndexAdvancedDeskEngine(DeskAdapter())
 
 
 # ===========================================================================
@@ -16386,10 +14303,7 @@ CAS_DEFAULTS = dict(entry_start='15:15', entry_end='15:38', square_off='15:39',
     max_quote_age=2., min_premium_move=1., max_premium_move=35., max_trades=4,
     max_positions=1, max_hold=None, cooldown=1/6, capital=15000., risk=750.,
     daily_loss=2000., confidence=.60, stop_pct=15., reward_r=2., partial_take_r=1.,
-    max_spread=1., lots=1, trail_pct=10., order_timeout=2.,
-    # v6: from 3 Aug 2026 every index constituent is in the closing auction from 15:15, so the cash index is frozen
-    # until about 15:35 while index futures and options trade to 15:40.  'futures' reads the nearest index future.
-    signal_source='futures')
+    max_spread=1., lots=1, trail_pct=10., order_timeout=2.)
 
 def _cas_epoch(value):
     return value.replace(tzinfo=timezone(timedelta(hours=5,minutes=30))).timestamp()
@@ -16398,7 +14312,6 @@ class CASAdapter(DeskAdapter):
     symbols = ('NIFTY','BANKNIFTY','FINNIFTY','SENSEX')
     def __init__(self):
         self.engine=None;self.quotes={};self.contracts={};self.contract_day=None;self.last_batch=0.
-        self.futures={};self.setup_errors={};self.contract_retry_mono=0.
         self.stream=None;self.stream_token=None;self.stream_connected=False;self.stream_status='WAITING FOR KITE'
         self.stream_lock=threading.RLock();self.wake=threading.Event();self.stream_quotes={};self.stream_queue=deque()
         self.stream_signatures={};self.stream_generation=0;self.seen_generation=0;self.wanted_tokens=set();self.token_keys={}
@@ -16415,36 +14328,15 @@ class CASAdapter(DeskAdapter):
     def market_open(self):
         t=now_ist();cfg=self.engine.config() if self.engine else CAS_DEFAULTS
         return t.weekday()<5 and '09:15'<=t.strftime('%H:%M')<cfg['market_close']
-    def _future_row(self,symbol,exchange):
-        instruments=get_bfo_instruments() if exchange=='BFO' else get_instruments()[0]
-        today=now_ist().date().isoformat()
-        rows=[dict(i,exchange=exchange) for i in instruments
-              if i.get('name')==symbol.upper() and i.get('instrument_type')=='FUT' and str(i.get('expiry',''))[:10]>=today]
-        rows.sort(key=lambda i:str(i.get('expiry')))
-        return rows[0] if rows else None
-    def signal_key(self,symbol,source=None):
-        source=source or (self.engine.config().get('signal_source') if self.engine else 'futures')
-        fut=self.futures.get(symbol)
-        if source!='spot' and fut:return fut['exchange']+':'+fut['tradingsymbol']
-        return INDEX_SYMBOLS[symbol]
     def load_contracts(self):
         today=now_ist().date()
         if self.contract_day==today:return
-        if time.monotonic()<self.contract_retry_mono:return
-        result={};futures={};errors={}
+        result={}
         for symbol in self.symbols:
-            # v6: one failing index must not stop the other three (a failure used to halt and disarm the whole desk).
-            try:
-                ex,items=get_option_instruments_for_symbol(symbol)
-                result[symbol]=[dict(i,exchange=ex) for i in items
-                    if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
-                fut=self._future_row(symbol,ex)
-                if fut:futures[symbol]=fut
-            except Exception as e:
-                result.setdefault(symbol,[]);errors[symbol]=self._safe_stream_error(e)
-        self.contracts=result;self.futures=futures;self.setup_errors=errors
-        if errors:self.contract_retry_mono=time.monotonic()+60
-        else:self.contract_day=today
+            ex,items=get_option_instruments_for_symbol(symbol)
+            result[symbol]=[dict(i,exchange=ex) for i in items
+                if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
+        self.contracts=result;self.contract_day=today
     def _invalidate_stream(self,ws,status):
         if ws is not self.stream:return
         with self.stream_lock:
@@ -16548,25 +14440,16 @@ class CASAdapter(DeskAdapter):
         if time.monotonic()-self.last_subscription<3:return
         self.last_subscription=time.monotonic();self.load_contracts()
         mapping={}
-        index_keys=set()
         for symbol in self.symbols:
-            try:
-                token,err=resolve_token_for_symbol(symbol)
-                if err:raise ValueError(err)
-                mapping[int(token)]=INDEX_SYMBOLS[symbol];index_keys.add(INDEX_SYMBOLS[symbol])
-            except Exception as e:
-                self.setup_errors[symbol]=self._safe_stream_error(e)
+            token,err=resolve_token_for_symbol(symbol)
+            if err:raise ValueError(err)
+            mapping[int(token)]=INDEX_SYMBOLS[symbol]
         for items in self.contracts.values():
             for i in items:mapping[int(i['instrument_token'])]=i['exchange']+':'+i['tradingsymbol']
-        future_keys=set()
-        for f in self.futures.values():
-            fkey=f['exchange']+':'+f['tradingsymbol'];mapping[int(f['instrument_token'])]=fkey;future_keys.add(fkey)
-        reverse={v:k for k,v in mapping.items()};wanted={reverse[k] for k in index_keys|future_keys}
+        reverse={v:k for k,v in mapping.items()};wanted={reverse[INDEX_SYMBOLS[s]] for s in self.symbols}
         with self.stream_lock:latest=dict(self.stream_quotes)
         for symbol in self.symbols:
-            fut=self.futures.get(symbol)
-            fut_px=latest.get(fut['exchange']+':'+fut['tradingsymbol'],{}).get('last_price') if fut else None
-            rows=self.contracts.get(symbol,[]);spot=latest.get(INDEX_SYMBOLS[symbol],{}).get('last_price') or fut_px
+            rows=self.contracts.get(symbol,[]);spot=latest.get(INDEX_SYMBOLS[symbol],{}).get('last_price')
             if not rows or not spot:continue
             expiry=min(str(i['expiry']) for i in rows)
             for typ in ('CE','PE'):
@@ -16609,9 +14492,7 @@ class CASAdapter(DeskAdapter):
             self.quotes=dict(self.exit_quotes)
     def feed_state(self):
         with self.stream_lock:
-            return dict(signal_source=(self.engine.config().get('signal_source') if self.engine else 'futures'),
-                futures={k:v['tradingsymbol'] for k,v in self.futures.items()},setup_errors=dict(self.setup_errors),
-                connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
+            return dict(connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
                 last_tick_age_seconds=round(time.monotonic()-self.last_tick_mono,2) if self.last_tick_mono else None,
                 source='KiteTicker FULL · event-driven',error_detail=getattr(self,'stream_error_detail',''),error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
     def fresh(self,key):
@@ -16659,9 +14540,7 @@ class CASEngine(DeskEngine):
                 if cfg.get(key)==value:cfg[key]=CAS_DEFAULTS[key]
             cfg.update(armed=False,verified_date='');self.put('config',cfg)
             self.put('fast_profile_version',2);self.event('UPGRADE','Fast CAS profile installed; entries disarmed. New trades use NRML IOC limits.')
-    # v7: CAS no longer needs a validated model, daily session verification or a paper record to trade live, so the
-    # paper-evidence override is always on for this desk.  Risk limits and broker reconciliation still apply.
-    def config(self):return {**super().config(),**CAS_DEFAULTS,**self.get('config',{}),'max_hold':None,'live_override':True}
+    def config(self):return {**super().config(),**CAS_DEFAULTS,**self.get('config',{}),'max_hold':None}
     def init_db(self):
         super().init_db()
         with self.db() as c:
@@ -16672,7 +14551,7 @@ class CASEngine(DeskEngine):
                 c.execute('ALTER TABLE cas_samples ADD COLUMN profile INTEGER NOT NULL DEFAULT 1')
     def model(self):
         m=super().model()
-        return m if m and m.get('fast_profile')==3 else None
+        return m if m and m.get('fast_profile')==2 else None
     def submit(self,p,side,qty,price,reason):
         if side=='BUY' and not self.rows('SELECT id FROM desk_orders WHERE position_id=?',(p['id'],)):
             with self.db() as c:c.execute("UPDATE desk_positions SET product='NRML' WHERE id=?",(p['id'],))
@@ -16680,7 +14559,23 @@ class CASEngine(DeskEngine):
     def verify_positions(self):
         if time.monotonic()-self.last_verify<1:return
         self.last_verify=time.monotonic()
-        return super().verify_positions()
+        live=[p for p in self.active() if p['mode']=='live']
+        if not live:self.mismatches=set();return
+        try:book=self.a.holdings()
+        except Exception as e:
+            if type(e).__name__=='BrokerDeferred':return
+            self.mismatches={p['id'] for p in live};raise
+        self.mismatches=set();actual={};expected={}
+        for p in book:
+            key=(p.get('exchange'),p.get('tradingsymbol'),p.get('product'))
+            actual[key]=actual.get(key,0)+int(p.get('quantity') or 0)
+        for p in live:
+            key=(p['exchange'],p['contract'],p['product']);expected[key]=expected.get(key,0)+p['qty']
+        for p in live:
+            key=(p['exchange'],p['contract'],p['product'])
+            if actual.get(key,0)!=expected[key]:
+                self.mismatches.add(p['id']);self.health[p['id']]={'reason':'Broker/product quantity mismatch; exit suspended'}
+        if self.mismatches:self.put('halt','CAS broker/product quantity mismatch; reconcile in Kite')
     def save_config(self,body):
         with self.lock:
             if self.config()['armed'] or self.active():raise ValueError('Disarm and close positions before changing CAS settings')
@@ -16691,10 +14586,7 @@ class CASEngine(DeskEngine):
                 daily_loss=(100,1000000),confidence=(.55,.85),stop_pct=(3,40),reward_r=(1,4),partial_take_r=(.5,3),
                 max_spread=(.1,3),lots=(0,50),cooldown=(0,120),max_positions=(1,4),slippage_bps=(1,100),fee_per_order=(1,500))
             for k,v in body.items():
-                if k=='signal_source':
-                    if v not in ('futures','spot'):raise ValueError("signal_source must be 'futures' or 'spot'")
-                    cfg[k]=v
-                elif k in times:
+                if k in times:
                     if not isinstance(v,str) or len(v)!=5:raise ValueError('Use HH:MM for '+k)
                     datetime.strptime(v,'%H:%M')
                     if not '14:45'<=v<='15:40':raise ValueError(k+' must be 14:45–15:40 IST')
@@ -16716,6 +14608,8 @@ class CASEngine(DeskEngine):
         cfg=self.config();t=now_ist()
         if not self.a.stream_connected:return 'Streaming unavailable · new entries paused'
         if t.strftime('%H:%M')<cfg['entry_start'] or t.strftime('%H:%M')>=cfg['entry_end']:return 'Outside CAS entry window'
+        if cfg['mode']=='live' and cfg.get('verified_date')!=t.date().isoformat():return 'Verify today’s exchange session and broker NRML cutoff in controls'
+        if cfg['mode']=='live' and not self.model():return 'Live requires a validated CAS model; collect paper observations first'
         if DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed'):return 'Disarm other AI desks before CAS entries'
         count=self.rows("SELECT COUNT(*) n FROM desk_positions WHERE ts LIKE ? AND mode=?",(t.date().isoformat()+'%',cfg['mode']))[0]['n']
         if count>=cfg['max_trades']:return 'CAS daily entry-attempt limit reached'
@@ -16731,12 +14625,11 @@ class CASEngine(DeskEngine):
         if self.day!=today:
             self.ticks.clear();self.option_ticks.clear();self.confirm.clear();self.last_learn.clear();self.day=today
             with self.db() as c:c.execute('DELETE FROM cas_samples WHERE label IS NULL AND target<?',(_cas_epoch(now)-60,))
-        signal_keys={self.a.signal_key(sym):sym for sym in self.a.symbols}
         for key in self.a.quotes:
             try:
                 raw,ts=self.a.fresh(key);stamp=_cas_epoch(ts)
-                if key in signal_keys:
-                    symbol=signal_keys[key];hist=self.ticks.setdefault(symbol,deque(maxlen=200))
+                if key in [INDEX_SYMBOLS[s] for s in self.a.symbols]:
+                    symbol=next(s for s in self.a.symbols if INDEX_SYMBOLS[s]==key);hist=self.ticks.setdefault(symbol,deque(maxlen=200))
                     price=float(raw['last_price'])
                 else:
                     q=quote_stats(raw)
@@ -16745,7 +14638,7 @@ class CASEngine(DeskEngine):
                 if hist and stamp<=hist[-1][0]:continue
                 if hist and stamp-hist[-1][0]>cfg['max_quote_age']+cfg['poll_seconds']:
                     hist.clear()
-                    if key in signal_keys:self.confirm.pop(symbol,None)
+                    if key in INDEX_SYMBOLS.values():self.confirm.pop(symbol,None)
                 hist.append((stamp,price))
             except (ValueError,TypeError):continue
         # Short-horizon labels use the first fresh sample at/after target, within 5s.
@@ -16753,10 +14646,10 @@ class CASEngine(DeskEngine):
             if not hist:continue
             stamp,spot=hist[-1]
             with self.db() as c:
-                c.execute('UPDATE cas_samples SET label=CASE WHEN ? > spot THEN 1 ELSE 0 END,settled=? WHERE symbol=? AND label IS NULL AND target<=? AND target>=? AND spot<>?',(spot,stamp,symbol,stamp,stamp-5,spot))
+                c.execute('UPDATE cas_samples SET label=CASE WHEN ? > spot THEN 1 ELSE 0 END,settled=? WHERE symbol=? AND label IS NULL AND target<=? AND target>=?',(spot,stamp,symbol,stamp,stamp-5))
     def inspect(self,symbol):
         cfg=self.config();s=dict(symbol=symbol,decision='WAIT',reason='Warming fresh quote history',ts=now_ist().isoformat())
-        raw,ts=self.a.fresh(self.a.signal_key(symbol));hist=self.ticks.get(symbol,[])
+        raw,ts=self.a.fresh(INDEX_SYMBOLS[symbol]);hist=self.ticks.get(symbol,[])
         s.update(spot=float(raw['last_price']),chart=[dict(ts=datetime.fromtimestamp(t,timezone.utc).isoformat(),close=v) for t,v in hist],bar_age=(now_ist()-ts).total_seconds()/60)
         move=self.momentum(hist,_cas_epoch(ts),cfg['lookback_seconds']) if hist else None
         if move is None:self.confirm.pop(symbol,None);return s
@@ -16765,7 +14658,7 @@ class CASEngine(DeskEngine):
         direction='UP' if move>0 else 'DOWN';s.update(move_bps=round(move,2),direction=direction)
         features=[move/50,noise/20,(max(recent)-min(recent))/recent[-1]*100,(ts.hour*60+ts.minute-915)/20,1. if symbol=='SENSEX' else 0.]
         if cfg['entry_start']<=now_ist().strftime('%H:%M')<cfg['entry_end'] and _cas_epoch(ts)-self.last_learn.get(symbol,0)>=5:
-            with self.db() as c:c.execute('INSERT INTO cas_samples(symbol,ts,target,spot,features,profile) VALUES(?,?,?,?,?,3)',(symbol,_cas_epoch(ts),_cas_epoch(ts)+5,s['spot'],json.dumps(features)))
+            with self.db() as c:c.execute('INSERT INTO cas_samples(symbol,ts,target,spot,features,profile) VALUES(?,?,?,?,?,2)',(symbol,_cas_epoch(ts),_cas_epoch(ts)+5,s['spot'],json.dumps(features)))
             self.last_learn[symbol]=_cas_epoch(ts)
         model=self.model();p=None
         if model:
@@ -16782,7 +14675,7 @@ class CASEngine(DeskEngine):
             s['reason']='CAS model does not confirm momentum';return s
         typ='CE' if move>0 else 'PE';rows=self.a.contracts.get(symbol,[])
         if not rows:s['reason']='No available option contracts';return s
-        expiry=min(str(i['expiry']) for i in rows);candidates=[];unaffordable=[]
+        expiry=min(str(i['expiry']) for i in rows);candidates=[]
         for ins in rows:
             if str(ins['expiry'])!=expiry or ins['instrument_type']!=typ:continue
             key=ins['exchange']+':'+ins['tradingsymbol']
@@ -16792,21 +14685,8 @@ class CASEngine(DeskEngine):
             ticks=self.option_ticks.get(key,[])
             om=self.momentum(ticks,ticks[-1][0],cfg['lookback_seconds']) if ticks else None
             if om is None or not cfg['min_premium_move']<=om/100<=cfg['max_premium_move']:continue
-            lot_i=int(ins.get('lot_size') or 0);tick_i=float(ins.get('tick_size') or .05)
-            if lot_i>0 and tick_i>0:
-                entry_i=math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/tick_i)*tick_i;risk_i=entry_i*cfg['stop_pct']/100
-                fit_i=int(min(max(0,cfg['capital']-2*cfg['fee_per_order'])/entry_i,max(0,cfg['risk']-2*cfg['fee_per_order'])/risk_i,q['ask_qty'])//lot_i)
-                if fit_i<max(1,int(cfg['lots'] or 1)):
-                    unaffordable.append((risk_i*lot_i+2*cfg['fee_per_order'],entry_i*lot_i));continue
             candidates.append((q['spread_pct']+abs(float(ins['strike'])-s['spot'])/s['spot']*100,ins,q,om/100))
-        if not candidates:
-            if unaffordable:
-                risk_needed,cost=min(unaffordable)
-                limit=(f"the Rs {cfg['risk']:,.0f} risk budget" if risk_needed>cfg['risk'] else f"the Rs {cfg['capital']:,.0f} capital per trade")
-                s['reason']=(f"Momentum confirmed but the cheapest lot costs about Rs {cost:,.0f} and risks Rs {risk_needed:,.0f} at a "
-                             f"{cfg['stop_pct']:g}% stop, above {limit}")
-            else:s['reason']='No liquid near-ATM option with confirmed premium momentum'
-            return s
+        if not candidates:s['reason']='No liquid near-ATM option with confirmed premium momentum';return s
         _,ins,q,om=min(candidates,key=lambda x:x[0]);lot=int(ins.get('lot_size') or 0);tick=float(ins.get('tick_size') or .05)
         if lot<=0 or not math.isfinite(tick) or tick<=0:s['reason']='Invalid contract metadata';return s
         entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/tick)*tick,2);risk=entry*cfg['stop_pct']/100
@@ -16853,7 +14733,7 @@ class CASEngine(DeskEngine):
     def _train(self):
         try:
             self.training=dict(status='FITTING CAS SAMPLES',progress=10)
-            rows=self.rows('SELECT * FROM cas_samples WHERE label IS NOT NULL AND profile=3 ORDER BY ts DESC LIMIT 20000')[::-1]
+            rows=self.rows('SELECT * FROM cas_samples WHERE label IS NOT NULL AND profile=2 ORDER BY ts DESC LIMIT 20000')[::-1]
             if len(rows)<300:raise ValueError('Need 300 settled CAS observations; collect them during the session, even while disarmed')
             cut=rows[int(len(rows)*.8)]['ts'];train=[r for r in rows if r['settled']<cut];val=[r for r in rows if r['ts']>=cut]
             X=np.array([json.loads(r['features']) for r in train]);y=np.array([r['label'] for r in train]);V=np.array([json.loads(r['features']) for r in val]);vy=np.array([r['label'] for r in val])
@@ -16864,7 +14744,7 @@ class CASEngine(DeskEngine):
             pred=1/(1+np.exp(-np.clip(np.clip((V-mu)/sd,-6,6)@w+b,-30,30)))
             accuracy=float(((pred>=.5)==vy).mean());baseline=float(max(vy.mean(),1-vy.mean()));brier=float(((pred-vy)**2).mean())
             if accuracy<=baseline or brier>=.25:raise ValueError('CAS validation did not beat baseline; current model retained, rule-based paper continues if none')
-            m=dict(id='CAS-'+str(int(time.time())),ts=now_ist().isoformat(),mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b),train_samples=len(train),validation_samples=len(val),accuracy=accuracy*100,baseline=baseline*100,brier=brier,horizon_seconds=5,fast_profile=3)
+            m=dict(id='CAS-'+str(int(time.time())),ts=now_ist().isoformat(),mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b),train_samples=len(train),validation_samples=len(val),accuracy=accuracy*100,baseline=baseline*100,brier=brier,horizon_seconds=5,fast_profile=2)
             with self.db() as c:c.execute('INSERT INTO desk_models VALUES(?,?,?)',(m['id'],m['ts'],json.dumps(m)))
             self.training=dict(status='COMPLETE',progress=100);self.event('LEARN','CAS model validated on later, purged observations')
         except Exception as e:self.training=dict(status='ERROR',progress=0,error=str(e))
@@ -16875,17 +14755,16 @@ class CASEngine(DeskEngine):
             if action=='verify-session':
                 if body.get('ack') is not True:raise ValueError('Confirm today is a trading day and the configured NFO/BFO/NRML cutoffs are supported')
                 cfg.update(verified_date=now_ist().date().isoformat(),armed=False);self.put('config',cfg);return cfg
-            if action=='arm':
+            if action=='arm' and cfg['mode']=='paper':
                 if hasattr(self,'shared_risk'):
-                    blocked=self.shared_risk.snapshot(cfg['mode'])['entry_block']
+                    blocked=self.shared_risk.snapshot('paper')['entry_block']
                     if blocked:raise ValueError(blocked)
                 if not self.a.connected():raise ValueError('Connect Kite first')
                 if self.get('halt') or self.get('close_requested'):raise ValueError('Resolve halt/close request first')
-                cfg['armed']=True;self.put('config',cfg);self.event('CONTROL','arm '+cfg['mode']);return cfg
-            if action=='mode':
-                if body.get('mode') not in ('paper','live'):raise ValueError('Invalid execution mode')
-                if self.active():raise ValueError('Close active positions before switching execution mode')
-                cfg.update(mode=body['mode'],armed=False);self.put('config',cfg);self.event('CONTROL','mode '+body['mode']);return cfg
+                cfg['armed']=True;self.put('config',cfg);return cfg
+            if action in ('arm','mode') and (cfg['mode']=='live' or body.get('mode')=='live'):
+                if cfg.get('verified_date')!=now_ist().date().isoformat():raise ValueError('Verify today’s session and broker cutoffs first')
+                if not self.model():raise ValueError('Live requires a validated CAS-specific model')
             if action in ('clear-halt','close'):self.last_verify=0.;self.last_reconcile=0.
             return super().control(action,body)
     def cycle(self):
@@ -16917,7 +14796,7 @@ class CASEngine(DeskEngine):
             self.manage(bool(self.get('close_requested')))
             for s in sorted(self.signals.values(),key=lambda s:abs(s.get('move_bps',0)),reverse=True):self.enter(s)
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
-            count=self.rows('SELECT COUNT(*) n FROM cas_samples WHERE label IS NOT NULL AND profile=3')[0]['n']
+            count=self.rows('SELECT COUNT(*) n FROM cas_samples WHERE label IS NOT NULL AND profile=2')[0]['n']
             if count>=300 and count-self.last_fit_count>=100 and not cfg['armed'] and not self.active() and not self.train_lock.locked():
                 self.last_fit_count=count;self.train()
         except Exception as e:
@@ -16934,6 +14813,9 @@ class CASEngine(DeskEngine):
         add('Instrument subscriptions',stream['subscriptions']>len(self.a.symbols),str(stream['subscriptions'])+' subscriptions. Use Prepare CAS feed; option subscriptions populate after index ticks arrive.')
         age=stream.get('last_tick_age_seconds')
         add('Recent stream arrivals',age is not None and age<=cfg['max_quote_age'],'Arrival age: '+(str(age)+' seconds' if age is not None else 'not received')+'. Every entry also requires fresh exchange timestamps and an executable option book.')
+        add('Validated CAS model',bool(s.get('model')),str(s['observations'].get('settled') or 0)+' settled CAS observations available. At least 300 and a passing validation result are required; use paper collection then Train CAS model.')
+        add('Today’s session verification',cfg.get('verified_date')==today,'Verify today’s exchange hours and broker NRML cutoff after saving settings.')
+        add('Paper performance gate',cfg.get('live_override') is True or s['evidence']['ready'],'The existing paper-evidence override bypasses only this gate, never model validation or risk controls.')
         others=DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed') or bool(self.a.legacy_open())
         add('Other desks idle',not others,'Disarm the other AI desks and reconcile/close their positions before CAS entries.')
         shared=self.shared_risk.snapshot('live')['entry_block'] if hasattr(self,'shared_risk') else None
@@ -16945,8 +14827,8 @@ class CASEngine(DeskEngine):
         add('Qualifying signal',qualified,'At least one fresh signal must meet spike, confirmation, option momentum, spread, depth and risk checks; see each index’s signal reason.')
         return checks
     def state(self):
-        s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=3')[0]
-        s.update(version='CAS-5',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index-futures direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
+        s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=2')[0]
+        s.update(version='CAS-4',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
         s['live_readiness']=self.live_readiness(s)
         return s
     def start(self):
@@ -16969,7 +14851,7 @@ class SharedAIRisk:
         symbol_losses=2,max_trades=10,max_positions=3,one_trade_per_arm=False,same_signal_lock=True,
         symbol_loss_limit_enabled=True,trade_limit_enabled=True,position_limit_enabled=True)
     def __init__(self,engines):
-        self.engines=engines;self.owner=engines.get('index') or next(iter(engines.values()));self.lock=threading.RLock()
+        self.engines=engines;self.owner=engines['index'];self.lock=threading.RLock()
         for name,engine in engines.items():engine.shared_risk=self;engine.desk_name=name
         if not self.owner.get('optional_risk_controls_v1',False):
             cfg=self.config();cfg.pop('loss_streak',None);cfg['one_trade_per_arm']=False
@@ -17093,7 +14975,6 @@ class SharedAIRisk:
 
 
 SHARED_RISK=SharedAIRisk({'index':DESK,'stock':STOCK_DESK,'cas':CAS_DESK})
-COMMODITY_RISK=SharedAIRisk({'commodity':COMMODITY_DESK})
 
 
 @app.route('/api/shared-ai-risk',methods=['GET','POST'])
@@ -17108,23 +14989,6 @@ def shared_ai_risk():
         for mode in ('paper','live'):
             states[mode]=SHARED_RISK.snapshot(mode);states[mode].pop('closed',None)
         return jsonify(config=SHARED_RISK.config(),states=states,broker=BROKER_GATE.status(),scope='Three AI desks in this backend process; excludes manual, legacy and other-app trades. Keep one backend worker process.')
-    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
-
-
-
-
-@app.route('/api/commodity-ai-risk',methods=['GET','POST'])
-def commodity_ai_risk():
-    if not require_session():return jsonify(error='Connect Kite first'),401
-    try:
-        if request.method=='POST':
-            body=request.get_json(silent=True)
-            if not isinstance(body,dict):raise ValueError('Settings object required')
-            COMMODITY_RISK.save(body)
-        states={}
-        for mode in ('paper','live'):
-            states[mode]=COMMODITY_RISK.snapshot(mode);states[mode].pop('closed',None)
-        return jsonify(config=COMMODITY_RISK.config(),states=states,broker=BROKER_GATE.status(),scope='Commodity desk only; excludes stock, index, CAS and manual trades. Keep one backend worker process.')
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
@@ -17167,7 +15031,7 @@ def cas_ai_control(action):
 @app.route('/api/order-recovery/<desk>/<oid>',methods=['POST'])
 def recover_desk_order(desk,oid):
     if not require_session():return jsonify(error='Connect Kite first'),401
-    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK,'commodity':COMMODITY_DESK}.get(desk)
+    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
     if engine is None:return jsonify(error='Unknown desk'),404
     body=request.get_json(silent=True)
     if not isinstance(body,dict) or body.get('action') not in ('cancel','verify-not-placed'):return jsonify(error='Valid recovery action required'),400
@@ -17183,14 +15047,14 @@ def recover_desk_order(desk,oid):
 @app.route('/api/trade-review/<desk>/<pid>')
 def desk_trade_review(desk,pid):
     if not require_session():return jsonify(error='Connect Kite first'),401
-    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK,'commodity':COMMODITY_DESK}.get(desk)
+    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
     if engine is None:return jsonify(error='Unknown desk'),404
     try:return jsonify(engine.trade_review(pid))
     except ValueError as e:return jsonify(error=str(e)),404
 
 
 def _review_engine(desk):
-    return {'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK,'commodity':COMMODITY_DESK}.get(desk)
+    return {'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
 
 
 def _review_filter():
@@ -17286,212 +15150,6 @@ def desk_trade_review_export(desk):
     return Response(stream_with_context(generate()),mimetype='application/json' if fmt=='json' else 'text/csv',headers={'Content-Disposition':f'attachment; filename="{desk}-trade-evidence.{fmt}"','Cache-Control':'no-store'})
 
 
-# ===========================================================================
-# AUTO-LIVE SCHEDULE
-#   From live_start (09:15 IST) on trading days: Index, Stock and Commodity desks are set to live and armed.
-#   One minute before the CAS window: those three are disarmed and the CAS desk is set to live and armed.
-#   After the CAS window closes: the Commodity desk (MCX evening session) is armed again.
-# Kite must be logged in (the token expires daily), so nothing happens until you log in.  Each step is attempted until it
-# succeeds and is then left alone: if you disarm a desk yourself, the schedule does not re-arm it that day.
-# Not bypassed: a halted desk, daily loss limits, shared risk limits, broker reconciliation, data-freshness checks.
-# ===========================================================================
-AUTO_LIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'auto_live_schedule.json')
-AUTO_LIVE_DEFAULTS = dict(enabled=True, live_start='09:15', cas_switch_seconds_before=60,
-                          rearm_commodity_after_cas=True, bypass_paper_evidence=True)
-
-
-class AutoLiveScheduler:
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.cfg = dict(AUTO_LIVE_DEFAULTS)
-        self.done = {}
-        self.problems = {}
-        self.log = deque(maxlen=60)
-        self.last_phase = 'IDLE'
-        self.last_tick = None
-        self._last_logged = {}
-        try:
-            with open(AUTO_LIVE_FILE, encoding='utf-8') as f:
-                saved = json.load(f)
-            for k in AUTO_LIVE_DEFAULTS:
-                if k in saved and type(saved[k]) is type(AUTO_LIVE_DEFAULTS[k]):
-                    self.cfg[k] = saved[k]
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            self.note('ERROR', 'Could not read schedule settings; defaults used: ' + type(e).__name__)
-
-    def desks(self):
-        return {'index': DESK, 'stock': STOCK_DESK, 'commodity': COMMODITY_DESK, 'cas': CAS_DESK}
-
-    def note(self, kind, text):
-        with self.lock:
-            self.log.appendleft(dict(ts=now_ist().isoformat(timespec='seconds'), kind=kind, text=str(text)[:300]))
-
-    def save(self):
-        tmp = AUTO_LIVE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(self.cfg, f)
-        os.replace(tmp, AUTO_LIVE_FILE)
-
-    def set_enabled(self, enabled):
-        with self.lock:
-            self.cfg['enabled'] = bool(enabled)
-            self.save()
-            self.note('SCHEDULE', 'Automatic live schedule turned ' + ('ON' if enabled else 'OFF'))
-            if enabled:
-                self.done.clear()
-                self.problems.clear()
-
-    def window(self, now):
-        cas = CAS_DESK.config()
-        start = datetime.strptime(self.cfg['live_start'], '%H:%M').time()
-        entry = datetime.strptime(cas['entry_start'], '%H:%M').time()
-        switch = datetime.combine(now.date(), entry) - timedelta(seconds=int(self.cfg['cas_switch_seconds_before']))
-        end = datetime.combine(now.date(), datetime.strptime(cas['market_close'], '%H:%M').time())
-        return datetime.combine(now.date(), start), switch, end
-
-    def phase(self, now):
-        if now.weekday() >= 5:
-            return 'WEEKEND'
-        start, switch, end = self.window(now)
-        if now < start:
-            return 'BEFORE'
-        if now < switch:
-            return 'DAY'
-        if now < end:
-            return 'CAS'
-        return 'AFTER'
-
-    def problem(self, key, text):
-        text = str(text)[:240]
-        with self.lock:
-            self.problems[key] = dict(ts=now_ist().isoformat(timespec='seconds'), text=text)
-            stamp = (key, text)
-            if time.monotonic() - self._last_logged.get(stamp, -1e9) >= 60:
-                self._last_logged[stamp] = time.monotonic()
-                self.note('WAITING', key + ': ' + text)
-                try:
-                    self.desks()[key].event('AUTO_LIVE', 'Not armed yet: ' + text)
-                except Exception:
-                    pass
-
-    def ensure_live_armed(self, key, tag, today):
-        mark = (today, key, tag)
-        if mark in self.done:
-            return
-        desk = self.desks()[key]
-        try:
-            cfg = desk.config()
-            if cfg.get('armed') and cfg.get('mode') == 'live':
-                self.done[mark] = now_ist().isoformat()
-                return
-            if desk.get('halt'):
-                self.problem(key, 'desk is halted (' + str(desk.get('halt'))[:100] + '); clear the halt after checking the broker')
-                return
-            if cfg.get('mode') != 'live' and desk.active():
-                self.problem(key, 'open positions must be closed before switching to live')
-                return
-            if key != 'cas':
-                evidence_ok = cfg.get('live_override') is True or desk.evidence()['ready']
-                need_override = self.cfg['bypass_paper_evidence'] and not evidence_ok
-                if cfg.get('mode') != 'live':
-                    if need_override:
-                        desk.control('live-override', {'enabled': True, 'ack': True})
-                    desk.control('mode', {'mode': 'live', 'ack': True})
-                elif need_override:
-                    desk.control('live-override', {'enabled': True, 'ack': True})
-                desk.control('arm', {'ack': True})
-            else:
-                if cfg.get('mode') != 'live':
-                    desk.control('mode', {'mode': 'live'})
-                desk.control('arm', {'ack': True})
-            self.done[mark] = now_ist().isoformat()
-            self.problems.pop(key, None)
-            self.note('ARMED', key.upper() + ' set to LIVE and armed (' + tag + ')')
-            desk.event('AUTO_LIVE', 'Set to live and armed by the automatic schedule')
-        except Exception as e:
-            self.problem(key, str(e))
-
-    def disarm(self, key, today):
-        mark = (today, key, 'disarm')
-        if mark in self.done:
-            return
-        try:
-            self.desks()[key].control('disarm', {})
-            self.done[mark] = now_ist().isoformat()
-            self.note('DISARMED', key.upper() + ' disarmed for the CAS window')
-        except Exception as e:
-            self.problem(key, 'could not disarm: ' + str(e))
-
-    def tick(self):
-        now = now_ist()
-        self.last_tick = now.isoformat(timespec='seconds')
-        if not self.cfg['enabled']:
-            self.last_phase = 'OFF'
-            return
-        phase = self.phase(now)
-        self.last_phase = phase
-        if phase in ('WEEKEND', 'BEFORE'):
-            return
-        if not CAS_DESK.a.connected():
-            return
-        today = now.date().isoformat()
-        if phase == 'DAY':
-            for key in ('index', 'stock', 'commodity'):
-                self.ensure_live_armed(key, 'day', today)
-        elif phase == 'CAS':
-            for key in ('index', 'stock', 'commodity'):
-                self.disarm(key, today)
-            self.ensure_live_armed('cas', 'cas', today)
-        elif phase == 'AFTER' and self.cfg['rearm_commodity_after_cas'] and COMMODITY_DESK.a.market_open():
-            self.ensure_live_armed('commodity', 'after', today)
-
-    def run(self):
-        while True:
-            try:
-                self.tick()
-            except Exception as e:
-                self.note('ERROR', type(e).__name__ + ': ' + str(e))
-            time.sleep(5)
-
-    def state(self):
-        now = now_ist()
-        start, switch, end = self.window(now)
-        desks = {}
-        for key, desk in self.desks().items():
-            try:
-                cfg = desk.config()
-                desks[key] = dict(mode=cfg.get('mode'), armed=bool(cfg.get('armed')), live_override=cfg.get('live_override') is True,
-                                  halt=desk.get('halt'), problem=self.problems.get(key))
-            except Exception as e:
-                desks[key] = dict(error=str(e))
-        return dict(config=dict(self.cfg), phase=self.last_phase, now=now.isoformat(timespec='seconds'),
-                    kite_connected=bool(CAS_DESK.a.connected()), live_start=start.strftime('%H:%M'),
-                    cas_switch=switch.strftime('%H:%M:%S'), cas_end=end.strftime('%H:%M'),
-                    desks=desks, log=list(self.log)[:25])
-
-
-AUTO_LIVE = AutoLiveScheduler()
-
-
-@app.route('/api/auto-live/state')
-def auto_live_state_route():
-    return jsonify(AUTO_LIVE.state())
-
-
-@app.route('/api/auto-live/config', methods=['POST'])
-def auto_live_config_route():
-    body = request.get_json(silent=True) or {}
-    enabled = body.get('enabled')
-    if not isinstance(enabled, bool):
-        return jsonify(error='enabled must be true or false'), 400
-    if enabled and body.get('ack') is not True:
-        return jsonify(error='Turning the automatic live schedule on requires explicit acknowledgement'), 400
-    AUTO_LIVE.set_enabled(enabled)
-    return jsonify(ok=True, state=AUTO_LIVE.state())
-
-
 def start_application_workers():
     if os.environ.get("AI_START_WORKERS","1")!="1":return
     def legacy_manage():
@@ -17508,9 +15166,7 @@ def start_application_workers():
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
     DESK.start()
     STOCK_DESK.start()
-    COMMODITY_DESK.start()
     CAS_DESK.start()
-    threading.Thread(target=AUTO_LIVE.run, daemon=True, name='auto-live-schedule').start()
 
 start_application_workers()
 
