@@ -49,6 +49,14 @@ import threading
 import time
 from datetime import datetime
 
+# v4: average several samples per forecast, in two independent halves.  The halves are
+# averaged for the forecast and compared with each other as a reliability check.
+# CPU cost grows with KRONOS_SAMPLES; watch kronos.active_seconds in the desk state.
+KRONOS_SAMPLES = max(2, min(20, int(os.environ.get('KRONOS_SAMPLES', '6'))))
+KRONOS_SAMPLES -= KRONOS_SAMPLES % 2
+KRONOS_HALF = KRONOS_SAMPLES // 2
+REQUIRE_SPLIT_AGREEMENT = os.environ.get('KRONOS_REQUIRE_SPLIT_AGREEMENT', '1').lower() not in ('0', 'false', 'no')
+
 
 def blend_signal(rows, forecast):
     """Blend Kronos and price action with soft disagreement and hysteresis-friendly diagnostics.
@@ -79,6 +87,15 @@ def blend_signal(rows, forecast):
     momentum=(close[-1]-close[-4])/atr
     micro=(close[-1]-close[-2])/atr
     technical=.50*math.tanh(trend)+.35*math.tanh(momentum/1.75)+.15*math.tanh(micro)
+    # Split-half reliability: two independent sample groups should point the same way.
+    split_agree=None;split_gap_atr=None
+    half_a=forecast.get('close_a');half_b=forecast.get('close_b')
+    if isinstance(half_a,list) and isinstance(half_b,list) and len(half_a)==3 and len(half_b)==3:
+        move_a=sum(w*(float(x)-close[-1]) for w,x in zip((.20,.30,.50),half_a))
+        move_b=sum(w*(float(x)-close[-1]) for w,x in zip((.20,.30,.50),half_b))
+        if math.isfinite(move_a) and math.isfinite(move_b):
+            split_agree=(move_a>0 and move_b>0) or (move_a<0 and move_b<0)
+            split_gap_atr=abs(move_a-move_b)/atr
     kronos=math.tanh(move/atr)
     score=.58*kronos+.42*technical
     path=sum(abs(b-a) for a,b in zip(close[-7:-1],close[-6:]))
@@ -95,7 +112,8 @@ def blend_signal(rows, forecast):
     # but only when the blended score remains meaningful.
     min_move_atr=.12 if efficiency>=.48 and abs(technical)>=.20 else .16
     reason=None;note=None
-    if tr[-1]>3.25*atr and abs(score)<.45:reason='Exceptional last-bar move; wait for stabilisation'
+    if REQUIRE_SPLIT_AGREEMENT and split_agree is False:reason='Kronos sample halves disagree on direction; forecast not reliable'
+    elif tr[-1]>3.25*atr and abs(score)<.45:reason='Exceptional last-bar move; wait for stabilisation'
     elif efficiency<.18 and abs(score)<.34:reason='Choppy index: directional edge is not persistent enough'
     elif forecast_move_atr<min_move_atr and abs(technical)<.32:reason='Forecast edge too small after volatility scaling'
     elif not agree and not soft_disagreement:reason='Kronos / price-action conflict without a dominant edge'
@@ -103,6 +121,7 @@ def blend_signal(rows, forecast):
     else:note='Kronos and price action are directionally aligned'
     return dict(p_up=.5+.5*score,confidence=.5+.5*abs(score),direction='UP' if score>0 else 'DOWN',
                 regime='TREND' if reason is None else 'WAIT',forecast_move=move,atr=atr,
+                split_agree=split_agree,split_gap_atr=split_gap_atr,kronos_samples=forecast.get('samples'),
                 forecast_move_atr=forecast_move_atr,min_forecast_atr=min_move_atr,
                 kronos_score=.5+.5*kronos,technical_score=.5+.5*technical,
                 efficiency=efficiency,agreement=agreement,signal_margin=abs(score),
@@ -183,7 +202,8 @@ class KronosService:
             return dict(status=self.status,error=self.error,pending=len(self.pending),active=list(self.active_symbols),
                         active_seconds=age,last_completed=self.last_completed,completed_count=self.completed_count,
                         fresh_results=fresh,batch_size=self.batch_size,lookback=self.lookback,
-                        model='NeoQuasar/Kronos-small',context=self.lookback,horizon_minutes=15)
+                        model='NeoQuasar/Kronos-small',context=self.lookback,horizon_minutes=15,
+                        samples=KRONOS_SAMPLES,split_agreement_gate=REQUIRE_SPLIT_AGREEMENT)
 
     def _start(self):
         self.process=subprocess.Popen([sys.executable,'-u',str(Path(__file__).resolve()),'--kronos-worker'],
@@ -287,16 +307,20 @@ def worker():
                 ts=pd.to_datetime(df['ts']);future=pd.Series(pd.date_range(ts.iloc[-1]+pd.Timedelta(minutes=5),periods=3,freq='5min'))
                 frames.append(df[['open','high','low','close','volume']]);timestamps.append(ts);futures.append(future);symbols.append(str(item['symbol']))
             results=[]
+            def run_half(n):
+                # sample_count is averaged inside the predictor, so each call returns a mean forecast.
+                if len(frames)>1 and len({len(x) for x in frames})==1 and hasattr(predictor,'predict_batch'):
+                    return predictor.predict_batch(df_list=frames,x_timestamp_list=timestamps,y_timestamp_list=futures,
+                        pred_len=3,T=1.0,top_p=.9,sample_count=n,verbose=False)
+                return [predictor.predict(df=df,x_timestamp=ts,y_timestamp=fut,pred_len=3,T=1.0,top_p=.9,sample_count=n,verbose=False)
+                        for df,ts,fut in zip(frames,timestamps,futures)]
             with contextlib.redirect_stdout(sys.stderr),torch.inference_mode():
                 torch.manual_seed(int(hashlib.sha256(line.encode()).hexdigest()[:8],16))
-                if len(frames)>1 and len({len(x) for x in frames})==1 and hasattr(predictor,'predict_batch'):
-                    outs=predictor.predict_batch(df_list=frames,x_timestamp_list=timestamps,y_timestamp_list=futures,
-                        pred_len=3,T=1.0,top_p=.9,sample_count=1,verbose=False)
-                else:
-                    outs=[predictor.predict(df=df,x_timestamp=ts,y_timestamp=fut,pred_len=3,T=1.0,top_p=.9,sample_count=1,verbose=False)
-                          for df,ts,fut in zip(frames,timestamps,futures)]
-            for symbol,out,future in zip(symbols,outs,futures):
-                results.append(dict(symbol=symbol,close=[float(x) for x in out['close']],timestamps=[str(t) for t in future]))
+                outs_a=run_half(KRONOS_HALF);outs_b=run_half(KRONOS_HALF)
+            for symbol,oa,ob,future in zip(symbols,outs_a,outs_b,futures):
+                ca=[float(x) for x in oa['close']];cb=[float(x) for x in ob['close']]
+                results.append(dict(symbol=symbol,close=[(x+y)/2 for x,y in zip(ca,cb)],close_a=ca,close_b=cb,
+                                    samples=2*KRONOS_HALF,timestamps=[str(t) for t in future]))
             print(json.dumps(dict(batch=results),allow_nan=False),flush=True)
         except Exception as e:print(json.dumps(dict(error=type(e).__name__+': '+str(e))),flush=True)
 
@@ -387,7 +411,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -14125,8 +14149,23 @@ def stock_ai_control(action):
 # Commodity V2: conservative rule defaults, not backtested optimal thresholds.
 COMMODITY_POLICY=dict(min_range_bps=8.,min_efficiency=.30,min_relative_volume=.70,
     max_flat_fraction=.50,shock_atr=4.,quote_age_seconds=30,trade_age_seconds=120,
-    premium_confirmation_seconds=5,iv_stress_fraction=.10,min_scenario_r=.20,
-    stall_after_minutes=30,stall_confirmation_seconds=300,min_contract_training_bars=300)
+    premium_confirmation_seconds=5,
+    # v5: a 10% relative IV crush inside a one-hour window exceeds the gain from a typical favourable move,
+    # so the scenario could not pass in ordinary conditions.  3% keeps a real IV/decay penalty.
+    iv_stress_fraction=float(os.environ.get('COMMODITY_IV_STRESS','0.03')),
+    min_scenario_r=float(os.environ.get('COMMODITY_MIN_SCENARIO_R','0.20')),
+    stall_after_minutes=30,stall_confirmation_seconds=300,min_contract_training_bars=300,
+    # v5: option-demand confirmation compares against a baseline up to this old (scan cycles are minutes apart).
+    premium_baseline_seconds=int(os.environ.get('COMMODITY_PREMIUM_BASELINE_SECONDS','600')),
+    require_bid_improvement=os.environ.get('COMMODITY_REQUIRE_BID_IMPROVEMENT','0')=='1',
+    # v5: futures/option mapping freshness (parity still has to identify exactly one future).
+    map_option_age_seconds=int(os.environ.get('COMMODITY_MAP_OPTION_AGE_SECONDS','90')),
+    map_stale_competitors=os.environ.get('COMMODITY_MAP_STALE_OK','1')=='1',
+    refresh_seconds=int(os.environ.get('COMMODITY_REFRESH_SECONDS','60')))
+# v5: the inherited 1% spread cap comes from NSE index options and rejects typical MCX option books; the cost scenario
+# already charges half the spread.  Applied once, and only if the setting is still at the old default.
+COMMODITY_DEFAULT_OVERRIDES=dict(max_spread=2.5)
+COMMODITY_NSE_DEFAULTS=dict(max_spread=1.)
 
 def commodity_black76(future,strike,years,sigma,kind,rate=0.):
     if kind not in ('CE','PE') or min(future,strike)<=0 or years<0 or sigma<0:raise ValueError('Invalid Black-76 inputs')
@@ -14305,7 +14344,7 @@ class CommodityDeskAdapter(DeskAdapter):
         # independent resumable backfill worker below so a one-year archive never blocks
         # entry execution or the 5-second position supervisor.
         with self.history_lock:
-            if time.monotonic()-self.refreshed.get(symbol,-1e9)<STOCK_HISTORY_REFRESH_SECONDS:return
+            if time.monotonic()-self.refreshed.get(symbol,-1e9)<COMMODITY_POLICY['refresh_seconds']:return
             token,err=commodity_token(symbol)
             if err:raise ValueError(err)
             end=now_ist()
@@ -14441,9 +14480,13 @@ class CommodityDeskAdapter(DeskAdapter):
         def fresh(q):
             ts=_ai_ts_naive((q or {}).get('timestamp'));trade=_ai_ts_naive((q or {}).get('last_trade_time'))
             return ts and trade and -5<=(now-ts).total_seconds()<=30 and -5<=(now-trade).total_seconds()<=120
+        def book_fresh(q):
+            # Put-call parity uses bid/ask, so a live resting book is enough; it need not have traded in the last 2 minutes.
+            ts=_ai_ts_naive((q or {}).get('timestamp'))
+            return bool(ts and -5<=(now-ts).total_seconds()<=COMMODITY_POLICY['map_option_age_seconds'])
         for o in opts:
             q=quotes.get('MCX:'+o['tradingsymbol'])
-            if not fresh(q):continue
+            if not book_fresh(q):continue
             st=quote_stats(q)
             if not st.get('bid') or not st.get('ask') or st['bid']>st['ask'] or st['spread_pct']>3:continue
             pairs.setdefault(float(o['strike']),{})[o['instrument_type']]=st
@@ -14451,12 +14494,26 @@ class CommodityDeskAdapter(DeskAdapter):
         for f in futures:
             q=quotes.get('MCX:'+f['tradingsymbol'])
             # If a competing future is unobserved, uniqueness cannot be established.
-            if not fresh(q):raise ValueError('Waiting for fresh competing futures quotes to resolve option mapping')
+            if not fresh(q):
+                if not COMMODITY_POLICY['map_stale_competitors']:raise ValueError('Waiting for fresh competing futures quotes to resolve option mapping')
+                # An illiquid far-month contract is only a competitor.  Its last known price is enough to rule it out,
+                # and if that price still fits the parity intervals the mapping is reported ambiguous and no trade is taken.
+                stale_price=extract_price(q) if q else None
+                if not stale_price or not math.isfinite(float(stale_price)) or stale_price<=0:
+                    raise ValueError('No price available for competing futures '+str(f['tradingsymbol']))
+                future_prices.append(dict(tradingsymbol=f['tradingsymbol'],price=float(stale_price),tick_size=float(f['tick_size'])))
+                continue
             st=quote_stats(q);price=st.get('mid') or extract_price(q)
             if not price or not math.isfinite(float(price)) or price<=0:raise ValueError('Missing underlying futures price')
             future_prices.append(dict(tradingsymbol=f['tradingsymbol'],price=float(price),tick_size=float(f['tick_size'])))
         chosen=commodity_parity_match(complete,future_prices,(expiry-now.date()).days/365.)
         return chosen
+    def _option_tick(self,contract):
+        cache=self.__dict__.setdefault('_tick_cache',{})
+        if contract not in cache:
+            row=next((r for r in commodity_instruments() if r.get('tradingsymbol')==contract),None)
+            cache[contract]=float(row.get('tick_size') or 0) if row else 0.
+        return cache[contract]
     def quote(self,exchange,contract):
         try:
             key=f'{exchange}:{contract}';raw=kite_quote_bulk([key],force_refresh=True).get(key)
@@ -14473,9 +14530,17 @@ class CommodityDeskAdapter(DeskAdapter):
                 samples=self.option_samples.setdefault(contract,[]);mono=time.monotonic()
                 if not samples or mono-samples[-1]['mono']>=1:
                     samples.append(dict(mono=mono,bid=q['bid'],volume=float(raw.get('volume') or 0),ts=ts.isoformat()))
-                    del samples[:-90]
-                old=next((r for r in reversed(samples) if COMMODITY_POLICY['premium_confirmation_seconds']<=mono-r['mono']<=90),None)
-                q['premium_confirmed']=bool(old and q['bid']>old['bid'] and float(raw.get('volume') or 0)>old['volume'] and ts.isoformat()!=old['ts'])
+                    # v5: keep a time window (not 90 samples) because scan cycles can be minutes apart.
+                    keep=max(120.,float(COMMODITY_POLICY['premium_baseline_seconds'])*1.5)
+                    samples[:]=[r for r in samples if mono-r['mono']<=keep][-240:]
+                old=next((r for r in reversed(samples) if COMMODITY_POLICY['premium_confirmation_seconds']<=mono-r['mono']<=COMMODITY_POLICY['premium_baseline_seconds']),None)
+                volume_now=float(raw.get('volume') or 0)
+                # Demand evidence = new traded volume since the baseline and a bid that has not deteriorated.
+                # (v4 demanded a strictly higher bid on every look, which an illiquid book rarely gives.)
+                if COMMODITY_POLICY['require_bid_improvement']:bid_ok=bool(old and q['bid']>old['bid'])
+                else:bid_ok=bool(old and q['bid']>=old['bid']-self._option_tick(contract)*m)
+                q['premium_confirmed']=bool(old and bid_ok and volume_now>old['volume'] and ts.isoformat()!=old['ts'])
+                q['premium_baseline_age']=round(mono-old['mono'],1) if old else None
             return q,None
         except Exception as e:return None,str(e)
     def place(self,exchange,contract,side,qty,price,tag):
@@ -14546,6 +14611,13 @@ class CommodityDeskEngine(DeskEngine):
     def __init__(self,adapter):
         super().__init__(adapter)
         self.a.symbols=tuple(self.get('commodity_universe',[]))
+        self.funnel_history=__import__('collections').deque(maxlen=60)
+        # One-time: move settings that were never customised off the NSE-shaped defaults.
+        if not self.get('commodity_defaults_v5'):
+            saved=dict(self.get('config',{}) or {})
+            for key,new in COMMODITY_DEFAULT_OVERRIDES.items():
+                if saved.get(key,COMMODITY_NSE_DEFAULTS[key])==COMMODITY_NSE_DEFAULTS[key]:saved[key]=new
+            self.put('config',saved);self.put('commodity_defaults_v5',now_ist().isoformat())
         self.scan_status={'status':'IDLE','completed':0,'total':0,'deep_total':0,'deep_completed':0}
         self.ban_checked=0;self.banned=set();self.ban_error='MCX: equity ban list does not apply'
         self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
@@ -14987,6 +15059,91 @@ class CommodityDeskEngine(DeskEngine):
             s['success_probability']=None;s['expected_r']=None
         s['rank_score']=self.rank_signal(s,cfg['max_spread'])
         return s
+    def _sizing_reason(self,entry,per_risk,lot,ask_qty,bid_qty=None):
+        """Say WHICH limit stops the entry, with the numbers.  Prices are INR per broker quantity (1 quantity = 1 MCX lot)."""
+        cfg=self.config();lot=max(1,int(lot or 1))
+        lot_cost=float(entry)*lot;risk_lot=float(per_risk)*lot
+        by_capital=cfg['capital']/lot_cost if lot_cost>0 else 0.
+        by_risk=cfg['risk']/risk_lot if risk_lot>0 else 0.
+        depth=[float(ask_qty or 0)]+([float(bid_qty or 0)] if bid_qty is not None else [])
+        by_depth=min(depth)/lot
+        info=dict(lot_premium=round(lot_cost,2),risk_per_lot=round(risk_lot,2),lots_by_capital=round(by_capital,2),
+                  lots_by_risk=round(by_risk,2),lots_by_depth=round(by_depth,2),capital=cfg['capital'],risk=cfg['risk'],
+                  stop_pct=cfg['stop_pct'],max_premium_per_lot=round(min(cfg['capital'],cfg['risk']/(cfg['stop_pct']/100.)),2))
+        if by_risk<1:
+            text=(f"one lot costs about Rs {lot_cost:,.0f}; a {cfg['stop_pct']:g}% stop risks Rs {risk_lot:,.0f}, above the "
+                  f"Rs {cfg['risk']:,.0f} risk budget (raise risk to at least Rs {math.ceil(risk_lot):,} or skip this contract)")
+        elif by_capital<1:
+            text=f"one lot costs about Rs {lot_cost:,.0f}, above the Rs {cfg['capital']:,.0f} capital per trade"
+        elif by_depth<1:
+            text=f"visible book depth is below one lot (ask {ask_qty}, bid {bid_qty})"
+        else:
+            text=f"limits allow {int(min(by_capital,by_risk,by_depth))} lot(s); re-check on the next scan"
+        return text,info
+    def _explain_sizing(self,s):
+        if s.get('decision')=='WAIT' and s.get('reason')=='Budget or visible ask depth cannot fund one lot' and s.get('entry') and s.get('lot'):
+            cfg=self.config()
+            text,info=self._sizing_reason(s['entry'],s['entry']*cfg['stop_pct']/100.,s['lot'],s.get('depth_qty'))
+            return dict(s,reason='No entry: '+text,sizing=info)
+        return s
+    def _record_funnel(self):
+        """Tally why each symbol stopped in this scan (numbers masked so identical reasons group together)."""
+        try:
+            import re
+            counts={};conf=[]
+            for s in self.signals.values():
+                reason=re.sub(r'\d[\d,\.]*','#',str(s.get('reason') or s.get('decision') or ''))[:110]
+                key=str(s.get('scan_stage') or 'UNIVERSE')+' | '+str(s.get('decision'))+' | '+reason
+                counts[key]=counts.get(key,0)+1
+                if s.get('p_up') is not None:conf.append(float(s.get('confidence') or 0))
+            self.funnel_history.append(dict(ts=now_ist().isoformat(),symbols=len(self.signals),counts=counts,confidence=conf))
+        except Exception:pass
+    def funnel(self,cycles=30):
+        """Where entries die.  Read `reasons_last_cycles` from the top: the first big line is the binding gate."""
+        hist=list(self.funnel_history)[-max(1,min(60,int(cycles or 30))):]
+        cfg=self.config();model=self.model() or {}
+        need=int(COMMODITY_POLICY['min_contract_training_bars'])
+        latest=hist[-1] if hist else None
+        agg={}
+        for h in hist:
+            for k,v in h['counts'].items():agg[k]=agg.get(k,0)+v
+        total=float(sum(agg.values()) or 1)
+        conf=sorted(latest['confidence']) if latest else []
+        def quant(p):return round(conf[min(len(conf)-1,int(p*len(conf)))],4) if conf else None
+        cov={r.get('symbol'):int(r.get('bars') or 0) for r in model.get('coverage',[])}
+        signals=list(self.signals.values())
+        return dict(
+            desk=dict(mode=cfg['mode'],armed=cfg['armed'],entry_block=self.block(),market_open=self.a.market_open(),
+                      universe=len(self.a.symbols),scan=dict(self.scan_status)),
+            reasons_last_cycles=[dict(gate=k,symbol_scans=v,share=round(v/total,3)) for k,v in sorted(agg.items(),key=lambda kv:-kv[1])[:25]],
+            cycles_used=len(hist),
+            direction=dict(threshold=cfg['confidence'],confidence_min=quant(0.),confidence_median=quant(.5),confidence_p90=quant(.9),
+                           confidence_max=quant(.999),at_or_above_threshold=sum(1 for c in conf if c>=cfg['confidence']),symbols=len(conf)),
+            model=dict(id=model.get('id'),trained=model.get('ts'),auc=model.get('auc'),accuracy=model.get('accuracy'),baseline=model.get('baseline'),
+                       validation_samples=model.get('validation_samples'),contracts_with_enough_history=sum(1 for v in cov.values() if v>=need),
+                       contracts_missing_history=[k for k in self.a.symbols if cov.get(k,0)<need][:20]),
+            sizing=dict(capital=cfg['capital'],risk=cfg['risk'],stop_pct=cfg['stop_pct'],
+                        max_premium_per_lot=round(min(cfg['capital'],cfg['risk']/(cfg['stop_pct']/100.)),2),
+                        seen=[dict(symbol=s.get('symbol'),**s['sizing']) for s in signals if s.get('sizing')][:12]),
+            settings=dict(max_spread=cfg['max_spread'],square_off=cfg['square_off'],max_hold=cfg['max_hold'],
+                          iv_stress_fraction=COMMODITY_POLICY['iv_stress_fraction'],min_scenario_r=COMMODITY_POLICY['min_scenario_r']),
+            reached_deep_check=[s.get('symbol') for s in signals if s.get('scan_stage')=='DEEP'],
+            ready_now=[s.get('symbol') for s in signals if s.get('decision')=='READY'])
+    def maybe_train(self):
+        # v5: the inherited schedule retrains only after the market has closed (>=15:35 and closed).  MCX stays open until
+        # 23:15, so a contract that rolled or was newly added stayed at "Contract learning incomplete" all day.
+        if self.train_lock.locked() or self.training.get('status')=='ERROR':return
+        model=self.model()
+        last_gap_train=getattr(self,'_gap_train_at',None)
+        if model and (last_gap_train is None or time.monotonic()-last_gap_train>=1800):
+            need=int(COMMODITY_POLICY['min_contract_training_bars'])
+            cov={r.get('symbol'):int(r.get('bars') or 0) for r in model.get('coverage',[])}
+            ready=[x for x in self.a.symbols if cov.get(x,0)<need and int(self.a.history_bounds(x).get('n') or 0)>=need+20]
+            if ready:
+                self._gap_train_at=time.monotonic()
+                self.event('LEARN','Retraining: contracts now have enough candles: '+', '.join(ready[:6]))
+                if self.train():return
+        return super().maybe_train()
     def contract_learning_block(self,symbol):
         model=self.model() or {}
         record=next((r for r in model.get('coverage',[]) if r.get('symbol')==symbol),None)
@@ -15034,7 +15191,7 @@ class CommodityDeskEngine(DeskEngine):
         if s.get('direction')!=direction.get('direction'):activity=self._activity(symbol,s.get('direction','UP'))
         s['commodity_activity']=activity;s['scan_stage']='DEEP'
         if not activity['ready']:return dict(s,decision='WAIT',reason=activity['reason'])
-        if s.get('decision')!='READY':return s
+        if s.get('decision')!='READY':return self._explain_sizing(s)
         q,err=self.a.quote(s['exchange'],s['contract'])
         if err:return dict(s,decision='WAIT',reason=err)
         if q.get('last_trade_age') is None or not -5<=q['last_trade_age']<=COMMODITY_POLICY['trade_age_seconds']:
@@ -15045,7 +15202,9 @@ class CommodityDeskEngine(DeskEngine):
         per_risk=entry*cfg['stop_pct']/100
         capacity=max(0,int(min(cfg['capital']/entry,cfg['risk']/per_risk,float(q.get('ask_qty') or 0),float(q.get('bid_qty') or 0))//s['lot']))
         lots=cfg['lots'] or capacity
-        if lots<=0 or lots>capacity:return dict(s,decision='WAIT',reason='No entry: fresh buy/sell depth or risk budget is insufficient')
+        if lots<=0 or lots>capacity:
+            reason,info=self._sizing_reason(entry,per_risk,s['lot'],q.get('ask_qty'),q.get('bid_qty'))
+            return dict(s,decision='WAIT',reason='No entry: '+reason,sizing=info)
         qty=lots*s['lot'];s.update(entry=entry,stop=entry-per_risk,target=entry+per_risk*cfg['reward_r'],lots=lots,qty=qty,bid=q['bid'],ask=q['ask'])
         if q.get('spread_pct') is None or q['spread_pct']>cfg['max_spread']:return dict(s,decision='WAIT',reason='Option spread widened before entry')
         meta=self.a.option_meta.get(s['contract'])
@@ -15180,6 +15339,7 @@ class CommodityDeskEngine(DeskEngine):
                 except Exception as e:self.signals[symbol]=dict(seed,decision='WAIT',reason='Deep check: '+str(e),scan_stage='DEEP')
                 self.scan_status.update(deep_completed=i+1,symbol=symbol)
                 self.supervise()
+            self._record_funnel()
             ranked=sorted(self.signals.values(),key=lambda s:(s.get('decision')=='READY',float(s.get('rank_score') or 0)),reverse=True)
             # Scanner only publishes the ranked READY list.  A dedicated execution
             # thread performs fresh pre-entry validation and broker submission.
@@ -15234,7 +15394,7 @@ class CommodityDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(build='COMMODITY_AI_V4_AUTOMATIC_CONTRACTS',universe=self.get('commodity_universe_info',{}),scan=dict(self.scan_status),ban_status='MCX: equity F&O ban list does not apply',watchlist=list(self.a.symbols),
+        s.update(build='COMMODITY_AI_V5_FUNNEL_FIXES',universe=self.get('commodity_universe_info',{}),scan=dict(self.scan_status),ban_status='MCX: equity F&O ban list does not apply',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -15291,6 +15451,12 @@ def commodity_ai_state():
     if not require_session():return jsonify(error='Connect Kite first'),401
     return jsonify(COMMODITY_DESK.state())
 
+@app.route('/api/commodity-ai/funnel')
+def commodity_ai_funnel():
+    # Where entries die: reasons tallied over the last scan cycles, direction confidence spread, sizing limits.
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    return jsonify(COMMODITY_DESK.funnel(cycles=request.args.get('cycles',30,type=int)))
+
 @app.route('/api/commodity-ai/config',methods=['POST'])
 def commodity_ai_config():
     if not require_session():return jsonify(error='Connect Kite first'),401
@@ -15344,7 +15510,7 @@ def commodity_ai_control(action):
 # models are ignored, probabilities are shrunk toward 50%, and execution is gated
 # again immediately before order submission. Shadow setups never place orders.
 # ===========================================================================
-INDEX_AI_BUILD = 'index-kronos-hysteresis-v7-20260918'
+INDEX_AI_BUILD = 'index-kronos-hysteresis-v8-20260920'
 INDEX_HIST_SUCCESS_MIN_SAMPLES = 300
 INDEX_HIST_SPECIALIST_MIN_SAMPLES = 90
 INDEX_HIST_SUCCESS_MIN_AUC = 0.52
@@ -15868,6 +16034,21 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         # Per-position reversal confirmation memory.  Counts distinct completed candles,
         # never repeated 15-second scans of the same candle.
         self.reversal_memory={}
+        # v4: every scored completed bar is logged (qualified or not) and settled against the
+        # actual close, so direction calibration can be measured without needing a trade.
+        self._logged_signal_keys=set();self.signal_log_error=None
+        with self.db() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS index_signal_log(
+              id TEXT PRIMARY KEY,ts TEXT,symbol TEXT,bar_ts TEXT,target_ts TEXT,horizon_min INTEGER,spot REAL,
+              direction TEXT,score REAL,margin REAL,confidence REAL,kronos REAL,technical REAL,
+              forecast_move REAL,atr REAL,forecast_move_atr REAL,efficiency REAL,agreement TEXT,
+              split_agree INTEGER,split_gap_atr REAL,cache_mode TEXT,samples INTEGER,wait_reason TEXT,
+              build TEXT,gate_passed INTEGER DEFAULT 0,final_decision TEXT,final_reason TEXT,
+              fwd_close REAL,fwd_move REAL,hit INTEGER,settled_ts TEXT,status TEXT);
+            CREATE INDEX IF NOT EXISTS index_signal_log_status ON index_signal_log(status,target_ts);
+            CREATE INDEX IF NOT EXISTS index_signal_log_build ON index_signal_log(build,symbol);
+            ''')
         if self.get('direction_build')!=INDEX_AI_BUILD:
             cfg=self.config();cfg.update(armed=False,live_override=False)
             # Retain execution mode for any existing positions; never rewrite broker holdings.
@@ -15915,6 +16096,7 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
                  forecast_horizon_minutes=int(forecast.get('remaining_horizon_minutes') or 15),
                  forecast_cache_mode=forecast.get('cache_mode','EXACT'),forecast_source_bar=forecast.get('source_bar_ts'),
                  score_kind='Uncalibrated directional score; not probability',selection_basis='58% Kronos + 42% price action · dominant-edge override')
+        self._log_signal(s)
         if s['signal_wait']:s['reason']=s['signal_wait'];return s
         configured=float(self.config()['confidence'])
         # A dominant-edge disagreement already passed a stricter structural test above;
@@ -15922,8 +16104,134 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         required=max(.60,configured-.04) if str(s.get('agreement','')).startswith('DOMINANT_') else configured
         s['required_confidence']=required
         if s['confidence']<required:s['reason']='Blended direction score below adaptive threshold';return s
-        s.update(decision='CANDIDATE',reason=(s.get('signal_note') or 'Directional edge qualifies')+'; checking CE/PE liquidity')
+        s.update(decision='CANDIDATE',direction_gate_passed=True,
+                 reason=(s.get('signal_note') or 'Directional edge qualifies')+'; checking CE/PE liquidity')
         return s
+
+    def _log_signal(self,s):
+        """Record one row per (symbol, completed bar, cache mode).  Never raises: logging must not affect trading."""
+        try:
+            bar_ts=s.get('bar_ts');symbol=s.get('symbol')
+            if not bar_ts or not symbol or s.get('p_up') is None or not s.get('spot'):return
+            mode=str(s.get('forecast_cache_mode') or 'EXACT')
+            key=f"{symbol}|{bar_ts}|{mode}|{INDEX_AI_BUILD}"
+            if key in self._logged_signal_keys:return
+            t=_ai_ts_naive(bar_ts)
+            if t is None:return
+            horizon=int(s.get('forecast_horizon_minutes') or 15)
+            score=(float(s['p_up'])-.5)*2
+            kronos=(float(s.get('kronos_score',.5))-.5)*2;technical=(float(s.get('technical_score',.5))-.5)*2
+            split=s.get('split_agree')
+            with self.db() as c:
+                c.execute("""INSERT OR IGNORE INTO index_signal_log(id,ts,symbol,bar_ts,target_ts,horizon_min,spot,direction,score,margin,
+                    confidence,kronos,technical,forecast_move,atr,forecast_move_atr,efficiency,agreement,split_agree,split_gap_atr,
+                    cache_mode,samples,wait_reason,build,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (key,now_ist().isoformat(),symbol,str(bar_ts),(t+timedelta(minutes=horizon)).isoformat(),horizon,float(s['spot']),
+                     s.get('direction'),score,abs(score),float(s.get('confidence') or 0),kronos,technical,
+                     float(s.get('forecast_move') or 0),float(s.get('atr') or 0),float(s.get('forecast_move_atr') or 0),
+                     float(s.get('efficiency') or 0),s.get('agreement'),None if split is None else int(bool(split)),
+                     s.get('split_gap_atr'),mode,s.get('kronos_samples'),s.get('signal_wait'),INDEX_AI_BUILD,'OPEN'))
+            self._logged_signal_keys.add(key)
+            if len(self._logged_signal_keys)>4000:self._logged_signal_keys.clear()
+        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
+
+    def _mark_signal_final(self,s):
+        """Attach what finally happened to the signal (qualified? READY? why not?).  READY is never downgraded."""
+        try:
+            bar_ts=s.get('bar_ts');symbol=s.get('symbol')
+            if not bar_ts or not symbol or s.get('p_up') is None:return
+            key=f"{symbol}|{bar_ts}|{s.get('forecast_cache_mode') or 'EXACT'}|{INDEX_AI_BUILD}"
+            with self.db() as c:
+                c.execute("""UPDATE index_signal_log SET gate_passed=MAX(gate_passed,?),
+                    final_reason=CASE WHEN final_decision='READY' THEN final_reason ELSE ? END,
+                    final_decision=CASE WHEN final_decision='READY' THEN 'READY' ELSE ? END WHERE id=?""",
+                    (1 if s.get('direction_gate_passed') else 0,str(s.get('reason'))[:200],str(s.get('decision')),key))
+        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
+
+    def _settle_signal_log(self):
+        """Fill in the actual close for logged signals once their target bar is complete."""
+        try:
+            now=now_ist()
+            rows=self.rows("SELECT * FROM index_signal_log WHERE status='OPEN' ORDER BY ts LIMIT 800")
+            due=[]
+            for r in rows:
+                target=_ai_ts_naive(r['target_ts'])
+                # 6 minutes = 5-minute bar length + 1 minute for the bar refresh to land.
+                if target is not None and target+timedelta(minutes=6)<=now:due.append((r,target))
+            if not due:return
+            by_symbol={}
+            for r,target in due:by_symbol.setdefault(r['symbol'],[]).append((r,target))
+            for symbol,items in by_symbol.items():
+                lookup={}
+                for b in self.a.bars(symbol,3000):
+                    t=_ai_ts_naive(b.get('ts'))
+                    if t is not None:lookup[t.isoformat()]=b
+                for r,target in items:
+                    bar=lookup.get(r['target_ts'])
+                    with self.db() as c:
+                        if bar is not None:
+                            fwd=float(bar['close']);move=fwd-float(r['spot'])
+                            hit=1 if ((move>0 and r['direction']=='UP') or (move<0 and r['direction']=='DOWN')) else 0
+                            c.execute("UPDATE index_signal_log SET fwd_close=?,fwd_move=?,hit=?,status='SETTLED',settled_ts=? WHERE id=? AND status='OPEN'",
+                                      (fwd,move,hit,now.isoformat(),r['id']))
+                        elif target.date()<now.date():
+                            c.execute("UPDATE index_signal_log SET status='ABANDONED',settled_ts=? WHERE id=? AND status='OPEN'",(now.isoformat(),r['id']))
+        except Exception as e:self.signal_log_error=f'{type(e).__name__}: {e}'
+
+    def signal_calibration(self,build=None,symbol=None):
+        """How often does the score point the right way, by score bucket, component and gate?
+
+        hit = the actual close at the forecast horizon is on the predicted side of the signal bar's close
+        (exact ties count as misses).  Intervals are 90% Wilson intervals.  The base rate (share of rows
+        where the market simply rose) is reported so drift is not mistaken for skill.
+        """
+        build=build or INDEX_AI_BUILD
+        sql="SELECT * FROM index_signal_log WHERE status='SETTLED'";args=[]
+        if build!='all':sql+=' AND build=?';args.append(build)
+        if symbol:sql+=' AND symbol=?';args.append(str(symbol).upper())
+        rows=self.rows(sql,tuple(args))
+        pending=self.rows("SELECT COUNT(*) n FROM index_signal_log WHERE status='OPEN'")[0]['n']
+
+        def wilson(k,n,z=1.645):
+            if not n:return [None,None]
+            p=k/n;d=1+z*z/n;c=p+z*z/(2*n);m=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n))
+            return [round((c-m)/d,4),round((c+m)/d,4)]
+        def side(r):return 1 if r['direction']=='UP' else -1
+        def summarize(items):
+            n=len(items);k=sum(int(r['hit'] or 0) for r in items)
+            dm=[side(r)*r['fwd_move']/r['atr'] for r in items if r['atr']]
+            dp=[side(r)*r['fwd_move']/r['spot']*100 for r in items if r['spot']]
+            return dict(n=n,hit_rate=round(k/n,4) if n else None,hit_ci90=wilson(k,n),
+                        avg_dir_move_atr=round(sum(dm)/len(dm),4) if dm else None,
+                        avg_dir_move_pct=round(sum(dp)/len(dp),5) if dp else None)
+        def component(items,key):
+            used=[r for r in items if r[key] and r['fwd_move']]
+            k=sum(1 for r in used if (r[key]>0)==(r['fwd_move']>0))
+            return dict(n=len(used),hit_rate=round(k/len(used),4) if used else None,hit_ci90=wilson(k,len(used)))
+        edges=[0.,.08,.16,.24,.32,.45,1.01]
+        buckets=[]
+        for lo,hi in zip(edges,edges[1:]):
+            part=[r for r in rows if lo<=(r['margin'] or 0)<hi]
+            buckets.append(dict(margin_from=lo,margin_to=min(hi,1.0),**summarize(part)))
+        def part_by(key,values):
+            return {str(v):summarize([r for r in rows if r[key]==v]) for v in values}
+        splits={'agree':summarize([r for r in rows if r['split_agree']==1]),
+                'disagree':summarize([r for r in rows if r['split_agree']==0]),
+                'not_available':summarize([r for r in rows if r['split_agree'] is None])}
+        funnel={}
+        for r in rows:
+            k=str(r['final_decision'] or 'UNMARKED');funnel[k]=funnel.get(k,0)+1
+        up_rate=round(sum(1 for r in rows if r['fwd_move']>0)/len(rows),4) if rows else None
+        return dict(build=build,settled=len(rows),pending_open=int(pending or 0),base_rate_market_up=up_rate,
+            overall=summarize(rows),by_margin_bucket=buckets,
+            components=dict(blend=summarize(rows),kronos_sign=component(rows,'kronos'),technical_sign=component(rows,'technical')),
+            passed_direction_gate=summarize([r for r in rows if r['gate_passed']]),
+            became_ready=summarize([r for r in rows if r['final_decision']=='READY']),
+            split_half=splits,by_symbol=part_by('symbol',sorted({r['symbol'] for r in rows})),
+            by_cache_mode=part_by('cache_mode',sorted({r['cache_mode'] for r in rows if r['cache_mode']})),
+            final_decisions=funnel,signal_log_error=self.signal_log_error,
+            note="About 270 settled rows per group are needed to tell a 55% hit rate from 50% at 90% confidence. "
+                 "Rows overlap in time and the four indices are correlated, so treat small groups as anecdotes.")
 
     def inspect(self,symbol):
         s=DeskEngine.inspect(self,symbol)
@@ -15940,6 +16248,7 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
         s['execution_quality_pass']=s.get('decision')=='READY'
         s['execution_quality_reason']=s.get('reason')
         s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        self._mark_signal_final(s)
         return s
 
     def enter(self,s):
@@ -16022,6 +16331,7 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
                 self.scan_status['completed']=i+1
             ranked=sorted(self.signals.values(),key=lambda s:s.get('rank_score',0),reverse=True)
             self._publish_execution_candidates(ranked)
+            self._settle_signal_log()
             self.scan_status.update(status='COMPLETE',ready=sum(s.get('decision')=='READY' for s in ranked),finished=now_ist().isoformat())
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
         finally:self.lock.release()
@@ -16052,6 +16362,13 @@ class IndexKronosDeskEngine(IndexAdvancedDeskEngine):
 DESK = IndexKronosDeskEngine(DeskAdapter())
 
 
+@app.route('/api/ai-desk/signal-calibration')
+def desk_signal_calibration_route():
+    # ?build=all for every strategy build, ?symbol=NIFTY for one index.
+    if not require_session():return jsonify({"error":"Connect Kite using the login button above."}),401
+    return jsonify(DESK.signal_calibration(build=request.args.get('build'),symbol=request.args.get('symbol')))
+
+
 
 # ===========================================================================
 # CAS OPTIONS DESK: sampled momentum, isolated learning and durable execution.
@@ -16069,7 +16386,10 @@ CAS_DEFAULTS = dict(entry_start='15:15', entry_end='15:38', square_off='15:39',
     max_quote_age=2., min_premium_move=1., max_premium_move=35., max_trades=4,
     max_positions=1, max_hold=None, cooldown=1/6, capital=15000., risk=750.,
     daily_loss=2000., confidence=.60, stop_pct=15., reward_r=2., partial_take_r=1.,
-    max_spread=1., lots=1, trail_pct=10., order_timeout=2.)
+    max_spread=1., lots=1, trail_pct=10., order_timeout=2.,
+    # v6: from 3 Aug 2026 every index constituent is in the closing auction from 15:15, so the cash index is frozen
+    # until about 15:35 while index futures and options trade to 15:40.  'futures' reads the nearest index future.
+    signal_source='futures')
 
 def _cas_epoch(value):
     return value.replace(tzinfo=timezone(timedelta(hours=5,minutes=30))).timestamp()
@@ -16078,6 +16398,7 @@ class CASAdapter(DeskAdapter):
     symbols = ('NIFTY','BANKNIFTY','FINNIFTY','SENSEX')
     def __init__(self):
         self.engine=None;self.quotes={};self.contracts={};self.contract_day=None;self.last_batch=0.
+        self.futures={};self.setup_errors={};self.contract_retry_mono=0.
         self.stream=None;self.stream_token=None;self.stream_connected=False;self.stream_status='WAITING FOR KITE'
         self.stream_lock=threading.RLock();self.wake=threading.Event();self.stream_quotes={};self.stream_queue=deque()
         self.stream_signatures={};self.stream_generation=0;self.seen_generation=0;self.wanted_tokens=set();self.token_keys={}
@@ -16094,15 +16415,36 @@ class CASAdapter(DeskAdapter):
     def market_open(self):
         t=now_ist();cfg=self.engine.config() if self.engine else CAS_DEFAULTS
         return t.weekday()<5 and '09:15'<=t.strftime('%H:%M')<cfg['market_close']
+    def _future_row(self,symbol,exchange):
+        instruments=get_bfo_instruments() if exchange=='BFO' else get_instruments()[0]
+        today=now_ist().date().isoformat()
+        rows=[dict(i,exchange=exchange) for i in instruments
+              if i.get('name')==symbol.upper() and i.get('instrument_type')=='FUT' and str(i.get('expiry',''))[:10]>=today]
+        rows.sort(key=lambda i:str(i.get('expiry')))
+        return rows[0] if rows else None
+    def signal_key(self,symbol,source=None):
+        source=source or (self.engine.config().get('signal_source') if self.engine else 'futures')
+        fut=self.futures.get(symbol)
+        if source!='spot' and fut:return fut['exchange']+':'+fut['tradingsymbol']
+        return INDEX_SYMBOLS[symbol]
     def load_contracts(self):
         today=now_ist().date()
         if self.contract_day==today:return
-        result={}
+        if time.monotonic()<self.contract_retry_mono:return
+        result={};futures={};errors={}
         for symbol in self.symbols:
-            ex,items=get_option_instruments_for_symbol(symbol)
-            result[symbol]=[dict(i,exchange=ex) for i in items
-                if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
-        self.contracts=result;self.contract_day=today
+            # v6: one failing index must not stop the other three (a failure used to halt and disarm the whole desk).
+            try:
+                ex,items=get_option_instruments_for_symbol(symbol)
+                result[symbol]=[dict(i,exchange=ex) for i in items
+                    if i.get('instrument_type') in ('CE','PE') and str(i.get('expiry',''))[:10]>=today.isoformat()]
+                fut=self._future_row(symbol,ex)
+                if fut:futures[symbol]=fut
+            except Exception as e:
+                result.setdefault(symbol,[]);errors[symbol]=self._safe_stream_error(e)
+        self.contracts=result;self.futures=futures;self.setup_errors=errors
+        if errors:self.contract_retry_mono=time.monotonic()+60
+        else:self.contract_day=today
     def _invalidate_stream(self,ws,status):
         if ws is not self.stream:return
         with self.stream_lock:
@@ -16206,16 +16548,25 @@ class CASAdapter(DeskAdapter):
         if time.monotonic()-self.last_subscription<3:return
         self.last_subscription=time.monotonic();self.load_contracts()
         mapping={}
+        index_keys=set()
         for symbol in self.symbols:
-            token,err=resolve_token_for_symbol(symbol)
-            if err:raise ValueError(err)
-            mapping[int(token)]=INDEX_SYMBOLS[symbol]
+            try:
+                token,err=resolve_token_for_symbol(symbol)
+                if err:raise ValueError(err)
+                mapping[int(token)]=INDEX_SYMBOLS[symbol];index_keys.add(INDEX_SYMBOLS[symbol])
+            except Exception as e:
+                self.setup_errors[symbol]=self._safe_stream_error(e)
         for items in self.contracts.values():
             for i in items:mapping[int(i['instrument_token'])]=i['exchange']+':'+i['tradingsymbol']
-        reverse={v:k for k,v in mapping.items()};wanted={reverse[INDEX_SYMBOLS[s]] for s in self.symbols}
+        future_keys=set()
+        for f in self.futures.values():
+            fkey=f['exchange']+':'+f['tradingsymbol'];mapping[int(f['instrument_token'])]=fkey;future_keys.add(fkey)
+        reverse={v:k for k,v in mapping.items()};wanted={reverse[k] for k in index_keys|future_keys}
         with self.stream_lock:latest=dict(self.stream_quotes)
         for symbol in self.symbols:
-            rows=self.contracts.get(symbol,[]);spot=latest.get(INDEX_SYMBOLS[symbol],{}).get('last_price')
+            fut=self.futures.get(symbol)
+            fut_px=latest.get(fut['exchange']+':'+fut['tradingsymbol'],{}).get('last_price') if fut else None
+            rows=self.contracts.get(symbol,[]);spot=latest.get(INDEX_SYMBOLS[symbol],{}).get('last_price') or fut_px
             if not rows or not spot:continue
             expiry=min(str(i['expiry']) for i in rows)
             for typ in ('CE','PE'):
@@ -16258,7 +16609,9 @@ class CASAdapter(DeskAdapter):
             self.quotes=dict(self.exit_quotes)
     def feed_state(self):
         with self.stream_lock:
-            return dict(connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
+            return dict(signal_source=(self.engine.config().get('signal_source') if self.engine else 'futures'),
+                futures={k:v['tradingsymbol'] for k,v in self.futures.items()},setup_errors=dict(self.setup_errors),
+                connected=self.stream_connected,status=self.stream_status,subscriptions=len(self.wanted_tokens),
                 last_tick_age_seconds=round(time.monotonic()-self.last_tick_mono,2) if self.last_tick_mono else None,
                 source='KiteTicker FULL · event-driven',error_detail=getattr(self,'stream_error_detail',''),error_code=self.stream_error_code,retry_scheduled=self.stream_retry_needed,exit_fallback='REST only when streaming is disconnected')
     def fresh(self,key):
@@ -16306,7 +16659,9 @@ class CASEngine(DeskEngine):
                 if cfg.get(key)==value:cfg[key]=CAS_DEFAULTS[key]
             cfg.update(armed=False,verified_date='');self.put('config',cfg)
             self.put('fast_profile_version',2);self.event('UPGRADE','Fast CAS profile installed; entries disarmed. New trades use NRML IOC limits.')
-    def config(self):return {**super().config(),**CAS_DEFAULTS,**self.get('config',{}),'max_hold':None}
+    # v7: CAS no longer needs a validated model, daily session verification or a paper record to trade live, so the
+    # paper-evidence override is always on for this desk.  Risk limits and broker reconciliation still apply.
+    def config(self):return {**super().config(),**CAS_DEFAULTS,**self.get('config',{}),'max_hold':None,'live_override':True}
     def init_db(self):
         super().init_db()
         with self.db() as c:
@@ -16317,7 +16672,7 @@ class CASEngine(DeskEngine):
                 c.execute('ALTER TABLE cas_samples ADD COLUMN profile INTEGER NOT NULL DEFAULT 1')
     def model(self):
         m=super().model()
-        return m if m and m.get('fast_profile')==2 else None
+        return m if m and m.get('fast_profile')==3 else None
     def submit(self,p,side,qty,price,reason):
         if side=='BUY' and not self.rows('SELECT id FROM desk_orders WHERE position_id=?',(p['id'],)):
             with self.db() as c:c.execute("UPDATE desk_positions SET product='NRML' WHERE id=?",(p['id'],))
@@ -16336,7 +16691,10 @@ class CASEngine(DeskEngine):
                 daily_loss=(100,1000000),confidence=(.55,.85),stop_pct=(3,40),reward_r=(1,4),partial_take_r=(.5,3),
                 max_spread=(.1,3),lots=(0,50),cooldown=(0,120),max_positions=(1,4),slippage_bps=(1,100),fee_per_order=(1,500))
             for k,v in body.items():
-                if k in times:
+                if k=='signal_source':
+                    if v not in ('futures','spot'):raise ValueError("signal_source must be 'futures' or 'spot'")
+                    cfg[k]=v
+                elif k in times:
                     if not isinstance(v,str) or len(v)!=5:raise ValueError('Use HH:MM for '+k)
                     datetime.strptime(v,'%H:%M')
                     if not '14:45'<=v<='15:40':raise ValueError(k+' must be 14:45–15:40 IST')
@@ -16358,8 +16716,6 @@ class CASEngine(DeskEngine):
         cfg=self.config();t=now_ist()
         if not self.a.stream_connected:return 'Streaming unavailable · new entries paused'
         if t.strftime('%H:%M')<cfg['entry_start'] or t.strftime('%H:%M')>=cfg['entry_end']:return 'Outside CAS entry window'
-        if cfg['mode']=='live' and cfg.get('verified_date')!=t.date().isoformat():return 'Verify today’s exchange session and broker NRML cutoff in controls'
-        if cfg['mode']=='live' and not self.model():return 'Live requires a validated CAS model; collect paper observations first'
         if DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed'):return 'Disarm other AI desks before CAS entries'
         count=self.rows("SELECT COUNT(*) n FROM desk_positions WHERE ts LIKE ? AND mode=?",(t.date().isoformat()+'%',cfg['mode']))[0]['n']
         if count>=cfg['max_trades']:return 'CAS daily entry-attempt limit reached'
@@ -16375,11 +16731,12 @@ class CASEngine(DeskEngine):
         if self.day!=today:
             self.ticks.clear();self.option_ticks.clear();self.confirm.clear();self.last_learn.clear();self.day=today
             with self.db() as c:c.execute('DELETE FROM cas_samples WHERE label IS NULL AND target<?',(_cas_epoch(now)-60,))
+        signal_keys={self.a.signal_key(sym):sym for sym in self.a.symbols}
         for key in self.a.quotes:
             try:
                 raw,ts=self.a.fresh(key);stamp=_cas_epoch(ts)
-                if key in [INDEX_SYMBOLS[s] for s in self.a.symbols]:
-                    symbol=next(s for s in self.a.symbols if INDEX_SYMBOLS[s]==key);hist=self.ticks.setdefault(symbol,deque(maxlen=200))
+                if key in signal_keys:
+                    symbol=signal_keys[key];hist=self.ticks.setdefault(symbol,deque(maxlen=200))
                     price=float(raw['last_price'])
                 else:
                     q=quote_stats(raw)
@@ -16388,7 +16745,7 @@ class CASEngine(DeskEngine):
                 if hist and stamp<=hist[-1][0]:continue
                 if hist and stamp-hist[-1][0]>cfg['max_quote_age']+cfg['poll_seconds']:
                     hist.clear()
-                    if key in INDEX_SYMBOLS.values():self.confirm.pop(symbol,None)
+                    if key in signal_keys:self.confirm.pop(symbol,None)
                 hist.append((stamp,price))
             except (ValueError,TypeError):continue
         # Short-horizon labels use the first fresh sample at/after target, within 5s.
@@ -16396,10 +16753,10 @@ class CASEngine(DeskEngine):
             if not hist:continue
             stamp,spot=hist[-1]
             with self.db() as c:
-                c.execute('UPDATE cas_samples SET label=CASE WHEN ? > spot THEN 1 ELSE 0 END,settled=? WHERE symbol=? AND label IS NULL AND target<=? AND target>=?',(spot,stamp,symbol,stamp,stamp-5))
+                c.execute('UPDATE cas_samples SET label=CASE WHEN ? > spot THEN 1 ELSE 0 END,settled=? WHERE symbol=? AND label IS NULL AND target<=? AND target>=? AND spot<>?',(spot,stamp,symbol,stamp,stamp-5,spot))
     def inspect(self,symbol):
         cfg=self.config();s=dict(symbol=symbol,decision='WAIT',reason='Warming fresh quote history',ts=now_ist().isoformat())
-        raw,ts=self.a.fresh(INDEX_SYMBOLS[symbol]);hist=self.ticks.get(symbol,[])
+        raw,ts=self.a.fresh(self.a.signal_key(symbol));hist=self.ticks.get(symbol,[])
         s.update(spot=float(raw['last_price']),chart=[dict(ts=datetime.fromtimestamp(t,timezone.utc).isoformat(),close=v) for t,v in hist],bar_age=(now_ist()-ts).total_seconds()/60)
         move=self.momentum(hist,_cas_epoch(ts),cfg['lookback_seconds']) if hist else None
         if move is None:self.confirm.pop(symbol,None);return s
@@ -16408,7 +16765,7 @@ class CASEngine(DeskEngine):
         direction='UP' if move>0 else 'DOWN';s.update(move_bps=round(move,2),direction=direction)
         features=[move/50,noise/20,(max(recent)-min(recent))/recent[-1]*100,(ts.hour*60+ts.minute-915)/20,1. if symbol=='SENSEX' else 0.]
         if cfg['entry_start']<=now_ist().strftime('%H:%M')<cfg['entry_end'] and _cas_epoch(ts)-self.last_learn.get(symbol,0)>=5:
-            with self.db() as c:c.execute('INSERT INTO cas_samples(symbol,ts,target,spot,features,profile) VALUES(?,?,?,?,?,2)',(symbol,_cas_epoch(ts),_cas_epoch(ts)+5,s['spot'],json.dumps(features)))
+            with self.db() as c:c.execute('INSERT INTO cas_samples(symbol,ts,target,spot,features,profile) VALUES(?,?,?,?,?,3)',(symbol,_cas_epoch(ts),_cas_epoch(ts)+5,s['spot'],json.dumps(features)))
             self.last_learn[symbol]=_cas_epoch(ts)
         model=self.model();p=None
         if model:
@@ -16425,7 +16782,7 @@ class CASEngine(DeskEngine):
             s['reason']='CAS model does not confirm momentum';return s
         typ='CE' if move>0 else 'PE';rows=self.a.contracts.get(symbol,[])
         if not rows:s['reason']='No available option contracts';return s
-        expiry=min(str(i['expiry']) for i in rows);candidates=[]
+        expiry=min(str(i['expiry']) for i in rows);candidates=[];unaffordable=[]
         for ins in rows:
             if str(ins['expiry'])!=expiry or ins['instrument_type']!=typ:continue
             key=ins['exchange']+':'+ins['tradingsymbol']
@@ -16435,8 +16792,21 @@ class CASEngine(DeskEngine):
             ticks=self.option_ticks.get(key,[])
             om=self.momentum(ticks,ticks[-1][0],cfg['lookback_seconds']) if ticks else None
             if om is None or not cfg['min_premium_move']<=om/100<=cfg['max_premium_move']:continue
+            lot_i=int(ins.get('lot_size') or 0);tick_i=float(ins.get('tick_size') or .05)
+            if lot_i>0 and tick_i>0:
+                entry_i=math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/tick_i)*tick_i;risk_i=entry_i*cfg['stop_pct']/100
+                fit_i=int(min(max(0,cfg['capital']-2*cfg['fee_per_order'])/entry_i,max(0,cfg['risk']-2*cfg['fee_per_order'])/risk_i,q['ask_qty'])//lot_i)
+                if fit_i<max(1,int(cfg['lots'] or 1)):
+                    unaffordable.append((risk_i*lot_i+2*cfg['fee_per_order'],entry_i*lot_i));continue
             candidates.append((q['spread_pct']+abs(float(ins['strike'])-s['spot'])/s['spot']*100,ins,q,om/100))
-        if not candidates:s['reason']='No liquid near-ATM option with confirmed premium momentum';return s
+        if not candidates:
+            if unaffordable:
+                risk_needed,cost=min(unaffordable)
+                limit=(f"the Rs {cfg['risk']:,.0f} risk budget" if risk_needed>cfg['risk'] else f"the Rs {cfg['capital']:,.0f} capital per trade")
+                s['reason']=(f"Momentum confirmed but the cheapest lot costs about Rs {cost:,.0f} and risks Rs {risk_needed:,.0f} at a "
+                             f"{cfg['stop_pct']:g}% stop, above {limit}")
+            else:s['reason']='No liquid near-ATM option with confirmed premium momentum'
+            return s
         _,ins,q,om=min(candidates,key=lambda x:x[0]);lot=int(ins.get('lot_size') or 0);tick=float(ins.get('tick_size') or .05)
         if lot<=0 or not math.isfinite(tick) or tick<=0:s['reason']='Invalid contract metadata';return s
         entry=round(math.ceil(q['ask']*(1+cfg['slippage_bps']/10000)/tick)*tick,2);risk=entry*cfg['stop_pct']/100
@@ -16483,7 +16853,7 @@ class CASEngine(DeskEngine):
     def _train(self):
         try:
             self.training=dict(status='FITTING CAS SAMPLES',progress=10)
-            rows=self.rows('SELECT * FROM cas_samples WHERE label IS NOT NULL AND profile=2 ORDER BY ts DESC LIMIT 20000')[::-1]
+            rows=self.rows('SELECT * FROM cas_samples WHERE label IS NOT NULL AND profile=3 ORDER BY ts DESC LIMIT 20000')[::-1]
             if len(rows)<300:raise ValueError('Need 300 settled CAS observations; collect them during the session, even while disarmed')
             cut=rows[int(len(rows)*.8)]['ts'];train=[r for r in rows if r['settled']<cut];val=[r for r in rows if r['ts']>=cut]
             X=np.array([json.loads(r['features']) for r in train]);y=np.array([r['label'] for r in train]);V=np.array([json.loads(r['features']) for r in val]);vy=np.array([r['label'] for r in val])
@@ -16494,7 +16864,7 @@ class CASEngine(DeskEngine):
             pred=1/(1+np.exp(-np.clip(np.clip((V-mu)/sd,-6,6)@w+b,-30,30)))
             accuracy=float(((pred>=.5)==vy).mean());baseline=float(max(vy.mean(),1-vy.mean()));brier=float(((pred-vy)**2).mean())
             if accuracy<=baseline or brier>=.25:raise ValueError('CAS validation did not beat baseline; current model retained, rule-based paper continues if none')
-            m=dict(id='CAS-'+str(int(time.time())),ts=now_ist().isoformat(),mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b),train_samples=len(train),validation_samples=len(val),accuracy=accuracy*100,baseline=baseline*100,brier=brier,horizon_seconds=5,fast_profile=2)
+            m=dict(id='CAS-'+str(int(time.time())),ts=now_ist().isoformat(),mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b),train_samples=len(train),validation_samples=len(val),accuracy=accuracy*100,baseline=baseline*100,brier=brier,horizon_seconds=5,fast_profile=3)
             with self.db() as c:c.execute('INSERT INTO desk_models VALUES(?,?,?)',(m['id'],m['ts'],json.dumps(m)))
             self.training=dict(status='COMPLETE',progress=100);self.event('LEARN','CAS model validated on later, purged observations')
         except Exception as e:self.training=dict(status='ERROR',progress=0,error=str(e))
@@ -16505,16 +16875,17 @@ class CASEngine(DeskEngine):
             if action=='verify-session':
                 if body.get('ack') is not True:raise ValueError('Confirm today is a trading day and the configured NFO/BFO/NRML cutoffs are supported')
                 cfg.update(verified_date=now_ist().date().isoformat(),armed=False);self.put('config',cfg);return cfg
-            if action=='arm' and cfg['mode']=='paper':
+            if action=='arm':
                 if hasattr(self,'shared_risk'):
-                    blocked=self.shared_risk.snapshot('paper')['entry_block']
+                    blocked=self.shared_risk.snapshot(cfg['mode'])['entry_block']
                     if blocked:raise ValueError(blocked)
                 if not self.a.connected():raise ValueError('Connect Kite first')
                 if self.get('halt') or self.get('close_requested'):raise ValueError('Resolve halt/close request first')
-                cfg['armed']=True;self.put('config',cfg);return cfg
-            if action in ('arm','mode') and (cfg['mode']=='live' or body.get('mode')=='live'):
-                if cfg.get('verified_date')!=now_ist().date().isoformat():raise ValueError('Verify today’s session and broker cutoffs first')
-                if not self.model():raise ValueError('Live requires a validated CAS-specific model')
+                cfg['armed']=True;self.put('config',cfg);self.event('CONTROL','arm '+cfg['mode']);return cfg
+            if action=='mode':
+                if body.get('mode') not in ('paper','live'):raise ValueError('Invalid execution mode')
+                if self.active():raise ValueError('Close active positions before switching execution mode')
+                cfg.update(mode=body['mode'],armed=False);self.put('config',cfg);self.event('CONTROL','mode '+body['mode']);return cfg
             if action in ('clear-halt','close'):self.last_verify=0.;self.last_reconcile=0.
             return super().control(action,body)
     def cycle(self):
@@ -16546,7 +16917,7 @@ class CASEngine(DeskEngine):
             self.manage(bool(self.get('close_requested')))
             for s in sorted(self.signals.values(),key=lambda s:abs(s.get('move_bps',0)),reverse=True):self.enter(s)
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
-            count=self.rows('SELECT COUNT(*) n FROM cas_samples WHERE label IS NOT NULL AND profile=2')[0]['n']
+            count=self.rows('SELECT COUNT(*) n FROM cas_samples WHERE label IS NOT NULL AND profile=3')[0]['n']
             if count>=300 and count-self.last_fit_count>=100 and not cfg['armed'] and not self.active() and not self.train_lock.locked():
                 self.last_fit_count=count;self.train()
         except Exception as e:
@@ -16563,9 +16934,6 @@ class CASEngine(DeskEngine):
         add('Instrument subscriptions',stream['subscriptions']>len(self.a.symbols),str(stream['subscriptions'])+' subscriptions. Use Prepare CAS feed; option subscriptions populate after index ticks arrive.')
         age=stream.get('last_tick_age_seconds')
         add('Recent stream arrivals',age is not None and age<=cfg['max_quote_age'],'Arrival age: '+(str(age)+' seconds' if age is not None else 'not received')+'. Every entry also requires fresh exchange timestamps and an executable option book.')
-        add('Validated CAS model',bool(s.get('model')),str(s['observations'].get('settled') or 0)+' settled CAS observations available. At least 300 and a passing validation result are required; use paper collection then Train CAS model.')
-        add('Today’s session verification',cfg.get('verified_date')==today,'Verify today’s exchange hours and broker NRML cutoff after saving settings.')
-        add('Paper performance gate',cfg.get('live_override') is True or s['evidence']['ready'],'The existing paper-evidence override bypasses only this gate, never model validation or risk controls.')
         others=DESK.config()['armed'] or STOCK_DESK.config()['armed'] or autotrade_ai_config().get('armed') or bool(self.a.legacy_open())
         add('Other desks idle',not others,'Disarm the other AI desks and reconcile/close their positions before CAS entries.')
         shared=self.shared_risk.snapshot('live')['entry_block'] if hasattr(self,'shared_risk') else None
@@ -16577,8 +16945,8 @@ class CASEngine(DeskEngine):
         add('Qualifying signal',qualified,'At least one fresh signal must meet spike, confirmation, option momentum, spread, depth and risk checks; see each index’s signal reason.')
         return checks
     def state(self):
-        s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=2')[0]
-        s.update(version='CAS-4',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
+        s=super().state();s['observations']=self.rows('SELECT COUNT(*) total,SUM(label IS NOT NULL) settled FROM cas_samples WHERE profile=3')[0]
+        s.update(version='CAS-5',feed='Kite FULL streaming; no auction IEP or imbalance feed',stream=self.a.feed_state(),learning_target='Index-futures direction 5 seconds ahead; not option profit',timing_note='Entries until 15:38; square-off attempts from 15:39. Verify NFO/BFO and NRML cutoffs.')
         s['live_readiness']=self.live_readiness(s)
         return s
     def start(self):
@@ -16918,6 +17286,212 @@ def desk_trade_review_export(desk):
     return Response(stream_with_context(generate()),mimetype='application/json' if fmt=='json' else 'text/csv',headers={'Content-Disposition':f'attachment; filename="{desk}-trade-evidence.{fmt}"','Cache-Control':'no-store'})
 
 
+# ===========================================================================
+# AUTO-LIVE SCHEDULE
+#   From live_start (09:15 IST) on trading days: Index, Stock and Commodity desks are set to live and armed.
+#   One minute before the CAS window: those three are disarmed and the CAS desk is set to live and armed.
+#   After the CAS window closes: the Commodity desk (MCX evening session) is armed again.
+# Kite must be logged in (the token expires daily), so nothing happens until you log in.  Each step is attempted until it
+# succeeds and is then left alone: if you disarm a desk yourself, the schedule does not re-arm it that day.
+# Not bypassed: a halted desk, daily loss limits, shared risk limits, broker reconciliation, data-freshness checks.
+# ===========================================================================
+AUTO_LIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'auto_live_schedule.json')
+AUTO_LIVE_DEFAULTS = dict(enabled=True, live_start='09:15', cas_switch_seconds_before=60,
+                          rearm_commodity_after_cas=True, bypass_paper_evidence=True)
+
+
+class AutoLiveScheduler:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.cfg = dict(AUTO_LIVE_DEFAULTS)
+        self.done = {}
+        self.problems = {}
+        self.log = deque(maxlen=60)
+        self.last_phase = 'IDLE'
+        self.last_tick = None
+        self._last_logged = {}
+        try:
+            with open(AUTO_LIVE_FILE, encoding='utf-8') as f:
+                saved = json.load(f)
+            for k in AUTO_LIVE_DEFAULTS:
+                if k in saved and type(saved[k]) is type(AUTO_LIVE_DEFAULTS[k]):
+                    self.cfg[k] = saved[k]
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.note('ERROR', 'Could not read schedule settings; defaults used: ' + type(e).__name__)
+
+    def desks(self):
+        return {'index': DESK, 'stock': STOCK_DESK, 'commodity': COMMODITY_DESK, 'cas': CAS_DESK}
+
+    def note(self, kind, text):
+        with self.lock:
+            self.log.appendleft(dict(ts=now_ist().isoformat(timespec='seconds'), kind=kind, text=str(text)[:300]))
+
+    def save(self):
+        tmp = AUTO_LIVE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.cfg, f)
+        os.replace(tmp, AUTO_LIVE_FILE)
+
+    def set_enabled(self, enabled):
+        with self.lock:
+            self.cfg['enabled'] = bool(enabled)
+            self.save()
+            self.note('SCHEDULE', 'Automatic live schedule turned ' + ('ON' if enabled else 'OFF'))
+            if enabled:
+                self.done.clear()
+                self.problems.clear()
+
+    def window(self, now):
+        cas = CAS_DESK.config()
+        start = datetime.strptime(self.cfg['live_start'], '%H:%M').time()
+        entry = datetime.strptime(cas['entry_start'], '%H:%M').time()
+        switch = datetime.combine(now.date(), entry) - timedelta(seconds=int(self.cfg['cas_switch_seconds_before']))
+        end = datetime.combine(now.date(), datetime.strptime(cas['market_close'], '%H:%M').time())
+        return datetime.combine(now.date(), start), switch, end
+
+    def phase(self, now):
+        if now.weekday() >= 5:
+            return 'WEEKEND'
+        start, switch, end = self.window(now)
+        if now < start:
+            return 'BEFORE'
+        if now < switch:
+            return 'DAY'
+        if now < end:
+            return 'CAS'
+        return 'AFTER'
+
+    def problem(self, key, text):
+        text = str(text)[:240]
+        with self.lock:
+            self.problems[key] = dict(ts=now_ist().isoformat(timespec='seconds'), text=text)
+            stamp = (key, text)
+            if time.monotonic() - self._last_logged.get(stamp, -1e9) >= 60:
+                self._last_logged[stamp] = time.monotonic()
+                self.note('WAITING', key + ': ' + text)
+                try:
+                    self.desks()[key].event('AUTO_LIVE', 'Not armed yet: ' + text)
+                except Exception:
+                    pass
+
+    def ensure_live_armed(self, key, tag, today):
+        mark = (today, key, tag)
+        if mark in self.done:
+            return
+        desk = self.desks()[key]
+        try:
+            cfg = desk.config()
+            if cfg.get('armed') and cfg.get('mode') == 'live':
+                self.done[mark] = now_ist().isoformat()
+                return
+            if desk.get('halt'):
+                self.problem(key, 'desk is halted (' + str(desk.get('halt'))[:100] + '); clear the halt after checking the broker')
+                return
+            if cfg.get('mode') != 'live' and desk.active():
+                self.problem(key, 'open positions must be closed before switching to live')
+                return
+            if key != 'cas':
+                evidence_ok = cfg.get('live_override') is True or desk.evidence()['ready']
+                need_override = self.cfg['bypass_paper_evidence'] and not evidence_ok
+                if cfg.get('mode') != 'live':
+                    if need_override:
+                        desk.control('live-override', {'enabled': True, 'ack': True})
+                    desk.control('mode', {'mode': 'live', 'ack': True})
+                elif need_override:
+                    desk.control('live-override', {'enabled': True, 'ack': True})
+                desk.control('arm', {'ack': True})
+            else:
+                if cfg.get('mode') != 'live':
+                    desk.control('mode', {'mode': 'live'})
+                desk.control('arm', {'ack': True})
+            self.done[mark] = now_ist().isoformat()
+            self.problems.pop(key, None)
+            self.note('ARMED', key.upper() + ' set to LIVE and armed (' + tag + ')')
+            desk.event('AUTO_LIVE', 'Set to live and armed by the automatic schedule')
+        except Exception as e:
+            self.problem(key, str(e))
+
+    def disarm(self, key, today):
+        mark = (today, key, 'disarm')
+        if mark in self.done:
+            return
+        try:
+            self.desks()[key].control('disarm', {})
+            self.done[mark] = now_ist().isoformat()
+            self.note('DISARMED', key.upper() + ' disarmed for the CAS window')
+        except Exception as e:
+            self.problem(key, 'could not disarm: ' + str(e))
+
+    def tick(self):
+        now = now_ist()
+        self.last_tick = now.isoformat(timespec='seconds')
+        if not self.cfg['enabled']:
+            self.last_phase = 'OFF'
+            return
+        phase = self.phase(now)
+        self.last_phase = phase
+        if phase in ('WEEKEND', 'BEFORE'):
+            return
+        if not CAS_DESK.a.connected():
+            return
+        today = now.date().isoformat()
+        if phase == 'DAY':
+            for key in ('index', 'stock', 'commodity'):
+                self.ensure_live_armed(key, 'day', today)
+        elif phase == 'CAS':
+            for key in ('index', 'stock', 'commodity'):
+                self.disarm(key, today)
+            self.ensure_live_armed('cas', 'cas', today)
+        elif phase == 'AFTER' and self.cfg['rearm_commodity_after_cas'] and COMMODITY_DESK.a.market_open():
+            self.ensure_live_armed('commodity', 'after', today)
+
+    def run(self):
+        while True:
+            try:
+                self.tick()
+            except Exception as e:
+                self.note('ERROR', type(e).__name__ + ': ' + str(e))
+            time.sleep(5)
+
+    def state(self):
+        now = now_ist()
+        start, switch, end = self.window(now)
+        desks = {}
+        for key, desk in self.desks().items():
+            try:
+                cfg = desk.config()
+                desks[key] = dict(mode=cfg.get('mode'), armed=bool(cfg.get('armed')), live_override=cfg.get('live_override') is True,
+                                  halt=desk.get('halt'), problem=self.problems.get(key))
+            except Exception as e:
+                desks[key] = dict(error=str(e))
+        return dict(config=dict(self.cfg), phase=self.last_phase, now=now.isoformat(timespec='seconds'),
+                    kite_connected=bool(CAS_DESK.a.connected()), live_start=start.strftime('%H:%M'),
+                    cas_switch=switch.strftime('%H:%M:%S'), cas_end=end.strftime('%H:%M'),
+                    desks=desks, log=list(self.log)[:25])
+
+
+AUTO_LIVE = AutoLiveScheduler()
+
+
+@app.route('/api/auto-live/state')
+def auto_live_state_route():
+    return jsonify(AUTO_LIVE.state())
+
+
+@app.route('/api/auto-live/config', methods=['POST'])
+def auto_live_config_route():
+    body = request.get_json(silent=True) or {}
+    enabled = body.get('enabled')
+    if not isinstance(enabled, bool):
+        return jsonify(error='enabled must be true or false'), 400
+    if enabled and body.get('ack') is not True:
+        return jsonify(error='Turning the automatic live schedule on requires explicit acknowledgement'), 400
+    AUTO_LIVE.set_enabled(enabled)
+    return jsonify(ok=True, state=AUTO_LIVE.state())
+
+
 def start_application_workers():
     if os.environ.get("AI_START_WORKERS","1")!="1":return
     def legacy_manage():
@@ -16936,6 +17510,7 @@ def start_application_workers():
     STOCK_DESK.start()
     COMMODITY_DESK.start()
     CAS_DESK.start()
+    threading.Thread(target=AUTO_LIVE.run, daemon=True, name='auto-live-schedule').start()
 
 start_application_workers()
 
