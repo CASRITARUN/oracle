@@ -22,7 +22,7 @@ IMPORTANT
 - Kite access tokens expire every day at ~6am IST. You will need to log in again each trading day.
 - Naked strangles carry theoretically unlimited risk on the call side.
 - ORDER EXECUTION IS REAL. Placing orders through this tool sends real orders to your live Zerodha
-  account using real money. Nothing is placed without you explicitly confirming on the preview screen.
+  account using real money. Stock AI has user-authorized scheduled live execution; manual baskets use previews.
   If one leg of a multi-leg order fails, you may be left holding a partial, unhedged position — the
   tool stops immediately on the first failure and tells you to check your Zerodha app right away.
 - REQUIRES kiteconnect >= 5.1.1 (`pip install --upgrade kiteconnect`). Exchanges now reject MARKET/
@@ -64,7 +64,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -1611,7 +1611,8 @@ def quote_stats(q):
     return {"bid": bid, "ask": ask, "mid": mid, "spread_pct": spread,
             "bid_qty": int(buys[0].get("quantity", 0)) if buys else 0,
             "ask_qty": int(sells[0].get("quantity", 0)) if sells else 0,
-            "volume": int(q.get("volume", 0) or 0), "oi": int(q.get("oi", 0) or 0)}
+            "volume": int(q.get("volume", 0) or 0), "oi": int(q.get("oi", 0) or 0),
+            "ask_levels": [{"price": float(x["price"]), "quantity": max(0, int(x.get("quantity") or 0))} for x in sells]}
 
 
 def option_quality(o, q):
@@ -10202,6 +10203,8 @@ def autotrade_ai_close_all(reason="Manual kill-switch"):
 
 
 def autotrade_ai_cycle():
+    return  # Retired: no new automatic entries.
+
     cfg = autotrade_ai_config()
     c = ai_db()
     c.execute("INSERT OR REPLACE INTO ai_runtime(key,value) VALUES('autotrade_ai_last_cycle_at',?)",
@@ -12121,7 +12124,7 @@ def _build_desk_engine_class():
                         cfg[k]=int(v) if k in ('max_positions','max_hold','cooldown','lots') else v
                     else:raise ValueError('Unsupported setting: '+k)
                 if cfg['partial_take_r']>=cfg['reward_r']:raise ValueError('Partial take-profit must be below the full target in R')
-                if cfg['risk']>cfg['capital']:raise ValueError('Risk budget exceeds capital per trade')
+                if not cfg.get('adaptive_risk') and cfg['risk']>cfg['capital']:raise ValueError('Risk budget exceeds capital per trade')
                 self.put('config',cfg);self.event('SETTINGS','Risk settings updated');return cfg
         def train(self):
             if not self.train_lock.acquire(False):return False
@@ -12493,6 +12496,8 @@ def _build_desk_engine_class():
                 recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
                 if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
                 s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
+                if (s.get('risk_plan') or {}).get('policy')=='adaptive-v1':
+                    plan=s['risk_plan'];s['risk_config_at_entry'].update(adaptive_risk=True,risk=plan.get('admitted_risk_budget',plan['risk_budget']),stop_pct=plan['stop_pct'],reward_r=plan['reward_r'],lots=s['lots'])
                 pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
                 with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                     (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
@@ -12519,6 +12524,9 @@ def _build_desk_engine_class():
                 q,err=self.a.quote(p['exchange'],p['contract'])
                 if err:
                     self.health[p['id']]={'reason':err};self.record_observation(p,error=err);continue
+                if hasattr(self,'adaptive_position_update'):
+                    try:self.adaptive_position_update(p,q,cfg)
+                    except Exception as e:self.record_trade(p['id'],'ADAPTIVE_STOP_ERROR',dict(error=str(e),note='Prior stop and normal exit supervision retained'))
                 bid=q['bid'];quote_age=max(0.,(datetime.now(IST)-dt(q['quote_ts'])).total_seconds()) if q.get('quote_ts') else 0.
                 self.health[p['id']]=dict(bid=bid,observed_mono=time.monotonic()-quote_age,reason='HOLD · within plan')
                 setup=json.loads(p['setup']);sig=self.signals.get(p['symbol'],{})
@@ -12534,7 +12542,7 @@ def _build_desk_engine_class():
                 elif cfg.get('max_hold') is not None and (datetime.now(IST)-dt(p['ts'])).total_seconds()>=cfg['max_hold']*60:reason='Maximum holding time'
                 elif self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
                 elif sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
-                elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-p['stop'])*cfg['partial_take_r']:reason='Partial profit at planned R'
+                elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-float((setup.get('risk_plan') or {}).get('initial_stop',p['stop'])))*float((setup.get('risk_plan') or {}).get('partial_take_r',cfg['partial_take_r'])):reason='Partial profit at planned R'
                 self.record_observation(p,q,decision=reason or 'HOLD')
                 if reason:
                     self.health[p['id']]['reason']=reason
@@ -12706,7 +12714,7 @@ def _build_desk_engine_class():
             if not timeline['events'] and orders:
                 timeline=dict(events=[dict(id='legacy-'+str(i),ts=o['ts'],kind='LEGACY_ORDER_RECORD',data=dict(side=o['side'],qty=o['qty'],filled=o['filled'],status=o['status'],reason=o.get('reason') or 'Not recorded',note='Historical order snapshot. This timestamp is the submission time, not a reconstructed fill timestamp.')) for i,o in enumerate(orders)],next_after=None)
             return dict(position={k:v for k,v in p.items() if k!='setup'},
-                entry_plan={k:setup.get(k) for k in ('ts','bar_ts','bar_age','direction','p_up','confidence','model_id','regime','spot','contract','entry','stop','target','qty','lots','max_lots','requested_lots','spread','reason','risk_config_at_entry','shared_signal_key','shared_risk_at_entry')},
+                entry_plan={k:setup.get(k) for k in ('ts','bar_ts','bar_age','direction','p_up','confidence','model_id','regime','spot','contract','entry','stop','target','qty','lots','max_lots','requested_lots','spread','reason','risk_plan','risk_config_at_entry','shared_signal_key','shared_risk_at_entry')},
                 outcome=dict(bought=bought,sold=sold,remaining=p['qty'],average_entry=entry,average_exit=exit_price,
                     realized=p['pnl'],estimated_costs=p['fees'],net_realized=p['pnl']-p['fees']),
                 review_summary=summary,recorded_exit_reason=recorded_reason,explanations=explanations,limitations=limitation,coverage=coverage,observed_range=observations,observed_changes=changes,timeline=timeline,recorder_error=self.recorder_error,
@@ -12759,21 +12767,28 @@ class DeskAdapter:
     def refresh(self,symbol):
         if self.connected():ai_refresh_live_bars(symbol)
     def chain(self,symbol):return get_chain_for_symbol(symbol)
+    def validate_quote(self,q):
+        if not q:return None,"Missing option quote"
+        ts=_ai_ts_naive(q.get("timestamp"))
+        if ts is None:return None,"Quote has no exchange timestamp"
+        age=(now_ist()-ts).total_seconds()
+        if age < -5 or age > 60:return None,f"Stale option quote ({age:.0f}s)"
+        st=quote_stats(q)
+        if not st.get("bid") or not st.get("ask") or st["bid"]>st["ask"]:return None,"No executable bid/ask"
+        if not all(math.isfinite(float(st[k])) for k in ("bid","ask")):return None,"Invalid option prices"
+        st.update(quote_ts=ts.isoformat(),source="Kite REST; timestamp IST")
+        return st,None
     def quote(self,exchange,contract):
         try:
             key=f"{exchange}:{contract}"
-            q=kite_quote_bulk([key],force_refresh=True).get(key)
-            if not q:return None,"Missing option quote"
-            ts=_ai_ts_naive(q.get("timestamp"))
-            if ts is None:return None,"Quote has no exchange timestamp"
-            age=(now_ist()-ts).total_seconds()
-            if age < -5 or age > 60:return None,f"Stale option quote ({age:.0f}s)"
-            st=quote_stats(q)
-            if not st.get("bid") or not st.get("ask") or st["bid"]>st["ask"]:return None,"No executable bid/ask"
-            if not all(math.isfinite(float(st[k])) for k in ("bid","ask")):return None,"Invalid option prices"
-            st.update(quote_ts=ts.isoformat(),source="Kite REST; timestamp IST")
-            return st,None
+            return self.validate_quote(kite_quote_bulk([key],force_refresh=True).get(key))
         except Exception as e:return None,str(e)
+    def quote_batch(self,exchange,contracts):
+        keys=[f"{exchange}:{contract}" for contract in contracts]
+        try:
+            raw=kite_quote_bulk(keys,force_refresh=True)
+            return {contract:self.validate_quote(raw.get(key)) for key,contract in zip(keys,contracts)}
+        except Exception as e:return {contract:(None,str(e)) for contract in contracts}
     def place(self,exchange,contract,side,qty,price,tag):
         # Bounded LIMIT order. Accepted is not filled; v2 reconciles broker results.
         return kite.place_order(variety="regular",exchange=exchange,tradingsymbol=contract,
@@ -13056,6 +13071,7 @@ class StockDeskAdapter(DeskAdapter):
         data,err=get_chain_for_symbol(symbol,str(expiries[0]))
         if err:return None,err
         data=dict(data)
+        data['unfiltered_contracts']=len(data['chain'])
         data['chain']=[o for o in data['chain'] if float(o.get('volume') or 0)>=max(1,int(o.get('lot_size') or 1))*10 and float(o.get('oi') or 0)>=max(1,int(o.get('lot_size') or 1))*20]
         return data,None
 
@@ -13073,6 +13089,234 @@ class StockDeskEngine(DeskEngine):
         self.hist_success_thread=None;self.hist_success_last_attempt=0.0
         self.history_backfill_thread=None;self.history_backfill_last_attempt=0.0;self.history_backfill_universe=()
         self.history_backfill_status=dict(status='WAITING FOR KITE',target_days=STOCK_HISTORY_BACKFILL_DAYS,completed=0,total=0,rows_added=0)
+        self._install_stock_automation()
+        self._install_adaptive_risk()
+    def _install_stock_automation(self):
+        if self.get('stock_execution_v5'):return
+        cfg=self.config()
+        # User-requested live schedule. Keep existing loss/stop/spread settings.
+        if not self.active():cfg.update(mode='live', live_override=True)
+        cfg.update(auto_start=True, armed=False)
+        if cfg.get('capital')==25000.:cfg['capital']=300000.
+        self.put('config',cfg);self.put('stock_execution_v5',True)
+        self.event('UPGRADE','Live default and daily 09:15 IST auto-start enabled; existing risk limits retained. Disarm pauses today.')
+    def _install_adaptive_risk(self):
+        if self.get('stock_adaptive_risk_v1'):return
+        cfg=self.config();cfg.update(adaptive_risk=True,lots=0)
+        self.put('config',cfg);self.put('stock_adaptive_risk_v1',True)
+        self.event('UPGRADE','Stock entries now use adaptive stops/size within remaining daily risk; fixed per-trade rupee risk removed. Existing positions keep their entry plans.')
+    def remaining_entry_risk(self):
+        cfg=self.config()
+        if not hasattr(self,'shared_risk'):raise ValueError('Daily risk supervisor unavailable')
+        view=self.shared_risk.snapshot(cfg['mode'])
+        if view['entry_block']:raise ValueError(view['entry_block'])
+        remaining=min(float(view['remaining']),max(0.,cfg['daily_loss']+
+            float(view['desk_totals'].get(self.desk_name,0))-float(view['desk_reserved'].get(self.desk_name,0))))
+        return remaining
+    def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
+        cfg=self.config();confidence=float(s.get('confidence') or .5)
+        strength=max(0.,min(1.,(confidence-.5)/.30))
+        # ATR is measured on completed underlying candles; delta approximates its
+        # effect on option price. This is a bounded heuristic, not a loss prediction.
+        bars=self.a.bars(s['symbol'],20);completed=[]
+        for row in bars:
+            ts=_ai_ts_naive(row.get('ts'))
+            if ts is not None and ts+timedelta(minutes=5)<=now_ist():completed.append(row)
+        if len(completed)<15:raise ValueError('Need 15 completed candles for adaptive volatility stop')
+        ranges=[]
+        for prev,row in zip(completed[-15:-1],completed[-14:]):
+            high=float(row['high']);low=float(row['low']);close=float(prev['close'])
+            if not all(math.isfinite(x) and x>0 for x in (high,low,close)) or high<low:raise ValueError('Invalid volatility candles')
+            ranges.append(max(high-low,abs(high-close),abs(low-close)))
+        atr=sum(ranges)/len(ranges)
+        entry=round(math.ceil((q['ask']*(1+cfg['slippage_bps']/10000)-1e-9)/tick)*tick,2)
+        distance=max(abs(float(s['option_delta']))*atr*1.5,entry*.05,3*(q['ask']-q['bid']),2*tick)
+        if not math.isfinite(distance) or distance>entry*.30:raise ValueError('Volatility/liquidity requires a stop over 30% of premium; choose another contract')
+        fees=2*cfg['fee_per_order'];one_lot=distance*lot+fees
+        # Usually allocate 45–75% of remaining risk. Permit one indivisible lot
+        # up to 80% when it does not fit the target share; never tighten a stop to fit.
+        budget=remaining*(.45+.30*strength)
+        if one_lot>budget and one_lot<=remaining*.80:budget=one_lot
+        ceiling=min(cfg['capital'],funds) if funds is not None else cfg['capital']
+        capital_share=.25+.50*strength
+        allocation=min(ceiling,max(ceiling*capital_share,entry*lot+fees))
+        reward=1.5+strength
+        effective=dict(cfg,capital=allocation,risk=budget,stop_pct=100*distance/entry,reward_r=reward,lots=0)
+        sized=self.size_contract(q,lot,tick,effective,funds)
+        if not sized['qty'] and sized['lot_limits']['risk']==0:
+            sized['size_reason']=f"Adaptive daily-risk allocation ₹{budget:,.0f}; one lot requires ₹{one_lot:,.0f}; daily risk remaining ₹{remaining:,.0f}"
+        sized['risk_plan']=dict(policy='adaptive-v1',strength=round(strength,4),confidence=confidence,
+            underlying_atr=atr,stop_distance=distance,stop_pct=100*distance/entry,reward_r=reward,
+            capital_fraction=capital_share,capital_allocation=allocation,remaining_daily_risk=remaining,
+            risk_budget=budget,planned_loss=distance*sized['qty']+fees if sized['qty'] else 0,
+            initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=one_lot>remaining*(.45+.30*strength) and budget==one_lot,
+            note='Estimated stop loss including fees; gaps and fills can exceed the plan')
+        return sized
+    def adaptive_position_update(self,p,q,cfg):
+        if p['status']!='OPEN' or p['qty']<=0 or p['id'] in self.mismatches:return
+        setup=json.loads(p.get('setup') or '{}');plan=setup.get('risk_plan') or {}
+        if plan.get('policy')!='adaptive-v1':return  # Preserve older positions.
+        bid=float(q['bid']);initial_stop=float(plan['initial_stop'])
+        unit_risk=max(float(setup.get('tick') or .05),p['entry']-initial_stop)
+        old_peak=float(setup.get('adaptive_peak_bid') or p['entry']);peak=max(old_peak,bid)
+        strength=float(plan['strength']);sig=self.signals.get(p['symbol'],{})
+        ts=_ai_ts_naive(sig.get('bar_ts'));fresh=bool(ts and 0<=(now_ist()-ts).total_seconds()<=900)
+        weak=False
+        if fresh:
+            current_conf=float(sig.get('confidence') or .5)
+            aligned=sig.get('direction')==setup.get('direction')
+            weak=not aligned or current_conf<float(plan['confidence'])-.08
+            strength=max(0.,min(1.,(current_conf-.5)/.30)) if aligned else 0.
+        stop=float(p['stop']);reasons=[]
+        if bid>stop:
+            if weak:
+                stop=max(stop,p['entry']-.5*unit_risk);reasons.append('fresh signal weakened')
+            if peak>=p['entry']+.75*unit_risk:
+                stop=max(stop,peak-unit_risk*(.65+.45*strength));reasons.append('profit trail')
+            if bid>=p['entry']+unit_risk:
+                # Breakeven includes fees already paid and one estimated remaining exit.
+                stop=max(stop,p['entry']+(p['fees']+cfg['fee_per_order'])/p['qty']);reasons.append('cost-aware breakeven')
+        tick=float(setup.get('tick') or .05)
+        stop=max(float(p['stop']),initial_stop,round(math.floor((stop+1e-9)/tick)*tick,2))
+        if stop>p['stop'] or peak>old_peak:
+            setup['adaptive_peak_bid']=peak
+            with self.db() as c:c.execute("UPDATE desk_positions SET stop=MAX(stop,?),setup=? WHERE id=? AND status='OPEN'",(stop,json.dumps(setup),p['id']))
+            if stop>p['stop']:self.record_trade(p['id'],'ADAPTIVE_STOP',dict(previous_stop=p['stop'],new_stop=stop,peak_bid=peak,reason=', '.join(reasons),strength=strength))
+            p['stop']=stop;p['setup']=json.dumps(setup)
+    def available_funds(self,force=False):
+        if self.config()['mode']!='live':return None
+        cached=getattr(self,'_funds_snapshot',None)
+        if not force and cached and time.monotonic()-cached[0]<10:return cached[1]
+        margins=kite.margins('equity')
+        value=(margins.get('available') or {}).get('live_balance')
+        if value is None:raise ValueError('Kite available live balance missing; entries paused')
+        value=float(value)
+        if not math.isfinite(value):raise ValueError('Invalid Kite available balance')
+        self._funds_snapshot=(time.monotonic(),max(0.,value))
+        return max(0.,value)
+    @staticmethod
+    def size_contract(q,lot,tick,cfg,funds=None):
+        if lot<=0 or not math.isfinite(tick) or tick<=0:raise ValueError('Invalid contract lot/tick size')
+        entry=round(math.ceil((q['ask']*(1+cfg['slippage_bps']/10000)-1e-9)/tick)*tick,2)
+        unit_risk=entry*cfg['stop_pct']/100
+        fees=2*cfg['fee_per_order']
+        capital=min(cfg['capital'],funds) if funds is not None else cfg['capital']
+        depth=sum(int(x['quantity']) for x in q.get('ask_levels',[]) if 0<float(x['price'])<=entry+1e-9)
+        if 'ask_levels' not in q:depth=int(q.get('ask_qty') or 0)
+        limits=dict(capital=max(0,int((capital-fees)//(entry*lot))),
+                    risk=max(0,int((cfg['risk']-fees+1e-7)//(unit_risk*lot))),depth=max(0,depth//lot))
+        max_lots=min(limits.values());lots=int(cfg['lots'] or max_lots)
+        qty=lots*lot if 0<lots<=max_lots else 0
+        reasons=[]
+        required=max(1,int(cfg['lots']))
+        if limits['capital']<required:reasons.append(f"premium budget: need ₹{entry*lot*required+fees:,.0f}, available ₹{capital:,.0f} (desk cap ₹{cfg['capital']:,.0f})")
+        if limits['risk']<required:reasons.append(f"stop risk: need ₹{unit_risk*lot*required+fees:,.0f}, limit ₹{cfg['risk']:,.0f}")
+        if limits['depth']<required:reasons.append(f"ask depth within ₹{entry:.2f}: {depth} units, need {lot*required}")
+        return dict(entry=entry,stop=entry-unit_risk,target=entry+unit_risk*cfg['reward_r'],qty=qty,
+            lots=lots if qty else 0,max_lots=max_lots,requested_lots=cfg['lots'],depth_qty=depth,
+            lot_limits=limits,one_lot_premium=entry*lot+fees,one_lot_risk=unit_risk*lot+fees,
+            broker_available=funds,effective_capital=capital,size_reason='; '.join(reasons))
+    def inspect_contracts(self,symbol):
+        s=self.direction_snapshot(symbol,refresh=True,record_observation=True,max_bar_age=15)
+        if s.get('decision')!='CANDIDATE':return s
+        cfg=self.config();typ='CE' if s['p_up']>.5 else 'PE'
+        data,err=self.a.chain(symbol)
+        if err:s.update(decision='WAIT',reason='Option chain: '+str(err));return s
+        candidates=[];counts=dict(side=0,delta=0,quote=0,spread=0);best_spread=None
+        for o in data.get('chain',[]):
+            if o.get('instrument_type')!=typ:continue
+            counts['side']+=1
+            try:delta=abs(float(o.get('delta')))
+            except (TypeError,ValueError):continue
+            if not math.isfinite(delta) or not .3<=delta<=.7:continue
+            counts['delta']+=1
+            ask=float(o.get('ask') or 0);bid=float(o.get('bid') or 0)
+            if not all(math.isfinite(x) for x in (ask,bid)) or not 0<bid<=ask:continue
+            counts['quote']+=1;spread=(ask-bid)/((ask+bid)/2)*100
+            best_spread=spread if best_spread is None else min(best_spread,spread)
+            if spread>cfg['max_spread']:continue
+            counts['spread']+=1;candidates.append((abs(delta-.5)+spread/10,o))
+        s.update(option_type=typ,contract_checks=counts)
+        if not candidates:
+            detail=f"best spread {best_spread:.2f}% vs limit {cfg['max_spread']:.2f}%" if best_spread is not None else 'no valid two-sided quotes in delta range 0.30–0.70'
+            s.update(decision='WAIT',reason=f"No qualifying {typ}: {detail}; {counts['side']} contracts after volume/OI filter, {counts['delta']} with valid delta")
+            return s
+        try:funds=self.available_funds()
+        except Exception as e:s.update(decision='WAIT',reason='Funds check: '+str(e));return s
+        try:remaining=self.remaining_entry_risk()
+        except Exception as e:s.update(decision='WAIT',reason='Daily risk: '+str(e));return s
+        failures=[]
+        # Bound quote traffic, but test several contracts instead of rejecting the stock
+        # solely because its nearest-ATM contract cannot fit one lot.
+        shortlisted=sorted(candidates,key=lambda r:r[0])[:8]
+        quotes=self.a.quote_batch(self.a.exchange(symbol),[o['tradingsymbol'] for _,o in shortlisted])
+        for _,o in shortlisted:
+            trial=dict(s,contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
+                lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),
+                option_delta=float(o['delta']),option_volume=float(o.get('volume') or 0),option_oi=float(o.get('oi') or 0),
+                option_expiry=str(o.get('expiry')),dte=None)
+            try:trial['dte']=(o['expiry']-now_ist().date()).days
+            except (TypeError,KeyError):pass
+            q,why=quotes[trial['contract']]
+            if why:failures.append(trial['contract']+': '+why);continue
+            trial.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'])
+            if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:
+                failures.append(trial['contract']+': refreshed spread exceeds limit');continue
+            try:trial.update(self.adaptive_entry_plan(trial,q,trial['lot'],trial['tick'],funds,remaining))
+            except ValueError as e:failures.append(trial['contract']+': '+str(e));continue
+            if trial['qty']>0:
+                trial.update(decision='READY',reason=f"{typ} ready: {trial['lots']} lot(s); premium ₹{trial['entry']*trial['qty']:,.0f}; stop risk + fees ₹{(trial['entry']-trial['stop'])*trial['qty']+2*cfg['fee_per_order']:,.0f}")
+                return trial
+            failures.append(trial['contract']+': '+trial['size_reason'])
+        s.update(decision='WAIT',reason='; '.join(failures[:3]),contract_failures=failures)
+        return s
+    def scheduled_start(self):
+        if not self.lock.acquire(False):return
+        try:
+            with self.risk_lock:
+                cfg=self.config();now=now_ist();today=now.date().isoformat()
+                if not cfg.get('auto_start') or cfg['armed'] or cfg['mode']!='live':return
+                if self.get('auto_start_paused_day')==today or self.get('auto_started_day')==today:return
+                if now.weekday()>=5 or not '09:15'<=now.strftime('%H:%M')<cfg['square_off']:return
+                if not self.a.connected() or not self.a.market_open() or not self.model():return
+                if self.get('halt') or self.get('close_requested') or self.mismatches:return
+                if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):return
+                # Reconcile before granting the day's one automatic arming action.
+                self.reconcile();self.verify_positions()
+                if self.get('halt') or self.mismatches:return
+                try:super().control('arm',{'ack':True})
+                except ValueError:return
+                self.put('auto_started_day',today)
+                self.event('AUTO_START','Scheduled live entries armed for today; all entry gates remain active')
+                self.execution_event.set()
+        finally:self.lock.release()
+    def save_config(self,body):
+        if self.config()['armed'] or self.active():raise ValueError('Disarm and close/reconcile Stock positions before changing risk settings')
+        body=dict(body);auto=body.pop('auto_start',None)
+        for key in ('risk','stop_pct','reward_r','lots'):
+            if key in body:raise ValueError(key+' is selected automatically by Stock AI; adjust daily loss or capital instead')
+        if auto is not None and not isinstance(auto,bool):raise ValueError('auto_start must be true or false')
+        cfg=super().save_config(body)
+        if auto is not None:cfg['auto_start']=auto;self.put('config',cfg)
+        return cfg
+    def submit(self,p,side,qty,price,reason):
+        if side=='BUY' and p['mode']=='live':
+            try:
+                funds=self.available_funds(force=True)
+                q,err=self.a.quote(p['exchange'],p['contract'])
+                if err:raise ValueError(err)
+                cfg=self.config()
+                depth=sum(int(x['quantity']) for x in q.get('ask_levels',[]) if 0<float(x['price'])<=price+1e-9)
+                if q['ask']>price or depth<qty:raise ValueError('Fresh ask depth at entry limit no longer covers quantity; wait for next scan')
+                if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:raise ValueError('Fresh spread exceeds configured limit')
+                required=qty*price+2*cfg['fee_per_order']
+                if required>funds:raise ValueError(f'Kite funds ₹{funds:,.0f}; premium + fees need ₹{required:,.0f}')
+                if self.get('close_requested') or self.get('halt'):raise ValueError('Close request or halt before submission')
+            except Exception as e:
+                with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0",(str(e),p['id']))
+                self.signals[p['symbol']]=dict(self.signals.get(p['symbol'],{}),decision='WAIT',reason=str(e))
+                self.event('WAIT',str(e),p['symbol']);return
+        return super().submit(p,side,qty,price,reason)
     def _full_mode(self):
         return self.get('stock_universe_info',{}).get('mode')!='Custom watchlist'
     def select_universe(self,body=None):
@@ -13452,7 +13696,7 @@ class StockDeskEngine(DeskEngine):
         s['historical_success_model_trained']=hist_model_valid
         s['historical_archive_coverage']=round(float(archive.get('ratio') or 0),4)
         s['historical_archive_ready']=bool(archive.get('ready'))
-        cfg=self.config();planned=max(.01,(float(s['entry'])-float(s['stop']))*max(1,int(s['qty'])))
+        cfg=dict(self.config(),reward_r=(s.get('risk_plan') or {}).get('reward_r',self.config()['reward_r']));planned=max(.01,(float(s['entry'])-float(s['stop']))*max(1,int(s['qty'])))
         cost_r=(2*float(cfg.get('fee_per_order') or 0))/planned
         hp=None;lp=None;raw_hist=None;raw_live=None
         hv=self._historical_setup_vector(s)
@@ -13513,7 +13757,7 @@ class StockDeskEngine(DeskEngine):
         s['scan_stage']='UNIVERSE';s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
         return s
     def inspect(self,symbol):
-        s=super().inspect(symbol)
+        s=self.inspect_contracts(symbol)
         s['reason']=s.get('reason','').replace('index candles','stock candles')
         if self.banned is not None and symbol in self.banned:s.update(decision='WAIT',reason='Stock in F&O ban list; new entries excluded')
         if self.config()['mode']=='live' and self.banned is None:s.update(decision='WAIT',reason='Daily F&O ban list unavailable; live entries paused')
@@ -13549,7 +13793,9 @@ class StockDeskEngine(DeskEngine):
         if s.get('decision')!='READY' or self.block() or self.get('close_requested'):return
         fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
         if fresh.get('decision')!='READY' or self.get('close_requested'):return
-        return super().enter(fresh)
+        with self.risk_lock:
+            if self.block() or self.get('close_requested'):return
+            return super().enter(fresh)
     def _publish_execution_candidates(self,ranked):
         ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('symbol') in self.a.symbols]
         with self.candidate_lock:
@@ -13594,6 +13840,7 @@ class StockDeskEngine(DeskEngine):
             if time.monotonic()-self.ban_checked>1800:
                 self.banned,self.ban_error=get_fo_ban_list();self.ban_checked=time.monotonic()
             self.supervise()
+            self.scheduled_start()
             names=list(dict.fromkeys(list(self.a.symbols)+[p['symbol'] for p in self.active()]))
             if not self.a.market_open():
                 self.scan_status=dict(status='MARKET CLOSED',phase='Full F&O scan resumes during market hours',completed=0,total=len(names),
@@ -13666,7 +13913,8 @@ class StockDeskEngine(DeskEngine):
             while not self.stop_event.is_set():self.cycle();self.stop_event.wait(30)
         def risk_loop():
             while not self.stop_event.wait(5):
-                if self.a.connected():self.supervise()
+                if self.a.connected():
+                    self.supervise();self.scheduled_start()
         def execution_loop():
             while not self.stop_event.is_set():
                 self.execution_event.wait(1)
@@ -13692,6 +13940,9 @@ class StockDeskEngine(DeskEngine):
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
         return s
     def control(self,action,body):
+        # Explicit operator actions pause today's scheduled start, across restarts.
+        if action in ('disarm','close','mode','clear-halt','live-override'):
+            self.put('auto_start_paused_day',now_ist().date().isoformat())
         # Disarming is immediate even while a broad scan is running.
         if action in ('disarm','close'):
             with self.risk_lock:
@@ -14965,7 +15216,19 @@ class SharedAIRisk:
                     if prior_key==signal:return 'Signal already used; wait for a fresh signal'
         required=(float(s['entry'])-float(s['stop']))*int(s['qty'])+2*cfg['fee_per_order']
         if not math.isfinite(required) or required<=0:return 'Invalid planned entry risk'
-        if required>cfg['risk']+.01:return 'Planned loss including estimated fees exceeds per-trade risk'
+        if e.desk_name=='stock' and cfg.get('adaptive_risk'):
+            plan=s.get('risk_plan') or {}
+            if plan.get('policy')!='adaptive-v1':return 'Missing adaptive entry risk plan'
+            available=min(float(view['remaining']),max(0.,cfg['daily_loss']+view['desk_totals'][e.desk_name]-view['desk_reserved'][e.desk_name]))
+            budget=min(float(plan['risk_budget']),available)
+            lot=int(s['lot']);unit=float(s['entry'])-float(s['stop'])
+            if lot<=0 or unit<=0 or not math.isfinite(budget):return 'Invalid adaptive size/risk'
+            lots=max(0,int((budget-2*cfg['fee_per_order']+1e-7)//(unit*lot)))
+            s['qty']=min(int(s['qty']),lots*lot);s['lots']=s['qty']//lot
+            if s['qty']<=0:return 'Remaining daily risk cannot cover one lot at the volatility stop'
+            required=unit*s['qty']+2*cfg['fee_per_order']
+            plan.update(admitted_daily_risk=available,admitted_risk_budget=budget,planned_loss=required)
+        elif required>cfg['risk']+.01:return 'Planned loss including estimated fees exceeds per-trade risk'
         floor=-limits['daily_loss']
         if limits['profit_protection_enabled'] and view['peak']>=limits['profit_activation']:floor=max(floor,view['peak']-limits['profit_giveback'])
         if required>view['net']-view['reserved']-floor:return 'Insufficient shared risk remaining for this entry'
@@ -15150,6 +15413,29 @@ def desk_trade_review_export(desk):
     return Response(stream_with_context(generate()),mimetype='application/json' if fmt=='json' else 'text/csv',headers={'Content-Disposition':f'attachment; filename="{desk}-trade-evidence.{fmt}"','Cache-Control':'no-store'})
 
 
+@app.before_request
+def retired_ai_entry_routes():
+    if request.method=='POST' and request.path.startswith(('/api/ai-desk/','/api/ai-autotrade/','/api/cas-ai/')):
+        if request.path.rsplit('/',1)[-1] not in ('close','disarm','clear-halt','legacy-close'):
+            return jsonify(error='This AI section is retired; new entries and configuration are disabled'),410
+
+def retired_ai_supervisor():
+    legacy_cfg=autotrade_ai_config();legacy_cfg['armed']=False;autotrade_ai_save_config(legacy_cfg)
+    # Keep owned positions and uncertain orders supervised after removing entry desks.
+    for engine in (DESK,CAS_DESK):
+        cfg=engine.config();cfg['armed']=False;engine.put('config',cfg)
+    while True:
+        if require_session():
+            for engine in (DESK,CAS_DESK):
+                try:
+                    with engine.lock:
+                        engine.reconcile();engine.verify_positions()
+                        if engine.active() and ai_market_open():
+                            if engine is CAS_DESK:engine.a.batch()
+                            engine.manage(close_all=bool(engine.get('close_requested')))
+                except Exception as e:engine.event('ERROR','Retired desk supervision: '+str(e))
+        time.sleep(5)
+
 def start_application_workers():
     if os.environ.get("AI_START_WORKERS","1")!="1":return
     def legacy_manage():
@@ -15164,9 +15450,8 @@ def start_application_workers():
     threading.Thread(target=legacy_manage,daemon=True,name='legacy-risk-monitor').start()
     threading.Thread(target=_autotrade_loop,daemon=True).start()
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
-    DESK.start()
     STOCK_DESK.start()
-    CAS_DESK.start()
+    threading.Thread(target=retired_ai_supervisor,daemon=True,name='retired-ai-exits').start()
 
 start_application_workers()
 
