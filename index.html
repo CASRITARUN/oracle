@@ -2609,7 +2609,7 @@ function skRender(s){
   skHTML('skEquity',skLineChart(ev.equity,'pnl','Close at least two paper trades to draw the equity curve.'));
   skHTML('skTrades',skTable(['Opened','Stock','Mode','Contract','Entry','Status','Realized','Est. costs','Exit reason'],(s.trades||[]).map(p=>[skDate(p.ts),p.symbol,p.mode,p.contract,skNum(p.entry),p.status,skMoney(p.pnl),skMoney(p.fees),p.exit_reason||'—'])));
   skHTML('skOrders',skTable(['Time','Side','Mode','Requested / filled','Status','Broker ID','Reason'],(s.orders||[]).map(o=>[skTime(o.ts),o.side,o.mode,o.qty+' / '+o.filled,o.status,o.broker_id||'Awaiting acknowledgement',o.error||o.reason])));
-  renderStockRecovery(s.pending_orders||s.orders||[]);
+  renderStockRecovery([...(s.pending_orders||s.orders||[]),...(s.historical_unknown_orders||[])]);
   renderTradeReviewControls('sk','stock',s.trades||[],s.recorder_error);
   if(!stockdeskDirty)skFields.forEach(([k])=>{const input=skEl('skSettings')?.elements.namedItem(k);if(input)input.value=cfg[k]});
   skText('skRuntimeBuild',s.runtime_build||'Backend update required');
@@ -3195,6 +3195,7 @@ function renderStockRecovery(orders){
  const pending=orders.filter(o=>o.mode==='live'&&!['COMPLETE','CANCELLED','REJECTED'].includes(o.status));
  if(!pending.length){host.textContent='No pending live orders.';return}
  for(const o of pending){
+  if(o.status==='HISTORICAL_UNKNOWN'){const note=document.createElement('p');note.textContent=(o.contract||o.symbol)+' · '+skDate(o.ts)+' · Historical outcome unknown. Current exposure verified absent; this record does not block entries and is excluded from performance learning.';host.append(note);continue}
   const row=document.createElement('div');row.style.cssText='margin:14px 0;padding:14px;border:1px solid #455268;border-radius:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:center';
   const label=document.createElement('span');label.textContent=(o.contract||o.symbol||'Order')+' · '+skDate(o.ts)+' · '+o.side+' · '+o.status+' · '+o.qty+' requested / '+o.filled+' filled · local '+o.id.slice(0,8);
   const input=document.createElement('input');input.placeholder='Kite order ID (if missing)';input.value=values.get(o.id)||o.broker_id||'';input.dataset.orderId=o.id;input.readOnly=!!o.broker_id;input.setAttribute('aria-label','Exact Kite order ID');
@@ -3203,7 +3204,7 @@ function renderStockRecovery(orders){
   const today=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
   const orderDay=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(o.ts));
   const older=orderDay!==today;
-  const detail=document.createElement('small');detail.style.cssText='width:100%;white-space:normal';detail.textContent=(o.error||'Waiting for broker status')+(older?' Older order: today’s empty Kite book cannot prove cancellation. Use saved terminal JSON or obtain broker evidence.':' Check Kite Orders, Trades and Positions before choosing a recovery action.');row.append(detail);
+  const detail=document.createElement('small');detail.style.cssText='width:100%;white-space:normal';detail.textContent=(o.error||'Waiting for broker status')+(older?' Older order: automatic checks can retire an unfilled local entry only after two flat broker snapshots. Known fills, positions or activity today still require broker evidence.':' Check Kite Orders, Trades and Positions before choosing a recovery action.');row.append(detail);
   if(older){
    const upload=document.createElement('input');upload.type='file';upload.accept='.json,application/json';upload.setAttribute('aria-label','Saved Kite terminal-order JSON');
    upload.onchange=async()=>{try{const file=upload.files[0];if(!file)return;if(file.size>1000000)throw Error('Use a JSON file below 1 MB.');let data=JSON.parse(await file.text());if(data.data)data=data.data;const records=Array.isArray(data)?data:[data];const exact=(input.value||'').trim();const selected=records.filter(r=>exact?String(r.order_id)===exact:r.tag===o.tag||(Array.isArray(r.tags)&&r.tags.includes(o.tag)));if(selected.length!==1)throw Error('Enter the exact Kite order ID to select one record in this JSON.');await recoverStockOrder(o.id,'import-terminal',selected[0].order_id,selected[0]);}catch(e){skNotice(e.message,true)}};
