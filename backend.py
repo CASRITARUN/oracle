@@ -64,7 +64,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -12030,7 +12030,7 @@ def _build_desk_engine_class():
             # Recover intents that crashed before any broker submission was possible.
             with self.db() as c:
                 c.execute("UPDATE desk_positions SET status='CANCELLED' WHERE status='ENTRY_PENDING' AND qty=0 AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=desk_positions.id)")
-            for order in self.rows("SELECT * FROM desk_orders WHERE mode='paper' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+            for order in self.rows("SELECT * FROM desk_orders WHERE mode='paper' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                 self.apply_order(order['id'],dict(status='CANCELLED',filled_quantity=order['filled'],average_price=order['notional']/order['filled'] if order['filled'] else 0))
             for position in self.active():
                 self.record_trade(position['id'],'RESTART_GAP',dict(note='Process restarted; observations during downtime are unavailable.'))
@@ -12293,7 +12293,7 @@ def _build_desk_engine_class():
             return None
         def day_pnl(self,mode):
             today=datetime.now(IST).date().isoformat()
-            total=sum(r['pnl']-r['fees'] for r in self.rows("SELECT pnl,fees FROM desk_positions WHERE mode=? AND (status!='CLOSED' OR exit_ts LIKE ?)",(mode,today+'%')))
+            total=sum(r['pnl']-r['fees'] for r in self.rows("SELECT pnl,fees FROM desk_positions WHERE mode=? AND status!='HISTORICAL_UNKNOWN' AND (status!='CLOSED' OR exit_ts LIKE ?)",(mode,today+'%')))
             for r in self.active():
                 if r['mode']==mode and r['qty']:
                     mark=self.health.get(r['id'],{}).get('bid')
@@ -12316,7 +12316,7 @@ def _build_desk_engine_class():
                     with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0",(shared['reason'],p['id']))
                     self.record_trade(p['id'],'ENTRY_CANCELLED_BEFORE_SUBMISSION',dict(reason=shared['reason']))
                     return
-            if self.rows("SELECT id FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')",(p['id'],)):return
+            if self.rows("SELECT id FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')",(p['id'],)):return
             # Intent is durable before contacting the broker. Unknown submissions are never blindly retried.
             with self.db() as c:
                 c.execute('INSERT INTO desk_orders(id,ts,position_id,side,qty,mode,tag,status,limit_price,reason) VALUES(?,?,?,?,?,?,?,?,?,?)',
@@ -12425,7 +12425,7 @@ def _build_desk_engine_class():
         def clear_verified_order_halt(self):
             halt=self.get('halt') or ''
             if not halt.startswith(('Unresolved broker order','Order submission uncertain','Broker reconciliation:')):return False
-            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):return False
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):return False
             self.verify_positions()  # Raises on broker failure; never infer agreement.
             if self.mismatches or getattr(self,'position_verification_deferred',False):return False
             if (self.get('halt') or '')!=halt:return False
@@ -12444,7 +12444,7 @@ def _build_desk_engine_class():
             resume=cfg.get('auto_start') and self.get('recovery_resume_day')==today and self.get('auto_start_paused_day')!=today
             if not resume:self.put('auto_start_paused_day',today)
             self.put('halt',None);self.put('recovery_contracts',[])
-            self.event('RECOVERY','All pending orders verified and quantities reconciled; order warning cleared. '+('Automatic schedule will recheck all gates before resuming.' if resume else 'Entries remain disarmed.'))
+            self.event('RECOVERY','Active orders reconciled and current quantities verified; order warning cleared. Any historical unknown results remain in the journal. '+('Automatic schedule will recheck all gates before resuming.' if resume else 'Entries remain disarmed.'))
             return True
         def recover_order(self,oid,body):
             # Caller owns the engine's execution/risk lock. No automatic re-arming.
@@ -12454,6 +12454,7 @@ def _build_desk_engine_class():
             if not rows:raise ValueError('Order not found')
             o=rows[0]
             if o['mode']!='live':raise ValueError('Recovery is for live broker orders')
+            if o['status']=='HISTORICAL_UNKNOWN':raise ValueError('Archived historical intent: do not replay old fills into current positions. Retain broker evidence for historical accounting.')
             if o['status'] in TERMINAL:
                 cleared=self.clear_verified_order_halt()
                 return dict(status=o['status'],message='Order is already terminal. '+('Verified order warning cleared; entries remain disarmed.' if cleared else 'Other order or position checks may still require attention.'))
@@ -12499,7 +12500,7 @@ def _build_desk_engine_class():
                     self.apply_order(oid,r)
                 self.event('RECOVERY','Cancel/reconcile requested for '+str(r['order_id']),p['symbol'])
                 result=dict(status=r['status'],message='Broker status reconciled. Filled quantity remains owned; only the unfilled remainder is cancelled.')
-            remaining=self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
+            remaining=self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')")
             self.verify_positions()
             halt=self.get('halt') or ''
             if not remaining and not self.mismatches and not getattr(self,'position_verification_deferred',False) and any(halt.startswith(x) for x in ('Unresolved broker order','Order submission uncertain','Broker reconciliation:')):
@@ -12507,8 +12508,50 @@ def _build_desk_engine_class():
             else:result['message']+=' Any remaining order or risk block still needs resolution.'
             self.record_trade(p['id'],'OPERATOR_RECOVERY',dict(order_id=oid,action=body.get('action'),result=result))
             return result
+        def archive_flat_historical_intent(self,o):
+            # This retires an expired entry intent, NOT its unknown historical outcome.
+            # Only this adapter's regular MIS/DAY NFO orders qualify. No known fills.
+            if not getattr(self.a,'regular_mis_day_orders',False):return False
+            now=datetime.now(IST)
+            if o['mode']!='live' or o['side']!='BUY' or o['filled'] or dt(o['ts']).date()>=now.date():return False
+            p=self.rows('SELECT * FROM desk_positions WHERE id=?',(o['position_id'],))[0]
+            if p['exchange']!='NFO' or p['qty'] or p['fees'] or p['pnl'] or p['status']!='ENTRY_PENDING':return False
+            if len(self.rows('SELECT id FROM desk_orders WHERE position_id=?',(p['id'],)))!=1:return False
+            checks=getattr(self,'_historical_flat_checks',{})
+            self._historical_flat_checks=checks
+            try:
+                book=self.a.orders();trades=self.a.trades();positions=self.a.holdings()
+                if not all(isinstance(x,list) for x in (book,trades,positions)):raise ValueError('Incomplete broker snapshot')
+                for rows in (book,trades,positions):
+                    if any(not isinstance(r,dict) or not r.get('exchange') or not r.get('tradingsymbol') for r in rows):raise ValueError('Malformed broker snapshot')
+                if any('quantity' not in r for r in positions):raise ValueError('Missing broker position quantity')
+                same=lambda r:r.get('exchange')==p['exchange'] and r.get('tradingsymbol')==p['contract']
+                # Never net offsetting positions across products, or overlook a carry exit today.
+                position_activity=any(same(r) and any(float(r.get(k) or 0)!=0 for k in ('quantity','buy_quantity','sell_quantity','day_buy_quantity','day_sell_quantity','pnl','realised')) for r in positions)
+                identity=lambda r:str(r.get('order_id') or '')==str(o.get('broker_id') or '-') or r.get('tag')==o['tag'] or o['tag'] in (r.get('tags') if isinstance(r.get('tags'),list) else [])
+                unsafe=position_activity or any(same(r) for r in trades) or any(identity(r) or (same(r) and (r.get('status') not in TERMINAL or not r.get('order_timestamp') or dt(r['order_timestamp']).date()>=now.date())) for r in book)
+                guard=getattr(self,'shared_risk',None)
+                for engine in guard.engines.values() if guard else [self]:
+                    if any(q['id']!=p['id'] and q['mode']=='live' and q['exchange']==p['exchange'] and q['contract']==p['contract'] for q in engine.active()):unsafe=True
+                if unsafe:checks.pop(o['id'],None);return False
+                previous=checks.get(o['id']);checks[o['id']]=now
+                if previous is None or not 4 <= (now-previous).total_seconds() <= 60:return False
+                evidence=dict(order_id=o['id'],original_order=o,original_position=p,checked_at=now.isoformat(),first_flat_check=previous.isoformat(),outcome='Historical fills and P&L unknown; current broker exposure verified absent',positions=[r for r in positions if same(r)])
+                with self.db() as c:
+                    current=c.execute('SELECT status,filled FROM desk_orders WHERE id=?',(o['id'],)).fetchone()
+                    current_p=c.execute('SELECT status,qty FROM desk_positions WHERE id=?',(p['id'],)).fetchone()
+                    if current['status']!=o['status'] or current['filled'] or current_p['qty'] or current_p['status']!='ENTRY_PENDING':return False
+                    c.execute("UPDATE desk_orders SET status='HISTORICAL_UNKNOWN',error=? WHERE id=?",(evidence['outcome'],o['id']))
+                    c.execute("UPDATE desk_positions SET status='HISTORICAL_UNKNOWN',exit_reason=? WHERE id=?",(evidence['outcome'],p['id']))
+                    c.execute('INSERT INTO desk_trade_events(position_id,ts,kind,payload) VALUES(?,?,?,?)',(p['id'],stamp(),'HISTORICAL_FLAT_ARCHIVE',json.dumps(evidence,default=str)))
+                checks.pop(o['id'],None);self.record_cache.pop(p['id'],None)
+                self.event('RECOVERY','Old entry removed from active risk after two flat broker checks; historical result remains unknown',p['symbol'])
+                return True
+            except Exception:
+                checks.pop(o['id'],None)
+                return False
         def reconcile(self):
-            pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')")
+            pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')")
             if not pending:
                 self.clear_verified_order_halt();return
             cfg=self.config();today=datetime.now(IST).date().isoformat()
@@ -12532,6 +12575,7 @@ def _build_desk_engine_class():
                     if r['status'] not in TERMINAL and (datetime.now(IST)-dt(o['ts'])).total_seconds()>45:self.a.cancel(str(r['order_id']))
                 except Exception as e:
                     if type(e).__name__=='BrokerDeferred':continue
+                    if (str(e).startswith('Older unresolved order') or str(e).startswith('Kite order history unavailable')) and self.archive_flat_historical_intent(o):continue
                     if str(e).startswith('Awaiting Kite acknowledgement'):
                         with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
                         continue
@@ -12607,7 +12651,7 @@ def _build_desk_engine_class():
         def manage(self,close_all=False):
             cfg=self.config()
             if hasattr(self,'shared_risk'):
-                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                     try:liquidate=self.shared_risk.snapshot('live')['liquidate']
                     except Exception:liquidate=False
                     if liquidate and o['broker_id']:
@@ -12643,7 +12687,7 @@ def _build_desk_engine_class():
                 if reason:
                     self.health[p['id']]['reason']=reason
                     if p['status']!='OPEN':
-                        pending=self.rows("SELECT * FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')",(p['id'],))
+                        pending=self.rows("SELECT * FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')",(p['id'],))
                         for o in pending:
                             if o['mode']=='live' and o['side']=='BUY' and o['broker_id']:self.a.cancel(o['broker_id'])
                         continue
@@ -12729,11 +12773,11 @@ def _build_desk_engine_class():
                     if self.a.connected():
                         self.reconcile()
                         self.verify_positions()
-                        for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                        for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                             if o['broker_id']:self.a.cancel(o['broker_id'])
                     if self.a.connected() and self.a.market_open():self.manage(close_all=True)
                 elif action=='clear-halt':
-                    if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):raise ValueError('Broker orders still unresolved')
+                    if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):raise ValueError('Broker orders still unresolved')
                     self.verify_positions()
                     if self.mismatches:raise ValueError('Broker positions still differ from the desk ledger')
                     self.put('halt',None);cfg['armed']=False
@@ -12835,7 +12879,8 @@ def _build_desk_engine_class():
                 block=self.block(),last_cycle=self.last_cycle,training=self.training,model=model,online=online,evidence=evidence,
                 observations=obs,signals=signals,positions=active,trades=trades,
                 orders=self.rows('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60'),
-                pending_orders=self.rows("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED') ORDER BY o.ts"),
+                historical_unknown_orders=self.rows("SELECT o.*,p.contract,p.symbol FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.status='HISTORICAL_UNKNOWN' ORDER BY o.ts DESC"),
+                pending_orders=self.rows("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') ORDER BY o.ts"),
                 events=self.rows('SELECT * FROM desk_events ORDER BY id DESC LIMIT 70'),
                 pnl=dict(paper=round(self.day_pnl('paper'),2),live=round(self.day_pnl('live'),2)),halt=self.get('halt'),legacy=self.a.legacy_open())
 
@@ -12893,8 +12938,12 @@ class DeskAdapter:
             validity="DAY",price=float(price),tag=tag)
     def orders(self):return kite.orders()
     def order_history(self,order_id):return kite.order_history(order_id)
+    regular_mis_day_orders=True
     def trades(self):return kite.trades()
-    def holdings(self):return kite.positions().get("net",[])
+    def holdings(self):
+        result=kite.positions()
+        if not isinstance(result,dict) or not isinstance(result.get('net'),list):raise ValueError('Broker positions response incomplete; cannot verify exposure')
+        return result['net']
     def cancel(self,order_id):return kite.cancel_order(variety="regular",order_id=order_id)
     def legacy_open(self):
         cas=globals().get('CAS_DESK')
@@ -13469,7 +13518,7 @@ class StockDeskEngine(DeskEngine):
                 if now.weekday()>=5 or not '09:15'<=now.strftime('%H:%M')<cfg['square_off']:return
                 if not self.a.connected() or not self.a.market_open() or not self.model():return
                 if self.get('halt') or self.get('close_requested') or self.mismatches:return
-                if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):return
+                if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):return
                 # Reconcile before granting the day's one automatic arming action.
                 self.reconcile();self.verify_positions()
                 if self.get('halt') or self.mismatches or getattr(self,'position_verification_deferred',False):return
@@ -13635,7 +13684,7 @@ class StockDeskEngine(DeskEngine):
             cfg=self.config()
             if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
             if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
-            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1"):
                 return 'Stock AI live order unresolved'
         except Exception:
             return 'Stock AI live-state check unavailable'
@@ -13646,7 +13695,7 @@ class StockDeskEngine(DeskEngine):
                 cfg=desk.config()
                 if cfg.get('mode')=='live' and cfg.get('armed'):return label+' live entries armed'
                 if any(p.get('mode')=='live' for p in desk.active()):return label+' live position active'
-                if desk.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):
+                if desk.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1"):
                     return label+' live order unresolved'
             except Exception:
                 pass
@@ -14098,7 +14147,7 @@ class StockDeskEngine(DeskEngine):
             # BUYs that are still pending so a manual close cannot be followed by a
             # late entry fill.  Filled quantity remains owned and is managed below.
             if self.get('close_requested'):
-                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                     if o.get('broker_id'):
                         try:self.a.cancel(o['broker_id'])
                         except Exception as e:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(e)))
@@ -14134,7 +14183,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.25-auto-recovery.1',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.25-historical-recovery.2',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14445,7 +14494,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
             cfg=self.config()
             if cfg.get('mode')=='live' and cfg.get('armed'):return 'Index AI live armed'
             if any(p.get('mode')=='live' for p in self.active()):return 'Index AI live position active'
-            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED') LIMIT 1"):return 'Index AI live order unresolved'
+            if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1"):return 'Index AI live order unresolved'
         except Exception:return 'Index live-state check unavailable'
         for name,label in (('STOCK_DESK','Stock AI'),('CAS_DESK','CAS AI')):
             e=globals().get(name)
@@ -15158,7 +15207,7 @@ class CASEngine(DeskEngine):
         self.a.order_dirty=False;self.last_reconcile=time.monotonic();self.last_verify=0.
         super().reconcile()
         cfg=self.config();cutoff=now_ist().strftime('%H:%M')>=cfg['entry_end'] or bool(self.get('close_requested'))
-        for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+        for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
             if o['broker_id'] and (cutoff and o['side']=='BUY' or (now_ist()-_ai_ts_naive(o['ts'])).total_seconds()>=cfg['order_timeout']):self.a.cancel(o['broker_id'])
     def manage(self,close_all=False):
         cfg=self.config()
@@ -15235,7 +15284,7 @@ class CASEngine(DeskEngine):
                 self.a.quotes={};self.confirm.clear();raise
             self.collect()
             halt=self.get('halt') or ''
-            if halt.startswith('CAS cycle error:') and not self.mismatches and not self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED')"):
+            if halt.startswith('CAS cycle error:') and not self.mismatches and not self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                 self.put('halt',None);cfg=self.config();cfg['armed']=False;self.put('config',cfg)
                 self.event('RECOVERED','CAS cycle recovered; entries remain disarmed. Review readiness and arm again.')
             # Manage owned positions before scanning for another entry.
