@@ -1989,9 +1989,14 @@ def handle_any_exception(e):
     confusing 'SyntaxError: string did not match expected pattern' instead of a clear message."""
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException):
-        return e  # let normal HTTP errors (404, 405, etc.) behave as Flask normally would
-    logger.exception("Unhandled exception on %s %s", request.method, request.path)
-    return jsonify({"error": "internal_error", "message": str(e)}), 500
+        if not request.path.startswith('/api/'):return e
+        response=e.get_response()
+        response.set_data(app.json.dumps(dict(error=e.name,message=e.description,status=e.code)))
+        response.content_type='application/json'
+        return response
+    reference=secrets.token_hex(6)
+    logger.exception("API failure %s on %s %s",reference,request.method,request.path)
+    return jsonify(error='internal_error',message='Server error; check backend logs with reference '+reference,reference=reference),500
 
 
 # ---------------------------------------------------------------------------
@@ -13371,7 +13376,8 @@ class StockDeskEngine(DeskEngine):
         ts=_ai_ts_naive(m.get('ts'));age=(now_ist()-ts).total_seconds()/86400 if ts else None
         if samples is None or samples<100:problems.append('need 100 chronological validation samples')
         if auc is None or not 0<=auc<=1:problems.append('validation AUC missing or invalid')  # AUC level affects sizing, not entry eligibility.
-        if brier is None or not 0<=brier<.25:problems.append('Brier score must be below 0.25')
+        if brier is None:problems.append('Brier score missing or invalid; retraining required')
+        elif not 0<=brier<=1:problems.append('Brier score metadata invalid; expected a finite value between 0 and 1')  # No Brier quality-level entry cutoff.
         if acc is None or base is None or acc<base-2:problems.append('validation accuracy below baseline tolerance')
         if age is None:problems.append('model training timestamp unavailable; automatic retraining required')
         elif age<0:problems.append('model training timestamp is in the future; check server clock')
@@ -14255,7 +14261,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.28-responsive-training.2',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.28-api-recovery.3',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14282,10 +14288,81 @@ class StockDeskEngine(DeskEngine):
 
 STOCK_DESK=StockDeskEngine(StockDeskAdapter())
 
+class DashboardSnapshot:
+    """One bounded background state job per desk; never queue one per browser poll."""
+    def __init__(self):
+        self.lock=threading.Lock();self.running=False;self.done=threading.Event()
+        self.payload=None;self.created=0.;self.generation=0;self.error=None;self.retry_at=0.
+    def invalidate(self):
+        with self.lock:
+            self.generation+=1;self.payload=None;self.created=0.;self.retry_at=0.
+    def read(self,build,encode,wait_seconds=1.):
+        now=time.monotonic()
+        with self.lock:
+            if self.payload is not None and now-self.created<=3:return self.payload,None
+            if not self.running and now>=self.retry_at:
+                self.running=True;self.done.clear();generation=self.generation
+                def job():
+                    started=time.monotonic()
+                    try:
+                        payload=encode(build())
+                        with self.lock:
+                            if self.generation==generation:
+                                self.payload=payload;self.created=started;self.error=None
+                    except Exception:
+                        reference=secrets.token_hex(6)
+                        logger.exception('Dashboard snapshot failed; reference %s',reference)
+                        with self.lock:
+                            if self.generation==generation:
+                                self.error='Dashboard calculation failed; log reference '+reference
+                                self.retry_at=time.monotonic()+5.
+                    finally:
+                        with self.lock:self.running=False;self.done.set()
+                threading.Thread(target=job,daemon=True,name='dashboard-state').start()
+            # At most ten seconds old; invalidated immediately after any control request.
+            if self.payload is not None and now-self.created<=10:return self.payload,None
+        self.done.wait(wait_seconds)
+        with self.lock:
+            if self.payload is not None and time.monotonic()-self.created<=10:return self.payload,None
+            return None,self.error or 'Dashboard refresh is busy. Retrying automatically; displayed values are stale.'
+
+_DASHBOARD_SNAPSHOTS={name:DashboardSnapshot() for name in ('stock','index','stock-risk','index-risk')}
+def dashboard_snapshot_response(name,build):
+    payload,error=_DASHBOARD_SNAPSHOTS[name].read(build,lambda value:app.json.dumps(value,allow_nan=False))
+    if payload is None:
+        response=jsonify(error='state_unavailable',message=error,retryable=True)
+        response.status_code=503;response.headers['Retry-After']='5';return response
+    return app.response_class(payload,mimetype='application/json')
+
+def dashboard_state_response(name,engine):
+    return dashboard_snapshot_response(name,engine.state)
+
+def desk_control_response(engine,action,body):
+    if not engine.control_lock.acquire(timeout=.5):
+        return jsonify(error='control_busy',message='Position supervision is busy; command was not applied. Refresh status before retrying.'),409
+    try:return jsonify(ok=True,config=engine.control(action,body))
+    finally:engine.control_lock.release()
+
+@app.after_request
+def invalidate_dashboard_after_mutation(response):
+    if request.method=='POST':
+        for name in ('stock','index'):
+            if request.path.startswith(('/api/'+name+'-ai/','/api/desk-risk/'+name,'/api/order-recovery/'+name+'/')):
+                _DASHBOARD_SNAPSHOTS[name].invalidate();_DASHBOARD_SNAPSHOTS[name+'-risk'].invalidate()
+    return response
+
+@app.route('/api/system-health')
+def dashboard_system_health():
+    # Website authentication still applies. No broker calls or ledger queries.
+    return jsonify(ok=True,build='2026.09.28-api-recovery.3',
+        kite_session_present=bool(SESSION.get('access_token')),
+        snapshots={name:dict(running=slot.running,age_seconds=round(time.monotonic()-slot.created,1) if slot.payload else None,
+            error=slot.error) for name,slot in _DASHBOARD_SNAPSHOTS.items()})
+
 @app.route('/api/stock-ai/state')
 def stock_ai_state():
     if not require_session():return jsonify(error='Connect Kite first'),401
-    return jsonify(STOCK_DESK.state())
+    return dashboard_state_response('stock',STOCK_DESK)
 
 @app.route('/api/stock-ai/config',methods=['POST'])
 def stock_ai_config():
@@ -14322,7 +14399,7 @@ def stock_ai_control(action):
             threading.Thread(target=job,daemon=True,name='stock-ai-job').start()
             return jsonify(ok=True,started=True)
         if action=='train':return jsonify(ok=True,started=STOCK_DESK.train())
-        return jsonify(ok=True,config=STOCK_DESK.control(action,body))
+        return desk_control_response(STOCK_DESK,action,body)
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
@@ -14419,7 +14496,7 @@ class IndexOptionsEngine(StockDeskEngine):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-responsive-training.2',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-api-recovery.3',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
@@ -14431,7 +14508,7 @@ INDEX_OPTIONS_DESK=IndexOptionsEngine(IndexOptionsAdapter())
 @app.route('/api/index-ai/state')
 def index_options_state():
     if not require_session():return jsonify(error='Connect Kite first'),401
-    return jsonify(INDEX_OPTIONS_DESK.state())
+    return dashboard_state_response('index',INDEX_OPTIONS_DESK)
 
 @app.route('/api/index-ai/config',methods=['POST'])
 def index_options_config():
@@ -14466,7 +14543,7 @@ def index_options_control(action):
                 finally:engine.train_lock.release()
             threading.Thread(target=job,daemon=True,name='index-history-sync').start()
             return jsonify(ok=True,started=True)
-        return jsonify(ok=True,config=engine.control(action,body))
+        return desk_control_response(engine,action,body)
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 # RETIRED ENGINE: retained exclusively for reconciliation and exits.
@@ -15766,11 +15843,14 @@ def independent_ai_risk(desk):
             body=request.get_json(silent=True)
             if not isinstance(body,dict):raise ValueError('Settings object required')
             manager.save(body)
-        states={}
-        for mode in ('paper','live'):
-            states[mode]=manager.snapshot(mode);states[mode].pop('closed',None)
-        return jsonify(config=manager.config(),states=states,broker=BROKER_GATE.status(),
-            scope=desk+' only. Separate risk, orders and models. Kite cash and API limits remain account-wide.')
+        if request.method=='POST':return jsonify(ok=True,config=manager.config())
+        def build():
+            states={}
+            for mode in ('paper','live'):
+                states[mode]=manager.snapshot(mode);states[mode].pop('closed',None)
+            return dict(config=manager.config(),states=states,broker=BROKER_GATE.status(),
+                scope=desk+' only. Separate risk, orders and models. Kite cash and API limits remain account-wide.')
+        return dashboard_snapshot_response(desk+'-risk',build)
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
@@ -15980,4 +16060,4 @@ if __name__ == "__main__":
     if ALLOW_INSECURE_NEWS:
         print("!! ALLOW_INSECURE_NEWS is on — news headline fetches will skip TLS verification on failure.")
     print("Starting server at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
