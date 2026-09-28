@@ -316,9 +316,10 @@ def kite_quote_bulk(keys, *, chunk_size=500, retries=1, force_refresh=False):
     missing=[k for k in keys if k not in result]
     # Include owned options in scanner batches so their supervision can reuse fresh books.
     owned=[]
-    guard=globals().get('SHARED_RISK')
-    if guard:
-        for engine in guard.engines.values():
+    # Quote batching is an account-level optimization, not a shared risk budget.
+    for name in ('STOCK_DESK','INDEX_OPTIONS_DESK','DESK','CAS_DESK'):
+        engine=globals().get(name)
+        if engine:
             owned.extend(p['exchange']+':'+p['contract'] for p in engine.active() if p['qty']>0)
     size=max(1,min(int(chunk_size),max(1,500-len(set(owned)))))
     for start in range(0,len(missing),size):
@@ -12106,7 +12107,7 @@ def _build_desk_engine_class():
             r=self.rows('SELECT payload FROM desk_models ORDER BY ts DESC,rowid DESC LIMIT 1')
             return json.loads(r[0]['payload']) if r else None
         def save_config(self,body):
-            with self.lock:
+            with getattr(self,'control_lock',self.lock):
                 cfg=self.config()
                 bounds=dict(capital=(1000,10000000),risk=(100,100000),daily_loss=(100,1000000),max_positions=(1,5),
                   confidence=(.55,.85),stop_pct=(3,40),reward_r=(1,4),max_spread=(.1,3),max_hold=(5,360),
@@ -12743,7 +12744,7 @@ def _build_desk_engine_class():
                 while not self.stop_event.is_set():self.cycle();self.stop_event.wait(15)
             threading.Thread(target=run,daemon=True,name='ai-desk-v2').start()
         def control(self,action,body):
-            with self.lock:
+            with getattr(self,'control_lock',self.lock):
                 cfg=self.config()
                 if action=='live-override':
                     enabled=body.get('enabled')
@@ -13000,13 +13001,18 @@ def desk_state_route():
 @app.route('/api/ai-desk/config',methods=['POST'])
 def desk_config_route():
     if not require_session():return jsonify({"error":"Connect Kite first"}),401
-    try:return jsonify({"ok":True,"config":DESK.save_config(request.get_json(silent=True) or {})})
+    try:
+        body=request.get_json(silent=True) or {}
+        if not isinstance(body,dict):raise ValueError('Settings object required')
+        with DESK.control_lock:return jsonify(ok=True,config=DESK.save_config(body))
     except (ValueError,TypeError) as e:return jsonify({"error":str(e)}),400
 
 @app.route('/api/ai-desk/control/<action>',methods=['POST'])
 def desk_control_route(action):
     if not require_session():return jsonify({"error":"Connect Kite first"}),401
     try:
+        body=request.get_json(silent=True) or {}
+        if not isinstance(body,dict):raise ValueError('Control object required')
         if action=='train':return jsonify({"ok":True,"started":DESK.train()})
         if action=='sync':
             if not DESK.train_lock.acquire(False):return jsonify({"error":"Learning job already running"}),409
@@ -13026,7 +13032,7 @@ def desk_control_route(action):
         if action=='scan':
             threading.Thread(target=DESK.cycle,daemon=True,name='desk-manual-scan').start()
             return jsonify({"ok":True})
-        return jsonify({"ok":True,"config":DESK.control(action,request.get_json(silent=True) or {})})
+        return jsonify({"ok":True,"config":DESK.control(action,body)})
     except (ValueError,TypeError) as e:return jsonify({"error":str(e)}),400
 
 @app.route('/api/ai-desk/legacy-close',methods=['POST'])
@@ -13126,6 +13132,11 @@ class StockDeskAdapter(DeskAdapter):
         except Exception:
             c.rollback();raise
         finally:c.close()
+    def spot_key(self,symbol):return 'NSE:'+symbol
+    def legacy_open(self):
+        # Other desks do not gate this desk. Broker contract ownership is still
+        # checked immediately before BUY and while reconciling owned positions.
+        return []
     def refresh(self,symbol):
         # Fast tail refresh used by the live scanner. Deep history is collected by the
         # independent resumable backfill worker below so a one-year archive never blocks
@@ -13227,7 +13238,7 @@ class StockDeskEngine(DeskEngine):
         self.a.symbols=tuple(self.get('stock_universe',[]))
         self.scan_status={'status':'IDLE','completed':0,'total':0,'deep_total':0,'deep_completed':0}
         self.ban_checked=0;self.banned=None;self.ban_error='Ban list not checked yet'
-        self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
+        self.risk_lock=threading.RLock();self.control_lock=self.risk_lock;self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
         self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
         self.execution_status={'status':'IDLE'};self.refresh_cursor=0
         self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
@@ -13294,7 +13305,7 @@ class StockDeskEngine(DeskEngine):
         auc=number('auc');brier=number('brier');acc=number('accuracy');base=number('baseline');samples=number('validation_samples')
         ts=_ai_ts_naive(m.get('ts'));age=(now_ist()-ts).total_seconds()/86400 if ts else None
         if samples is None or samples<100:problems.append('need 100 chronological validation samples')
-        if auc is None or auc<.53:problems.append('validation AUC below 0.53 or missing')
+        if auc is None or not 0<=auc<=1:problems.append('validation AUC missing or invalid')  # AUC level affects sizing, not entry eligibility.
         if brier is None or not 0<=brier<.25:problems.append('Brier score must be below 0.25')
         if acc is None or base is None or acc<base-2:problems.append('validation accuracy below baseline tolerance')
         if age is None or not 0<=age<=7:problems.append('model is missing a valid timestamp or older than 7 days')
@@ -13308,7 +13319,7 @@ class StockDeskEngine(DeskEngine):
     def check_underlying(self,s):
         ts=_ai_ts_naive(s.get('bar_ts'))
         if ts is None or not 0<=(now_ist()-ts).total_seconds()<=660:raise ValueError('Underlying candle older than 11 minutes; refresh signal')
-        key='NSE:'+s['symbol'];raw=kite_quote_bulk([key],force_refresh=True).get(key) or {}
+        key=self.a.spot_key(s['symbol']);raw=kite_quote_bulk([key],force_refresh=True).get(key) or {}
         qt=_ai_ts_naive(raw.get('timestamp'));price=float(raw.get('last_price') or 0)
         if qt is None or not -2<=(now_ist()-qt).total_seconds()<=10 or not math.isfinite(price) or price<=0:raise ValueError('Fresh underlying quote unavailable')
         reference=float(s.get('spot') or 0);atr=float((s.get('risk_plan') or {}).get('underlying_atr') or 0)
@@ -13508,7 +13519,7 @@ class StockDeskEngine(DeskEngine):
         s.update(decision='WAIT',reason='; '.join(failures[:3]),contract_failures=failures)
         return s
     def scheduled_start(self):
-        if not self.lock.acquire(False):return
+        if not self.risk_lock.acquire(False):return
         try:
             with self.risk_lock:
                 cfg=self.config();now=now_ist();today=now.date().isoformat()
@@ -13527,7 +13538,7 @@ class StockDeskEngine(DeskEngine):
                 self.put('auto_started_day',today);self.put('recovery_resume_day',None)
                 self.event('AUTO_START','Scheduled live entries armed for today; all entry gates remain active')
                 self.execution_event.set()
-        finally:self.lock.release()
+        finally:self.risk_lock.release()
     def save_config(self,body):
         if self.config()['armed'] or self.active():raise ValueError('Disarm and close/reconcile Stock positions before changing risk settings')
         body=dict(body);auto=body.pop('auto_start',None)
@@ -13679,33 +13690,15 @@ class StockDeskEngine(DeskEngine):
             if hit_target:return 1
         return None
     def _live_execution_priority_reason(self):
-        """Heavy history work yields whenever any automated live desk may need Kite."""
+        """Heavy history work yields to this desk’s live execution; API pacing remains account-wide."""
         try:
             cfg=self.config()
-            if cfg.get('mode')=='live' and cfg.get('armed'):return 'Stock AI live entries armed'
-            if any(p.get('mode')=='live' for p in self.active()):return 'Stock AI live position active'
+            if cfg.get('mode')=='live' and cfg.get('armed'):return 'This desk live entries armed'
+            if any(p.get('mode')=='live' for p in self.active()):return 'This desk live position active'
             if self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1"):
-                return 'Stock AI live order unresolved'
+                return 'This desk live order unresolved'
         except Exception:
-            return 'Stock AI live-state check unavailable'
-        for name,label in (('DESK','Index AI'),('CAS_DESK','CAS AI')):
-            desk=globals().get(name)
-            if not desk or desk is self:continue
-            try:
-                cfg=desk.config()
-                if cfg.get('mode')=='live' and cfg.get('armed'):return label+' live entries armed'
-                if any(p.get('mode')=='live' for p in desk.active()):return label+' live position active'
-                if desk.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1"):
-                    return label+' live order unresolved'
-            except Exception:
-                pass
-        try:
-            cfg=autotrade_ai_config()
-            if cfg.get('execution_mode')=='live' and cfg.get('armed'):return 'Auto Buy/Sell AI live entries armed'
-            if any(p.get('execution_mode')=='live' for p in autotrade_ai_open_positions()):
-                return 'Auto Buy/Sell AI live position active'
-        except Exception:
-            pass
+            return 'This desk live-state check unavailable'
         return None
     def _history_archive_coverage(self):
         hb=self.history_backfill_status or {}
@@ -14183,7 +14176,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.25-historical-recovery.2',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.26-independent-desks.1',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14196,19 +14189,17 @@ class StockDeskEngine(DeskEngine):
         if action in ('disarm','close'):
             with self.risk_lock:
                 cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-                if action=='close':
-                    self.put('close_requested',True)
-                    # Drop queued entries immediately; the risk thread performs broker
-                    # cancellation/reconciliation independently of the scan thread.
-                    with self.candidate_lock:self.execution_candidates=[]
-                    self.execution_event.clear()
+                with self.candidate_lock:self.execution_candidates=[]
+                self.execution_event.clear()
+                if action=='close':self.put('close_requested',True)
                 self.event('CONTROL',action)
-            if action=='close' and self.a.connected():self.supervise()
+            # The existing five-second supervisor processes close requests independently.
             return cfg
-        if not self.lock.acquire(False):raise ValueError('Scan in progress; retry after completion')
-        try:
-            with self.risk_lock:return super().control(action,body)
-        finally:self.lock.release()
+        # Scanner owns self.lock; controls serialize with execution/supervision only.
+        with self.control_lock:
+            cfg=super().control(action,body)
+            if action=='arm':self.execution_event.set()
+            return cfg
 
 STOCK_DESK=StockDeskEngine(StockDeskAdapter())
 
@@ -14220,11 +14211,9 @@ def stock_ai_state():
 @app.route('/api/stock-ai/config',methods=['POST'])
 def stock_ai_config():
     if not require_session():return jsonify(error='Connect Kite first'),401
-    if not STOCK_DESK.lock.acquire(False):return jsonify(error='Scan in progress; retry after completion'),409
     try:
-        with STOCK_DESK.risk_lock:return jsonify(ok=True,config=STOCK_DESK.save_config(request.get_json(silent=True) or {}))
+        with STOCK_DESK.control_lock:return jsonify(ok=True,config=STOCK_DESK.save_config(request.get_json(silent=True) or {}))
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
-    finally:STOCK_DESK.lock.release()
 
 @app.route('/api/stock-ai/control/<action>',methods=['POST'])
 def stock_ai_control(action):
@@ -14258,6 +14247,150 @@ def stock_ai_control(action):
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
+
+# New Index Options desk. Reuses Stock AI's execution primitives, not the retired
+# IndexAdvancedDeskEngine. Its DB owns all configuration, models, orders and risk.
+class IndexOptionsAdapter(StockDeskAdapter):
+    @contextmanager
+    def db(self):
+        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'index_options_ai_v1.db'),timeout=30)
+        c.row_factory=sqlite3.Row
+        try:
+            c.execute('PRAGMA journal_mode=WAL');yield c;c.commit()
+        except Exception:c.rollback();raise
+        finally:c.close()
+    def spot_key(self,symbol):return INDEX_SYMBOLS[symbol]
+    def chain(self,symbol):
+        exchange,opts=get_option_instruments_for_symbol(symbol)
+        today=now_ist().date()
+        # Derive expiry/lot/tick from current instruments; avoid expiry-day entries.
+        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=1})
+        if not expiries:return None,'No index option expiry at least one calendar day away'
+        data,err=get_chain_for_symbol(symbol,str(expiries[0]))
+        if err:return None,err
+        data=dict(data);data['unfiltered_contracts']=len(data['chain'])
+        data['chain']=[o for o in data['chain'] if float(o.get('volume') or 0)>=max(1,int(o.get('lot_size') or 1))*10 and float(o.get('oi') or 0)>=max(1,int(o.get('lot_size') or 1))*20]
+        return data,None
+
+class IndexOptionsEngine(StockDeskEngine):
+    UNIVERSE=('NIFTY','BANKNIFTY','FINNIFTY','SENSEX')
+    def __init__(self,adapter):
+        super().__init__(adapter)
+        self.a.symbols=self.UNIVERSE
+        self.scan_status.update(total=len(self.UNIVERSE))
+    def _install_stock_automation(self):
+        if self.get('index_options_engine_v1'):return
+        cfg=self.config()
+        cfg.update(mode='paper',armed=False,live_override=False,auto_start=False,
+            capital=100000.,daily_loss=5000.,max_positions=2,confidence=.60,
+            max_spread=.8,max_hold=60,cooldown=10,square_off='15:15')
+        self.put('config',cfg);self.put('index_options_engine_v1',True)
+        self.event('SYSTEM','New independent Index Options engine; paper mode, entries disarmed. No retired engine records or models imported.')
+    def _install_adaptive_risk(self):
+        if self.get('index_adaptive_risk_v1'):return
+        cfg=self.config();cfg.update(adaptive_risk=True,lots=0)
+        self.put('config',cfg);self.put('index_adaptive_risk_v1',True)
+        self.event('SYSTEM','Adaptive ATR/delta stops, cost-aware whole-lot sizing and tightening-only trails enabled.')
+    def _full_mode(self):return False
+    def inspect(self,symbol):
+        if symbol not in self.UNIVERSE:raise ValueError('Index outside this desk universe')
+        s=self.inspect_contracts(symbol);s['scan_stage']='DEEP'
+        if s.get('decision')!='READY':s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
+        return s
+    def save_config(self,body):
+        try:return super().save_config(body)
+        except ValueError as e:raise ValueError(str(e).replace('Stock','Index')) from e
+    def cycle(self):
+        if not self.lock.acquire(False):return
+        try:
+            self.last_cycle=now_ist().isoformat()
+            if not self.a.connected():return
+            self._ensure_deep_history_backfill()
+            if not self.a.market_open():
+                self.scan_status.update(status='MARKET CLOSED',completed=0,total=len(self.UNIVERSE))
+                self.settle_observations();self.maybe_train();self._ensure_historical_success_training();return
+            self.scan_status=dict(status='SCANNING INDICES',completed=0,total=len(self.UNIVERSE),started=now_ist().isoformat())
+            signals={}
+            for i,symbol in enumerate(self.UNIVERSE):
+                try:signals[symbol]=self.inspect(symbol)
+                except Exception as e:signals[symbol]=dict(symbol=symbol,decision='WAIT',reason=str(e),rank_score=0)
+                self.scan_status.update(completed=i+1,symbol=symbol)
+            self.signals=signals
+            ranked=sorted(signals.values(),key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
+            self._publish_execution_candidates(ranked)
+            self.settle_observations();self.maybe_train();self.train_success_model();self._ensure_historical_success_training()
+            self.scan_status.update(status='COMPLETE',ready=sum(x.get('decision')=='READY' for x in ranked),finished=now_ist().isoformat())
+        except Exception as e:
+            self.scan_status.update(status='ERROR',error=str(e));self.event('ERROR','Index scan: '+str(e))
+        finally:self.lock.release()
+    def start(self):
+        if self.started:return
+        self.started=True
+        def scan_loop():
+            while not self.stop_event.is_set():self.cycle();self.stop_event.wait(15)
+        def risk_loop():
+            while not self.stop_event.wait(5):
+                if self.a.connected():self.supervise();self.scheduled_start()
+        def execution_loop():
+            while not self.stop_event.is_set():
+                self.execution_event.wait(1)
+                if self.stop_event.is_set():break
+                if self.execution_event.is_set():self.execution_event.clear();self.execute_candidates()
+        for target,name in ((scan_loop,'scan'),(risk_loop,'risk'),(execution_loop,'execution')):
+            threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
+    def state(self):
+        s=super().state();quality=self.model_quality()
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.26-independent-desks.1',
+            universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
+            watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
+            model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
+            risk_scope='Index desk only; independent of Stock AI')
+        return s
+
+INDEX_OPTIONS_DESK=IndexOptionsEngine(IndexOptionsAdapter())
+
+@app.route('/api/index-ai/state')
+def index_options_state():
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    return jsonify(INDEX_OPTIONS_DESK.state())
+
+@app.route('/api/index-ai/config',methods=['POST'])
+def index_options_config():
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return jsonify(error='Settings object required'),400
+    try:
+        with INDEX_OPTIONS_DESK.control_lock:return jsonify(ok=True,config=INDEX_OPTIONS_DESK.save_config(body))
+    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+@app.route('/api/index-ai/control/<action>',methods=['POST'])
+def index_options_control(action):
+    if not require_session():return jsonify(error='Connect Kite first'),401
+    body=request.get_json(silent=True) or {}
+    if not isinstance(body,dict):return jsonify(error='Control object required'),400
+    engine=INDEX_OPTIONS_DESK
+    try:
+        if action=='train':return jsonify(ok=True,started=engine.train())
+        if action=='scan':
+            threading.Thread(target=engine.cycle,daemon=True,name='index-manual-scan').start()
+            return jsonify(ok=True,started=True)
+        if action=='sync':
+            if not engine.train_lock.acquire(False):return jsonify(error='Learning job already running'),409
+            def job():
+                try:
+                    for i,symbol in enumerate(engine.a.symbols):
+                        engine.training=dict(status='SYNCING HISTORY',progress=25*i)
+                        engine.a.refresh(symbol)
+                    engine.training=dict(status='HISTORY READY',progress=100)
+                    engine._ensure_deep_history_backfill(force=True)
+                except Exception as e:engine.training=dict(status='ERROR',error=str(e),progress=0)
+                finally:engine.train_lock.release()
+            threading.Thread(target=job,daemon=True,name='index-history-sync').start()
+            return jsonify(ok=True,started=True)
+        return jsonify(ok=True,config=engine.control(action,body))
+    except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
+
+# RETIRED ENGINE: retained exclusively for reconciliation and exits.
 # ===========================================================================
 # INDEX AI V4 — hierarchical success intelligence beyond the Stock AI layer.
 #
@@ -14331,7 +14464,7 @@ def _index_public_model(model):
 class IndexAdvancedDeskEngine(DeskEngine):
     def __init__(self,adapter):
         super().__init__(adapter)
-        self.risk_lock=threading.Lock();self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
+        self.risk_lock=threading.RLock();self.control_lock=self.risk_lock;self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
         self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
         self.execution_status={'status':'IDLE'}
         self.hist_success_lock=threading.Lock();self.hist_success_thread=None;self.hist_success_last_attempt=0.;self.hist_success_cache=None;self.hist_success_cache_at=0.
@@ -14683,7 +14816,9 @@ class IndexAdvancedDeskEngine(DeskEngine):
         if s.get('decision')!='READY' or not s.get('execution_quality_pass') or self.block() or self.get('close_requested'):return
         fresh=self.inspect(s['symbol']);self.signals[s['symbol']]=fresh
         if fresh.get('decision')!='READY' or not fresh.get('execution_quality_pass') or self.get('close_requested'):return
-        return super().enter(fresh)
+        with self.risk_lock:
+            if self.block() or self.get('close_requested'):return
+            return super().enter(fresh)
     def _publish_execution_candidates(self,ranked):
         ready=[dict(s) for s in ranked if s.get('decision')=='READY' and s.get('execution_quality_pass')]
         with self.candidate_lock:
@@ -14705,6 +14840,9 @@ class IndexAdvancedDeskEngine(DeskEngine):
         if not self.risk_lock.acquire(False):return
         try:
             self.reconcile();self.verify_positions()
+            if self.get('close_requested'):
+                for order in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
+                    if order.get('broker_id'):self.a.cancel(order['broker_id'])
             if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
         except Exception as e:self.put('halt','Index supervision error: '+str(e));self.event('ERROR',str(e))
         finally:self.risk_lock.release()
@@ -14762,25 +14900,30 @@ class IndexAdvancedDeskEngine(DeskEngine):
         if lm and lm.get('valid'):valid.append('PAPER')
         dm=s.get('model') or {};direction_live_ready=bool(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
         success_live_ready=bool(valid)
-        s.update(build=INDEX_AI_BUILD,scan=dict(self.scan_status),execution=dict(self.execution_status),historical_success_model=_index_public_model(hm),shadow_success_model=_index_public_model(sm),live_success_model=_index_public_model(lm),
+        s.update(runtime_build='2026.09.25-index-options.1',symbols=list(self.a.symbols),risk_scope='Shared account exposure and daily limits with Stock AI; desk settings also apply',build=INDEX_AI_BUILD,scan=dict(self.scan_status),execution=dict(self.execution_status),historical_success_model=_index_public_model(hm),shadow_success_model=_index_public_model(sm),live_success_model=_index_public_model(lm),
             success_selector_status=' + '.join(valid) if valid else 'DIRECTIONAL FALLBACK',shadow=self.shadow_stats(),live_model_validation_ready=bool(direction_live_ready and success_live_ready),
             live_model_validation_reason='READY' if direction_live_ready and success_live_ready else ('Direction validation gate not met' if not direction_live_ready else 'No success layer validated'),
             quality_gate=dict(min_success=INDEX_EXEC_MIN_SUCCESS,min_expected_r=INDEX_EXEC_MIN_EXPECTED_R,fallback_confidence=INDEX_EXEC_FALLBACK_MIN_CONFIDENCE,min_direction_auc=INDEX_DIRECTION_MIN_AUC))
         return s
     def control(self,action,body):
-        if action in ('disarm','close'):
-            with self.risk_lock:
+        # Index controls do not wait for the universe scan. Execution remains serialized.
+        with self.control_lock:
+            if action in ('disarm','close'):
                 cfg=self.config();cfg['armed']=False;self.put('config',cfg)
-                if action=='close':self.put('close_requested',True);self.execution_event.clear();self.execution_candidates=[]
+                with self.candidate_lock:self.execution_candidates=[]
+                self.execution_event.clear()
+                if action=='close':self.put('close_requested',True)
                 self.event('CONTROL',action)
-            if action=='close' and self.a.connected():self.supervise()
-            return cfg
-        cfg=self.config();target_mode=body.get('mode') if action=='mode' else cfg.get('mode')
-        if target_mode=='live' and action in ('mode','arm'):
-            dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
-            if not direction_ok:raise ValueError('Live Index AI requires a validated direction model meeting the configured AUC/accuracy gate')
-            if not self._validated_success_layer_available():raise ValueError('Live Index AI requires at least one validated success layer; manual paper-evidence override does not bypass model validation')
-        return super().control(action,body)
+                return cfg
+            cfg=self.config();target_mode=body.get('mode') if action=='mode' else cfg.get('mode')
+            if action=='arm' and self.get('close_requested'):raise ValueError('Close request still pending; wait for reconciliation')
+            if target_mode=='live' and action in ('mode','arm'):
+                dm=self.model() or {};direction_ok=(dm.get('auc') is not None and float(dm.get('auc'))>=INDEX_DIRECTION_MIN_AUC and float(dm.get('accuracy') or 0)>=float(dm.get('baseline') or 0)-2)
+                if not direction_ok:raise ValueError('Live Index AI requires a validated direction model meeting the displayed AUC/accuracy gate')
+                if not self._validated_success_layer_available():raise ValueError('Live Index AI requires at least one validated success layer; paper-evidence override does not bypass model validation')
+            result=super().control(action,body)
+            if action=='arm':self.execution_event.set()
+            return result
 
 # Replace the base index desk before shared risk and worker startup. Flask routes
 # above resolve the global DESK at request time, so they automatically use V4.
@@ -15361,7 +15504,7 @@ class SharedAIRisk:
         cfg={**self.DEFAULTS,**self.owner.get('shared_risk_config',{})};cfg.pop('loss_streak',None);return cfg
     def save(self,body):
         with self.lock:
-            if any(e.config()['armed'] or e.active() for e in self.engines.values()):raise ValueError('Disarm all three desks and close/reconcile positions before changing shared risk settings')
+            if any(e.config()['armed'] or e.active() for e in self.engines.values()):raise ValueError('Disarm this desk and close/reconcile positions before changing risk settings')
             cfg=self.config()
             bounds=dict(daily_loss=(100,1000000),profit_activation=(100,1000000),profit_giveback=(100,1000000),symbol_losses=(1,20),max_trades=(1,100),max_positions=(1,10))
             for key,value in body.items():
@@ -15376,10 +15519,10 @@ class SharedAIRisk:
                         if not v.is_integer():raise ValueError('Whole number required: '+key)
                         v=int(v)
                     cfg[key]=v
-                else:raise ValueError('Unknown shared setting: '+key)
+                else:raise ValueError('Unknown risk setting: '+key)
             if cfg['profit_protection_enabled'] and cfg['profit_giveback']>=cfg['profit_activation']:raise ValueError('Giveback must be below profit activation')
             self.owner.put('shared_risk_config',cfg)
-            self.owner.event('SHARED_RISK','Shared limits updated; existing daily latches retained')
+            self.owner.event('DESK_RISK','Desk limits updated; existing daily latches retained')
             return cfg
     def snapshot(self,mode):
         with self.lock:
@@ -15465,7 +15608,7 @@ class SharedAIRisk:
                     if prior_key==signal:return 'Signal already used; wait for a fresh signal'
         required=(float(s['entry'])-float(s['stop']))*int(s['qty'])+2*cfg['fee_per_order']
         if not math.isfinite(required) or required<=0:return 'Invalid planned entry risk'
-        if e.desk_name=='stock' and cfg.get('adaptive_risk'):
+        if cfg.get('adaptive_risk'):
             plan=s.get('risk_plan') or {}
             if plan.get('policy')!='adaptive-v1':return 'Missing adaptive entry risk plan'
             available=min(float(view['remaining']),max(0.,cfg['daily_loss']+view['desk_totals'][e.desk_name]-view['desk_reserved'][e.desk_name]))
@@ -15480,30 +15623,76 @@ class SharedAIRisk:
         elif required>cfg['risk']+.01:return 'Planned loss including estimated fees exceeds per-trade risk'
         floor=-limits['daily_loss']
         if limits['profit_protection_enabled'] and view['peak']>=limits['profit_activation']:floor=max(floor,view['peak']-limits['profit_giveback'])
-        if required>view['net']-view['reserved']-floor:return 'Insufficient shared risk remaining for this entry'
+        if required>view['net']-view['reserved']-floor:return 'Insufficient desk risk remaining for this entry'
         if view['desk_totals'][e.desk_name]-view['desk_reserved'][e.desk_name]-required < -cfg['daily_loss']:return 'Insufficient desk daily risk remaining'
         s['shared_signal_key']=signal;s['shared_risk_at_entry']={k:v for k,v in view.items() if k!='closed'}
         return None
 
 
-SHARED_RISK=SharedAIRisk({'index':DESK,'stock':STOCK_DESK,'cas':CAS_DESK})
+class IndependentDeskRisk(SharedAIRisk):
+    """Reuse the risk calculations with exactly one ledger, never a pooled budget.
 
+    The inherited engine attribute `shared_risk` is a compatibility interface;
+    each desk has a different manager, mutex, configuration and persisted latch.
+    """
+    def __init__(self,name,engine):
+        self.engines={name:engine};self.owner=engine;self.lock=threading.RLock()
+        engine.shared_risk=self;engine.desk_name=name
+        if engine.get('independent_risk_config') is None:
+            # Migrate preferences once, never the former combined P&L or latch.
+            prior=engine.get('shared_risk_config',{})
+            if name=='stock' and globals().get('DESK'):prior=DESK.get('shared_risk_config',{})
+            own={k:v for k,v in prior.items() if k in self.DEFAULTS and k not in ('daily_loss','max_positions')}
+            engine.put('independent_risk_config',own)
+    def config(self):
+        cfg={**self.DEFAULTS,**self.owner.get('independent_risk_config',{})}
+        cfg['daily_loss']=self.owner.config()['daily_loss']
+        cfg['max_positions']=self.owner.config()['max_positions']
+        cfg.pop('loss_streak',None)
+        return cfg
+    def save(self,body):
+        # Serialize with this desk's controls/execution, not its scanner.
+        with getattr(self.owner,'control_lock',self.owner.lock),self.lock:
+            if self.owner.config()['armed'] or self.owner.active():
+                raise ValueError('Disarm this desk and close/reconcile its positions before changing limits')
+            if 'max_positions' in body and float(body['max_positions'])>5:raise ValueError('Maximum positions must be 1–5')
+            cfg=super().save(body)
+            self.owner.put('independent_risk_config',cfg)
+            own=self.owner.config();own['daily_loss']=cfg['daily_loss'];own['max_positions']=cfg['max_positions'];self.owner.put('config',own)
+            return self.config()
+    def snapshot(self,mode):
+        view=super().snapshot(mode)
+        for key in ('reason','entry_block'):
+            if view.get(key):view[key]=view[key].replace('Combined AI','Desk').replace('in another or this AI desk','in this desk')
+        view['scope']=self.owner.desk_name
+        return view
+
+STOCK_RISK=IndependentDeskRisk('stock',STOCK_DESK)
+INDEX_RISK=IndependentDeskRisk('index',INDEX_OPTIONS_DESK)
+# Retained engines continue exit supervision on their own ledgers only.
+LEGACY_INDEX_RISK=IndependentDeskRisk('legacy-index',DESK)
+CAS_RISK=IndependentDeskRisk('cas',CAS_DESK)
 
 @app.route('/api/shared-ai-risk',methods=['GET','POST'])
 def shared_ai_risk():
+    return jsonify(error='Shared risk was removed. Use /api/desk-risk/stock or /api/desk-risk/index.'),410
+
+@app.route('/api/desk-risk/<desk>',methods=['GET','POST'])
+def independent_ai_risk(desk):
     if not require_session():return jsonify(error='Connect Kite first'),401
+    manager={'stock':STOCK_RISK,'index':INDEX_RISK}.get(desk)
+    if manager is None:return jsonify(error='Unknown active desk'),404
     try:
         if request.method=='POST':
             body=request.get_json(silent=True)
             if not isinstance(body,dict):raise ValueError('Settings object required')
-            SHARED_RISK.save(body)
+            manager.save(body)
         states={}
         for mode in ('paper','live'):
-            states[mode]=SHARED_RISK.snapshot(mode);states[mode].pop('closed',None)
-        return jsonify(config=SHARED_RISK.config(),states=states,broker=BROKER_GATE.status(),scope='Three AI desks in this backend process; excludes manual, legacy and other-app trades. Keep one backend worker process.')
+            states[mode]=manager.snapshot(mode);states[mode].pop('closed',None)
+        return jsonify(config=manager.config(),states=states,broker=BROKER_GATE.status(),
+            scope=desk+' only. Separate risk, orders and models. Kite cash and API limits remain account-wide.')
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
-
-
 
 
 @app.route('/api/cas-ai/state')
@@ -15543,7 +15732,7 @@ def cas_ai_control(action):
 @app.route('/api/order-recovery/<desk>/<oid>',methods=['POST'])
 def recover_desk_order(desk,oid):
     if not require_session():return jsonify(error='Connect Kite first'),401
-    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+    engine={'stock':STOCK_DESK,'index':INDEX_OPTIONS_DESK,'legacy-index':DESK,'cas':CAS_DESK}.get(desk)
     if engine is None:return jsonify(error='Unknown desk'),404
     body=request.get_json(silent=True)
     if not isinstance(body,dict) or body.get('action') not in ('cancel','verify-not-placed','import-terminal'):return jsonify(error='Valid recovery action required'),400
@@ -15559,14 +15748,14 @@ def recover_desk_order(desk,oid):
 @app.route('/api/trade-review/<desk>/<pid>')
 def desk_trade_review(desk,pid):
     if not require_session():return jsonify(error='Connect Kite first'),401
-    engine={'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+    engine={'stock':STOCK_DESK,'index':INDEX_OPTIONS_DESK,'legacy-index':DESK,'cas':CAS_DESK}.get(desk)
     if engine is None:return jsonify(error='Unknown desk'),404
     try:return jsonify(engine.trade_review(pid))
     except ValueError as e:return jsonify(error=str(e)),404
 
 
 def _review_engine(desk):
-    return {'stock':STOCK_DESK,'index':DESK,'cas':CAS_DESK}.get(desk)
+    return {'stock':STOCK_DESK,'index':INDEX_OPTIONS_DESK,'legacy-index':DESK,'cas':CAS_DESK}.get(desk)
 
 
 def _review_filter():
@@ -15700,6 +15889,7 @@ def start_application_workers():
     threading.Thread(target=_autotrade_loop,daemon=True).start()
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
     STOCK_DESK.start()
+    INDEX_OPTIONS_DESK.start()
     threading.Thread(target=retired_ai_supervisor,daemon=True,name='retired-ai-exits').start()
 
 start_application_workers()
