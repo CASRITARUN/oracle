@@ -12104,8 +12104,18 @@ def _build_desk_engine_class():
             with self.db() as c:return [dict(r) for r in c.execute(sql,args).fetchall()]
         def active(self):return self.rows("SELECT * FROM desk_positions WHERE status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING') ORDER BY ts")
         def model(self):
-            r=self.rows('SELECT payload FROM desk_models ORDER BY ts DESC,rowid DESC LIMIT 1')
-            return json.loads(r[0]['payload']) if r else None
+            r=self.rows('SELECT ts,payload FROM desk_models ORDER BY ts DESC,rowid DESC LIMIT 1')
+            if not r:return None
+            model=json.loads(r[0]['payload'])
+            # Recover missing/invalid payload metadata from the saved model row,
+            # never from today's clock. Genuine model age remains unchanged.
+            try:dt(model.get('ts'))
+            except (TypeError,ValueError,OverflowError):
+                try:
+                    model['ts']=dt(r[0]['ts']).isoformat()
+                    model['timestamp_source']='saved model database row'
+                except (TypeError,ValueError,OverflowError):pass
+            return model
         def save_config(self,body):
             with getattr(self,'control_lock',self.lock):
                 cfg=self.config()
@@ -12700,13 +12710,44 @@ def _build_desk_engine_class():
                     # exchange partial fills remain pending and are reconciled, not fabricated.
                     self.submit(p,'SELL',qty if p['mode']=='paper' else desired,max(tick,round(math.floor(price/tick)*tick,2)),reason)
         def maybe_train(self):
-            if self.train_lock.locked() or self.training.get('status')=='ERROR':return
-            model=self.model()
-            latest=[self.a.bars(symbol,1) for symbol in self.a.symbols]
-            newest=max((dt(rows[-1]['ts']) for rows in latest if rows),default=None)
-            enough=sum(max(0,len(self.a.bars(symbol,2000))-203)//3 for symbol in self.a.symbols)>=300
-            if not model and enough:self.train()
-            elif model and newest and not self.a.market_open() and datetime.now(IST).strftime('%H:%M')>='15:35' and newest>dt(model['ts']):self.train()
+            if self.train_lock.locked():return
+            clock=time.monotonic()
+            # Transient failures retry after fifteen minutes, not on every scan.
+            if clock<getattr(self,'_auto_train_retry_at',0.):return
+            self._auto_train_retry_at=clock+900.
+            try:
+                model=self.model();now=datetime.now(IST);model_ts=None
+                if model:
+                    try:model_ts=dt(model.get('ts'))
+                    except (TypeError,ValueError,OverflowError):pass
+                age=(now-model_ts).total_seconds()/86400 if model_ts else None
+                stale=not model or age is None or not 0<=age<=7
+                completed=[]
+                for symbol in self.a.symbols:
+                    for row in self.a.bars(symbol,2):
+                        try:
+                            candle=dt(row['ts'])
+                            if candle+timedelta(minutes=5)<=now:completed.append(candle)
+                        except (KeyError,TypeError,ValueError,OverflowError):continue
+                newest=max(completed,default=None)
+                retry_error=self.training.get('status')=='ERROR'
+                after_close=bool(model and model_ts and newest and not self.a.market_open()
+                    and now.strftime('%H:%M')>='15:35' and newest>model_ts)
+                if not (stale or retry_error or after_close):return
+                # Do not give an expired archive a fresh training timestamp.
+                if newest is None or (now-newest).total_seconds()>7*86400:
+                    self.training=dict(status='WAITING FOR HISTORY',progress=0,
+                        error='Automatic training needs recent completed candles; connect Kite and sync recent history. Retry within 15 minutes.')
+                    return
+                enough=sum(max(0,len(self.a.bars(symbol,2000))-203)//3 for symbol in self.a.symbols)>=300
+                if not enough:
+                    self.training=dict(status='WAITING FOR HISTORY',progress=0,
+                        error='Need at least 300 labelled observations; historical collection continues. Retry within 15 minutes.')
+                    return
+                if self.train():self.event('AUTO_TRAIN','Refreshing missing/expired model or retrying training; entry validation remains active.')
+            except Exception as e:
+                self.training=dict(status='ERROR',progress=0,error='Automatic training: '+str(e)+'; retry within 15 minutes')
+                self.event('ERROR',self.training['error'])
 
         def cycle(self):
             if not self.lock.acquire(False):return
@@ -13308,7 +13349,9 @@ class StockDeskEngine(DeskEngine):
         if auc is None or not 0<=auc<=1:problems.append('validation AUC missing or invalid')  # AUC level affects sizing, not entry eligibility.
         if brier is None or not 0<=brier<.25:problems.append('Brier score must be below 0.25')
         if acc is None or base is None or acc<base-2:problems.append('validation accuracy below baseline tolerance')
-        if age is None or not 0<=age<=7:problems.append('model is missing a valid timestamp or older than 7 days')
+        if age is None:problems.append('model training timestamp unavailable; automatic retraining required')
+        elif age<0:problems.append('model training timestamp is in the future; check server clock')
+        elif age>7:problems.append(f'model trained {age:.1f} days ago (maximum 7); automatic retraining pending — see Learning lab')
         weight=0. if problems else min(1.,max(.25,(auc-.5)/.15))*min(1.,samples/300.)
         return dict(live_ok=not problems,risk_weight=weight,issues=problems,age_days=age,
                     note='Validation-quality proxy; confidence is not a calibrated win probability')
@@ -14176,7 +14219,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.26-independent-desks.1',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.28-model-refresh.1',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14340,7 +14383,7 @@ class IndexOptionsEngine(StockDeskEngine):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.26-independent-desks.1',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-model-refresh.1',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
