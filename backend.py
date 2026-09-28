@@ -32,6 +32,10 @@ IMPORTANT
 """
 
 import os
+# Keep numerical training from starting a BLAS worker on every VM core.
+# Set before NumPy is imported; web and risk workers need CPU headroom.
+for _math_pool in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+    os.environ[_math_pool]='1'
 import math
 import time
 import json
@@ -64,7 +68,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
 API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
-REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo2.wecon.in/api/callback")
+REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
 # "self-signed certificate in certificate chain" errors), set this env var to allow the news
@@ -11970,6 +11974,17 @@ def breakout_diagnostics():
 from contextlib import contextmanager
 # Embedded engine: this backend needs no separate ai_engine_v2.py file.
 # A private factory preserves the engine namespace without changing other sections.
+# CPU scheduling only: strategy ledgers and risk limits remain independent.
+_AI_TRAINING_SLOT=threading.Semaphore(1)
+def _serialized_training(fn):
+    from functools import wraps
+    @wraps(fn)
+    def run(self,*args,**kwargs):
+        if fn.__name__=='_train':self.training=dict(status='QUEUED FOR TRAINING',progress=0)
+        with _AI_TRAINING_SLOT:
+            return fn(self,*args,**kwargs)
+    return run
+
 def _build_desk_engine_class():
     """AI Desk v2: historical direction models, forward evidence and durable orders.
     Injected broker/archive adapter; no credentials and no import-time workers.
@@ -12012,6 +12027,7 @@ def _build_desk_engine_class():
         mu=X.mean(0);sd=np.maximum(X.std(0),1e-5);z=np.clip((X-mu)/sd,-6,6)
         w=np.zeros(X.shape[1]);bias=0.
         for _ in range(220):
+            if _%5==0:time.sleep(.005)
             err=sigmoid(z@w+bias)-Y
             w-=.06*(z.T@err/len(Y)+.02*w);bias-=.06*err.mean()
         return dict(mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(bias))
@@ -12140,17 +12156,24 @@ def _build_desk_engine_class():
         def train(self):
             if not self.train_lock.acquire(False):return False
             threading.Thread(target=self._train,daemon=True,name='desk-train').start();return True
+        @_serialized_training
         def _train(self):
             try:
                 self.training=dict(status='READING ARCHIVE',progress=5)
                 samples=[];coverage=[]
+                per_symbol_cap=max(1,min(1500,80000//max(1,len(self.a.symbols))))
                 for j,symbol in enumerate(self.a.symbols):
                     rows=[r for r in self.a.bars(symbol,20000) if dt(r['ts'])+timedelta(minutes=5)<=datetime.now(IST)]
                     coverage.append(dict(symbol=symbol,bars=len(rows),first=str(rows[0]['ts']) if rows else None,last=str(rows[-1]['ts']) if rows else None))
                     if len(rows)<300:continue
                     arr={k:np.array([float(r[k] or 0) for r in rows]) for k in ('close','high','low','volume')}
                     arr['ts']=[str(r['ts']) for r in rows]
-                    for i in range(200,len(rows)-3,3):
+                    eligible=[i for i in range(200,len(rows)-3,3)
+                        if (dt(rows[i+3]['ts'])-dt(rows[i]['ts'])).total_seconds()==900]
+                    if len(eligible)>per_symbol_cap:
+                        eligible=[eligible[int(k)] for k in np.linspace(0,len(eligible)-1,per_symbol_cap,dtype=int)]
+                    for sample_no,i in enumerate(eligible):
+                        if sample_no%32==0:time.sleep(.01)
                         t=dt(rows[i]['ts']);end=dt(rows[i+3]['ts'])
                         if (end-t).total_seconds()!=900:continue
                         f=self.a.features(rows,i,arr);x=[f[k] for k in FEATURES]
@@ -12164,7 +12187,7 @@ def _build_desk_engine_class():
                 if len(set(Y))<2:raise ValueError('Training requires both UP and DOWN outcomes')
                 self.training=dict(status='FITTING & VALIDATING',progress=80)
                 m=fit(X,Y);pred=predict(m,[r[2] for r in val]);y=np.array([r[3] for r in val])
-                m.update(id=uuid.uuid4().hex[:12],ts=stamp(),features=FEATURES,train_samples=len(train),validation_samples=len(val),
+                m.update(id=uuid.uuid4().hex[:12],ts=stamp(),features=FEATURES,sampling_policy='evenly spaced chronological samples per symbol; at most 80000 total',sample_cap_per_symbol=per_symbol_cap,train_samples=len(train),validation_samples=len(val),
                     accuracy=float(((pred>=.5)==y).mean()*100),auc=auc(y,pred),brier=float(np.mean((pred-y)**2)),
                     baseline=float(max(y.mean(),1-y.mean())*100),coverage=coverage,
                     train_end=datetime.fromtimestamp(max(r[1] for r in train),IST).isoformat(),
@@ -13134,6 +13157,7 @@ def _stock_success_fit(X,Y):
     mu=X.mean(0);sd=np.maximum(X.std(0),1e-5);z=np.clip((X-mu)/sd,-6,6)
     w=np.zeros(X.shape[1]);b=0.0
     for _ in range(260):
+        if _%5==0:time.sleep(.005)
         err=_stock_success_sigmoid(z@w+b)-Y
         w-=.05*(z.T@err/len(Y)+.03*w);b-=.05*err.mean()
     return dict(mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b))
@@ -13282,7 +13306,7 @@ class StockDeskEngine(DeskEngine):
         self.risk_lock=threading.RLock();self.control_lock=self.risk_lock;self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
         self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
         self.execution_status={'status':'IDLE'};self.refresh_cursor=0
-        self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
+        self.success_job_lock=threading.Lock();self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
         self.hist_success_lock=threading.Lock();self.hist_success_model_cache=None;self.hist_success_model_cache_at=0.0
         self.hist_success_thread=None;self.hist_success_last_attempt=0.0
         self.history_backfill_thread=None;self.history_backfill_last_attempt=0.0;self.history_backfill_universe=()
@@ -13822,6 +13846,7 @@ class StockDeskEngine(DeskEngine):
         m=self.get('historical_setup_success_model')
         self.hist_success_model_cache=m;self.hist_success_model_cache_at=now
         return m
+    @_serialized_training
     def train_historical_success_model(self,force=False):
         if not self.hist_success_lock.acquire(False):return self.historical_success_model()
         try:
@@ -13852,6 +13877,7 @@ class StockDeskEngine(DeskEngine):
                 arr={k:np.asarray([float(r[k] or 0) for r in rows],float) for k in ('close','high','low','volume')};arr['ts']=[str(r['ts']) for r in rows]
                 made=[]
                 for i in range(200,len(rows)-horizon,3):
+                    if (i-200)%96==0:time.sleep(.01)
                     try:
                         t=datetime.fromisoformat(str(rows[i]['ts']).replace('Z','+00:00'))
                         if t.tzinfo is None:t=t.replace(tzinfo=IST)
@@ -13934,6 +13960,16 @@ class StockDeskEngine(DeskEngine):
         m=self.get('trade_success_model')
         self.success_model_cache=m;self.success_model_cache_at=now
         return m
+    def request_success_training(self):
+        if not self.success_job_lock.acquire(False):return False
+        def job():
+            try:self.train_success_model()
+            except Exception as e:self.event('ERROR','Paper-model training: '+str(e))
+            finally:self.success_job_lock.release()
+        try:threading.Thread(target=job,daemon=True,name='paper-success-training').start()
+        except Exception:self.success_job_lock.release();raise
+        return True
+    @_serialized_training
     def train_success_model(self,force=False):
         if not self.success_lock.acquire(False):return self.success_model()
         try:
@@ -13970,7 +14006,7 @@ class StockDeskEngine(DeskEngine):
         finally:self.success_lock.release()
     def _apply_success_intelligence(self,s):
         if s.get('decision')!='READY':return s
-        live_model=self.success_model() or self.train_success_model()
+        live_model=self.success_model()
         hist_model=self.historical_success_model()
         archive=self._history_archive_coverage()
         live_ts=_ai_ts_naive((live_model or {}).get('updated'))
@@ -14168,7 +14204,7 @@ class StockDeskEngine(DeskEngine):
             # Scanner only publishes the ranked READY list.  A dedicated execution
             # thread performs fresh pre-entry validation and broker submission.
             self._publish_execution_candidates(ranked)
-            self.settle_observations();self.maybe_train();self.train_success_model();self._ensure_historical_success_training()
+            self.settle_observations();self.maybe_train();self.request_success_training();self._ensure_historical_success_training()
             self.scan_status.update(status='COMPLETE',phase='Complete',completed=len(names),ready=sum(1 for s in self.signals.values() if s.get('decision')=='READY'),finished=now_ist().isoformat())
             self.last_cycle=now_ist().isoformat()
             if self.get('close_requested') and not self.active():self.put('close_requested',False)
@@ -14214,12 +14250,12 @@ class StockDeskEngine(DeskEngine):
         s=super().state()
         s['signals'].sort(key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
         for i,row in enumerate(s['signals'],1):row['rank']=i
-        sm=self.train_success_model();hm=self.historical_success_model()
+        sm=self.success_model();hm=self.historical_success_model()
         if sm:sm={k:v for k,v in sm.items() if k not in ('mu','sd','w','bias')}
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.28-model-refresh.1',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.28-responsive-training.2',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14361,7 +14397,7 @@ class IndexOptionsEngine(StockDeskEngine):
             self.signals=signals
             ranked=sorted(signals.values(),key=lambda x:(x.get('decision')=='READY',x.get('success_probability') is not None,float(x.get('success_probability') or 0),float(x.get('expected_r') or -99),float(x.get('rank_score') or 0)),reverse=True)
             self._publish_execution_candidates(ranked)
-            self.settle_observations();self.maybe_train();self.train_success_model();self._ensure_historical_success_training()
+            self.settle_observations();self.maybe_train();self.request_success_training();self._ensure_historical_success_training()
             self.scan_status.update(status='COMPLETE',ready=sum(x.get('decision')=='READY' for x in ranked),finished=now_ist().isoformat())
         except Exception as e:
             self.scan_status.update(status='ERROR',error=str(e));self.event('ERROR','Index scan: '+str(e))
@@ -14383,7 +14419,7 @@ class IndexOptionsEngine(StockDeskEngine):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-model-refresh.1',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-responsive-training.2',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
