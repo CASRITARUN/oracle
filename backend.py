@@ -311,12 +311,12 @@ def _quote_cache_get(keys):
     return out
 
 
-def kite_quote_bulk(keys, *, chunk_size=500, retries=1, force_refresh=False):
+def kite_quote_bulk(keys, *, chunk_size=500, retries=1, force_refresh=False, bypass_cache=False):
     """All HTTP calls pass the shared broker gate. Never sleep/retry a 429 here."""
     keys=list(dict.fromkeys(k for k in keys if k))
     if not keys:return {}
     now=time.monotonic();ttl=min(_QUOTE_CACHE_TTL,.9 if force_refresh else _QUOTE_CACHE_TTL)
-    result={k:_QUOTE_CACHE[k]['quote'] for k in keys if k in _QUOTE_CACHE and now-_QUOTE_CACHE[k]['ts']<=ttl}
+    result={k:_QUOTE_CACHE[k]['quote'] for k in keys if not bypass_cache and k in _QUOTE_CACHE and now-_QUOTE_CACHE[k]['ts']<=ttl}
     missing=[k for k in keys if k not in result]
     # Include owned options in scanner batches so their supervision can reuse fresh books.
     owned=[]
@@ -12320,7 +12320,7 @@ def _build_desk_engine_class():
             if self.get('halt'):return self.get('halt')
             if self.a.legacy_open():return 'Legacy positions remain open · close them before new entries'
             if not cfg['armed']:return 'Entries disarmed · learning continues'
-            if any(p['qty']>0 and self.health.get(p['id'],{}).get('bid') is None for p in self.active()):return 'Position quote unavailable · new entries paused'
+            if getattr(self,'desk_name','')!='stock' and any(p['qty']>0 and self.health.get(p['id'],{}).get('bid') is None for p in self.active()):return 'Position quote unavailable · new entries paused'
             if datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:return 'Square-off window · no new entries'
             if self.train_lock.locked():return 'Model training · new entries paused'
             if cfg['mode']=='live' and not (cfg.get('live_override') is True or self.evidence()['ready']):return 'Live locked · build the forward paper record'
@@ -12369,16 +12369,49 @@ def _build_desk_engine_class():
                 self.apply_order(oid,dict(status='COMPLETE',filled_quantity=qty,average_price=price,order_id='PAPER-'+oid));return
             try:
                 broker_id=self.a.place(p['exchange'],p['contract'],side,qty,price,tag)
-                with self.db() as c:c.execute("UPDATE desk_orders SET broker_id=?,status='OPEN' WHERE id=?",(str(broker_id),oid))
-                self.record_trade(p['id'],'BROKER_ACK',dict(order_id=oid,broker_id=str(broker_id),side=side))
-                self.event('ORDER',f'{side} submitted; awaiting confirmed fill',p['symbol'])
+                if not broker_id or str(broker_id).strip().lower() in ('none','null'):
+                    raise ValueError('Kite returned no usable order ID; placement outcome unknown')
             except Exception as e:
-                if type(e).__name__=='BrokerDeferred':
-                    self.apply_order(oid,dict(status='REJECTED',filled_quantity=0,average_price=0,status_message=str(e)))
+                definite=self.definite_submission_rejection(e)
+                evidence=dict(order_id=oid,error=str(e),exception_type=type(e).__name__,
+                    exception_module=type(e).__module__,http_code=getattr(e,'code',None),
+                    confirmed_rejection=definite,phase='broker_place',schema=1)
+                # Durable structured evidence survives a restart between response and apply.
+                self.put('submission_failure:'+oid,evidence)
+                self.record_trade(p['id'],'SUBMISSION_FAILURE',evidence)
+                if definite:
+                    self.apply_order(oid,dict(status='REJECTED',filled_quantity=0,average_price=0,
+                        status_message='Confirmed placement refusal: '+str(e)))
                     return
                 with self.db() as c:c.execute("UPDATE desk_orders SET status='UNKNOWN',error=? WHERE id=?",(str(e),oid))
-                self.record_trade(p['id'],'SUBMISSION_UNCERTAIN',dict(order_id=oid,error=str(e)))
-                self.put('halt','Order submission uncertain · inspect broker orders');self.event('ERROR','Submission uncertain: '+str(e),p['symbol'])
+                self.record_trade(p['id'],'SUBMISSION_UNCERTAIN',evidence)
+                self.put('halt','Order submission uncertain · automatic broker reconciliation running');self.event('ERROR','Submission uncertain: '+str(e),p['symbol'])
+                return
+            # An acknowledgement must never be reclassified as a placement rejection
+            # merely because a local DB/audit/UI operation subsequently fails.
+            self.put('submission_ack:'+oid,dict(order_id=str(broker_id),tag=tag))
+            with self.db() as c:c.execute("UPDATE desk_orders SET broker_id=?,status='OPEN' WHERE id=?",(str(broker_id),oid))
+            self.record_trade(p['id'],'BROKER_ACK',dict(order_id=oid,broker_id=str(broker_id),side=side))
+            self.event('ORDER',f'{side} submitted; awaiting confirmed fill',p['symbol'])
+        @staticmethod
+        def definite_submission_rejection(error):
+            if isinstance(error,BrokerDeferred):return True  # Request was never sent.
+            # Only structured SDK client-error responses, not message substring guesses.
+            return (type(error).__module__=='kiteconnect.exceptions' and
+                type(error).__name__ in ('InputException','OrderException','MarginException','HoldingException','TokenException','PermissionException') and
+                getattr(error,'code',None) in (400,403))
+        def recover_confirmed_rejection(self,o):
+            if o.get('broker_id') or o.get('filled') or self.get('submission_ack:'+o['id']):return False
+            proof=self.get('submission_failure:'+o['id'],{})
+            if proof.get('order_id')!=o['id'] or proof.get('phase')!='broker_place' or proof.get('schema')!=1:return False
+            sdk=(proof.get('exception_module')=='kiteconnect.exceptions' and
+                proof.get('exception_type') in ('InputException','OrderException','MarginException','HoldingException','TokenException','PermissionException') and
+                proof.get('http_code') in (400,403))
+            local=proof.get('exception_type')=='BrokerDeferred' and proof.get('confirmed_rejection') is True
+            if not (sdk or local):return False
+            self.apply_order(o['id'],dict(status='REJECTED',filled_quantity=0,average_price=0,
+                status_message='Recovered confirmed placement refusal: '+str(proof.get('error') or '')))
+            return True
         def apply_order(self,oid,update):
             guard=getattr(self,'shared_risk',None)
             with guard.lock if guard else self.lock:
@@ -12431,7 +12464,7 @@ def _build_desk_engine_class():
             if r.get('status')=='COMPLETE' and filled!=o['qty']:raise ValueError('COMPLETE record must contain the full quantity')
             return r
         def broker_match(self,o,book,manual_id=None):
-            bid=str(manual_id or o.get('broker_id') or '')
+            bid=str(manual_id or o.get('broker_id') or (self.get('submission_ack:'+o['id'],{}).get('order_id')) or '')
             if manual_id and o.get('broker_id') and bid!=str(o['broker_id']):raise ValueError('Cannot replace an acknowledged Kite order ID')
             if not bid:
                 # Recover identity only from this intent's durable acknowledgement/fill audit.
@@ -12485,6 +12518,14 @@ def _build_desk_engine_class():
             self.put('halt',None);self.put('recovery_contracts',[])
             self.event('RECOVERY','Active orders reconciled and current quantities verified; order warning cleared. Any historical unknown results remain in the journal. '+('Automatic schedule will recheck all gates before resuming.' if resume else 'Entries remain disarmed.'))
             return True
+        def pending_order_details(self,query,*args):
+            orders=self.rows(query,*args)
+            for o in orders:
+                proof=self.get('submission_failure:'+o['id'],{})
+                o['submission_error']=proof.get('error')
+                o['submission_exception']=proof.get('exception_type')
+                o['recovery_status']='Automatic broker reconciliation running; no replacement order will be submitted while outcome is unknown.'
+            return orders
         def recover_order(self,oid,body):
             # Caller owns the engine's execution/risk lock. No automatic re-arming.
             cfg=self.config();cfg['armed']=False;self.put('config',cfg)
@@ -12608,6 +12649,7 @@ def _build_desk_engine_class():
                 book=[]
             for o in pending:
                 try:
+                    if self.recover_confirmed_rejection(o):continue
                     r=self.broker_match(o,book)
                     if r.get('status') in TERMINAL:self.put('broker_terminal:'+o['id'],json.loads(json.dumps(r,default=str)))
                     self.apply_order(o['id'],r)
@@ -12671,7 +12713,7 @@ def _build_desk_engine_class():
                         self.signals[s['symbol']]=dict(s,decision='WAIT',reason=reason)
                         return
                 active=self.active()
-                if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
+                if (getattr(self,'desk_name','')!='stock' and len(active)>=cfg['max_positions']) or any(p['symbol']==s['symbol'] for p in active):return
                 recent=self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],))
                 if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
                 s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
@@ -12689,6 +12731,15 @@ def _build_desk_engine_class():
             self.submit(p,'BUY',qty,round(limit,2),'Qualified direction and risk checks')
         def manage(self,close_all=False):
             cfg=self.config()
+            position_quotes={}
+            if getattr(self,'desk_name','')=='stock':
+                groups={}
+                for pos in self.active():
+                    if pos['qty']>0 and pos['id'] not in self.mismatches:
+                        groups.setdefault(pos['exchange'],[]).append(pos['contract'])
+                for exchange,contracts in groups.items():
+                    batch=self.a.quote_batch(exchange,list(dict.fromkeys(contracts)),bypass_cache=True)
+                    position_quotes.update({(exchange,contract):value for contract,value in batch.items()})
             if hasattr(self,'shared_risk'):
                 for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
                     try:liquidate=self.shared_risk.snapshot('live')['liquidate']
@@ -12700,9 +12751,10 @@ def _build_desk_engine_class():
                 if p['qty']<=0:continue
                 if p['id'] in self.mismatches:
                     self.record_observation(p,error='Broker quantity mismatch; automated exit suspended');continue
-                q,err=self.a.quote(p['exchange'],p['contract'])
+                q,err=position_quotes.get((p['exchange'],p['contract']),(None,None)) if getattr(self,'desk_name','')=='stock' else self.a.quote(p['exchange'],p['contract'])
+                if q is None and not err:err='Position quote unavailable'
                 if err:
-                    self.health[p['id']]={'reason':err};self.record_observation(p,error=err);continue
+                    self.health[p['id']]={**(self.health.get(p['id'],{}) if getattr(self,'desk_name','')=='stock' else {}),'reason':err};self.record_observation(p,error=err);continue
                 if hasattr(self,'adaptive_position_update'):
                     try:self.adaptive_position_update(p,q,cfg)
                     except Exception as e:self.record_trade(p['id'],'ADAPTIVE_STOP_ERROR',dict(error=str(e),note='Prior stop and normal exit supervision retained'))
@@ -12950,7 +13002,7 @@ def _build_desk_engine_class():
                 observations=obs,signals=signals,positions=active,trades=trades,
                 orders=self.rows('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60'),
                 historical_unknown_orders=self.rows("SELECT o.*,p.contract,p.symbol FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.status='HISTORICAL_UNKNOWN' ORDER BY o.ts DESC"),
-                pending_orders=self.rows("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') ORDER BY o.ts"),
+                pending_orders=self.pending_order_details("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') ORDER BY o.ts"),
                 events=self.rows('SELECT * FROM desk_events ORDER BY id DESC LIMIT 70'),
                 pnl=dict(paper=round(self.day_pnl('paper'),2),live=round(self.day_pnl('live'),2)),halt=self.get('halt'),legacy=self.a.legacy_open())
 
@@ -12995,10 +13047,10 @@ class DeskAdapter:
             key=f"{exchange}:{contract}"
             return self.validate_quote(kite_quote_bulk([key],force_refresh=True).get(key))
         except Exception as e:return None,str(e)
-    def quote_batch(self,exchange,contracts):
+    def quote_batch(self,exchange,contracts,bypass_cache=False):
         keys=[f"{exchange}:{contract}" for contract in contracts]
         try:
-            raw=kite_quote_bulk(keys,force_refresh=True)
+            raw=kite_quote_bulk(keys,force_refresh=True,bypass_cache=bypass_cache)
             return {contract:self.validate_quote(raw.get(key)) for key,contract in zip(keys,contracts)}
         except Exception as e:return {contract:(None,str(e)) for contract in contracts}
     def place(self,exchange,contract,side,qty,price,tag):
@@ -13189,7 +13241,7 @@ def _stock_success_auc(y,p):
 class StockDeskAdapter(DeskAdapter):
     def __init__(self):
         self.symbols=()
-        self.refreshed={}
+        self.refreshed={};self.refresh_attempted={}
         self.history_lock=threading.Lock()
     @contextmanager
     def db(self):
@@ -13212,7 +13264,15 @@ class StockDeskAdapter(DeskAdapter):
         # independent resumable backfill worker below so a one-year archive never blocks
         # entry execution or the 5-second position supervisor.
         with self.history_lock:
-            if time.monotonic()-self.refreshed.get(symbol,-1e9)<STOCK_HISTORY_REFRESH_SECONDS:return
+            clock=time.monotonic();recent=self.bars(symbol,2);end=now_ist()
+            completed=[_ai_ts_naive(r.get('ts')) for r in recent]
+            completed=[t for t in completed if t is not None and t+timedelta(minutes=5)<=end]
+            stale=self.market_open() and (not completed or (end-max(completed)).total_seconds()>660)
+            # A stale symbol can refresh sooner than the normal 210-second cache,
+            # but failed/empty requests still get a 30-second per-symbol backoff.
+            if clock-self.refresh_attempted.get(symbol,-1e9)<30:return
+            if not stale and clock-self.refreshed.get(symbol,-1e9)<STOCK_HISTORY_REFRESH_SECONDS:return
+            self.refresh_attempted[symbol]=clock
             token,err=resolve_token_for_symbol(symbol)
             if err:raise ValueError(err)
             end=now_ist()
@@ -13310,6 +13370,7 @@ class StockDeskEngine(DeskEngine):
         self.ban_checked=0;self.banned=None;self.ban_error='Ban list not checked yet'
         self.risk_lock=threading.RLock();self.control_lock=self.risk_lock;self.entry_lock=threading.Lock();self.candidate_lock=threading.Lock()
         self.execution_event=threading.Event();self.execution_candidates=[];self.execution_generation=0
+        self.quote_retry_lock=threading.Lock();self.quote_retry_at={}
         self.execution_status={'status':'IDLE'};self.refresh_cursor=0
         self.success_job_lock=threading.Lock();self.success_lock=threading.Lock();self.success_model_cache=None;self.success_model_cache_at=0.0
         self.hist_success_lock=threading.Lock();self.hist_success_model_cache=None;self.hist_success_model_cache_at=0.0
@@ -13438,7 +13499,7 @@ class StockDeskEngine(DeskEngine):
         distance=max(abs(float(s['option_delta']))*atr*1.5,entry*.05,3*(q['ask']-q['bid']),2*tick)
         if not math.isfinite(distance) or distance>entry*.30:raise ValueError('Volatility/liquidity requires a stop over 30% of premium; choose another contract')
         fees=2*cfg['fee_per_order'];one_lot=distance*lot+fees
-        # No one-lot exception: allocation is capped at 40% of remaining daily risk.
+        # Both desks allocate a strength-weighted share of remaining daily risk.
         budget=remaining*(.20+.20*strength)
         ceiling=min(cfg['capital'],funds) if funds is not None else cfg['capital']
         capital_share=.15+.25*strength
@@ -13455,8 +13516,12 @@ class StockDeskEngine(DeskEngine):
             initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=False,quality=quality,
             note='Estimated stop loss including fees; gaps and fills can exceed the plan')
         self.fit_costed_size(sized,budget,allocation,lot)
-        if not sized['qty']:sized['size_reason']=f'One lot plus value-based costs exceeds adaptive capital/risk allowance (risk ₹{budget:,.0f}, capital ₹{allocation:,.0f})'
-        sized['one_lot_risk']=distance*lot+self.trade_cost(entry,sized['target'],lot)
+        diagnostic=self.sizing_diagnostics(sized,lot,budget,allocation,remaining,funds)
+        sized['sizing_diagnostics']=diagnostic
+        sized['one_lot_premium']=diagnostic['one_lot_cash_required']
+        sized['one_lot_risk']=diagnostic['one_lot_loss_with_costs']
+        if not sized['qty']:
+            sized['size_reason']='; '.join(diagnostic['failures']) or 'No whole lot fits the computed limits; see one-lot diagnostics'
         return sized
     def adaptive_position_update(self,p,q,cfg):
         if p['status']!='OPEN' or p['qty']<=0 or p['id'] in self.mismatches:return
@@ -13522,6 +13587,41 @@ class StockDeskEngine(DeskEngine):
             lots=lots if qty else 0,max_lots=max_lots,requested_lots=cfg['lots'],depth_qty=depth,
             lot_limits=limits,one_lot_premium=entry*lot+fees,one_lot_risk=unit_risk*lot+fees,
             broker_available=funds,effective_capital=capital,size_reason='; '.join(reasons))
+    def fresh_entry_quotes(self,symbol,contracts):
+        quotes=self.a.quote_batch(self.a.exchange(symbol),contracts)
+        retry=[c for c in contracts if quotes.get(c,(None,'Missing quote'))[1] or not self.entry_quote_fresh(quotes.get(c,(None,None))[0] or {})]
+        meta=dict(retried=False,contracts=retry,note='Fresh first snapshot')
+        if not retry:return quotes,meta
+        gate=globals().get('BROKER_GATE')
+        if gate and gate.status()['cooldown_seconds']>0:
+            meta['note']='Recheck deferred during broker cooldown';return quotes,meta
+        with self.quote_retry_lock:
+            now=time.monotonic()
+            if now-self.quote_retry_at.get(symbol,-1e9)<30:
+                meta['note']='Recheck deferred: 30-second per-symbol retry limit';return quotes,meta
+            self.quote_retry_at[symbol]=now
+        # Exactly one additional batch, bypassing only the local quote cache.
+        # GovernedKiteConnect still enforces broker spacing/cooldown; no order retry.
+        refreshed=self.a.quote_batch(self.a.exchange(symbol),retry,bypass_cache=True)
+        for contract in retry:quotes[contract]=refreshed.get(contract,(None,'No quote returned on recheck'))
+        meta.update(retried=True,note='One network recheck; broker timestamps preserved')
+        return quotes,meta
+    @staticmethod
+    def quote_age_seconds(q):
+        stamp=_ai_ts_naive((q or {}).get('quote_ts'))
+        return round((now_ist()-stamp).total_seconds(),1) if stamp else None
+    def sizing_diagnostics(self,sized,lot,budget,allocation,remaining,funds):
+        cost=self.trade_cost(sized['entry'],sized['target'],lot)
+        premium=sized['entry']*lot;loss=(sized['entry']-sized['stop'])*lot
+        d=dict(lot=lot,ask_depth_units=sized['depth_qty'],limit_price=sized['entry'],
+            one_lot_premium=premium,one_lot_costs=cost,one_lot_cash_required=premium+cost,
+            one_lot_stop_loss=loss,one_lot_loss_with_costs=loss+cost,
+            capital_allocation=allocation,risk_allocation=budget,daily_risk_remaining=remaining,
+            broker_available=funds,failures=[])
+        if premium+cost>allocation+1e-7:d['failures'].append(f"premium allocation: one lot + costs ₹{premium+cost:,.0f}, allocated ₹{allocation:,.0f}")
+        if loss+cost>budget+1e-7:d['failures'].append(f"loss allocation: one lot + costs ₹{loss+cost:,.0f}, allocated ₹{budget:,.0f} (daily remaining ₹{remaining:,.0f})")
+        if sized['depth_qty']<lot:d['failures'].append(f"ask depth: {sized['depth_qty']} units at/below ₹{sized['entry']:.2f}, one lot needs {lot}")
+        return d
     def inspect_contracts(self,symbol):
         s=self.direction_snapshot(symbol,refresh=True,record_observation=True,max_bar_age=11)
         if s.get('decision')!='CANDIDATE':return s
@@ -13554,11 +13654,12 @@ class StockDeskEngine(DeskEngine):
         except Exception as e:s.update(decision='WAIT',reason='Funds check: '+str(e));return s
         try:remaining=self.remaining_entry_risk()
         except Exception as e:s.update(decision='WAIT',reason='Daily risk: '+str(e));return s
-        failures=[];qualified=[]
+        failures=[];qualified=[];diagnostics=[]
         # Bound quote traffic, but test several contracts instead of rejecting the stock
         # solely because its nearest-ATM contract cannot fit one lot.
         shortlisted=sorted(candidates,key=lambda r:r[0])[:8]
-        quotes=self.a.quote_batch(self.a.exchange(symbol),[o['tradingsymbol'] for _,o in shortlisted])
+        quotes,recheck=self.fresh_entry_quotes(symbol,[o['tradingsymbol'] for _,o in shortlisted])
+        s.update(contracts_compared=len(shortlisted),quote_recheck=recheck)
         for _,o in shortlisted:
             trial=dict(s,contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
                 lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),
@@ -13566,14 +13667,21 @@ class StockDeskEngine(DeskEngine):
                 option_expiry=str(o.get('expiry')),dte=None)
             try:trial['dte']=(o['expiry']-now_ist().date()).days
             except (TypeError,KeyError):pass
-            q,why=quotes[trial['contract']]
-            if why:failures.append(trial['contract']+': '+why);continue
-            if not self.entry_quote_fresh(q):failures.append(trial['contract']+': quote older than 10 seconds');continue
+            q,why=quotes.get(trial['contract'],(None,'Missing quote'))
+            detail=dict(contract=trial['contract'],lot=trial['lot'],quote_age_seconds=self.quote_age_seconds(q),quote_recheck=recheck['note'])
+            diagnostics.append(detail)
+            if why:
+                detail['reason']=why;failures.append(trial['contract']+': '+why);continue
+            if not self.entry_quote_fresh(q):
+                detail['reason']=f"quote age {detail['quote_age_seconds']}s; require -2 to 10s; {recheck['note']}"
+                failures.append(trial['contract']+': '+detail['reason']);continue
             trial.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'])
             if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:
-                failures.append(trial['contract']+': refreshed spread exceeds limit');continue
+                detail['reason']='Refreshed spread exceeds limit';failures.append(trial['contract']+': '+detail['reason']);continue
             try:trial.update(self.adaptive_entry_plan(trial,q,trial['lot'],trial['tick'],funds,remaining))
-            except ValueError as e:failures.append(trial['contract']+': '+str(e));continue
+            except ValueError as e:
+                detail['reason']=str(e);failures.append(trial['contract']+': '+str(e));continue
+            detail.update(trial['sizing_diagnostics']);detail['reason']=trial.get('size_reason') or 'Whole-lot sizing passed'
             if trial['qty']>0:
                 trial.update(decision='READY',reason=f"{typ} ready: {trial['lots']} lot(s); premium ₹{trial['entry']*trial['qty']:,.0f}; stop risk + fees ₹{(trial['entry']-trial['stop'])*trial['qty']+trial['estimated_costs']:,.0f}")
                 self._apply_success_intelligence(trial)
@@ -13582,14 +13690,15 @@ class StockDeskEngine(DeskEngine):
                     depth_ratio=min(3.,trial['depth_qty']/max(1,trial['qty']))
                     trial['contract_score']=round(100-25*trial['spread']/cfg['max_spread']-100*cost_fraction+3*depth_ratio-10*abs(abs(trial['option_delta'])-.5),4)
                     qualified.append(trial)
-                else:failures.append(trial['contract']+': '+trial['reason'])
+                else:
+                    detail['reason']=trial['reason'];failures.append(trial['contract']+': '+trial['reason'])
                 continue
             failures.append(trial['contract']+': '+trial['size_reason'])
         if qualified:
             best=max(qualified,key=lambda x:(x['contract_score'],-x['spread'],x['depth_qty']))
-            best['contracts_compared']=len(shortlisted);best['qualifying_contracts']=len(qualified)
+            best['contracts_compared']=len(shortlisted);best['qualifying_contracts']=len(qualified);best['contract_diagnostics']=diagnostics
             return best
-        s.update(decision='WAIT',reason='; '.join(failures[:3]),contract_failures=failures)
+        s.update(decision='WAIT',reason='; '.join(failures[:3]),contract_failures=failures,contract_diagnostics=diagnostics)
         return s
     def scheduled_start(self):
         if not self.risk_lock.acquire(False):return
@@ -14094,23 +14203,20 @@ class StockDeskEngine(DeskEngine):
         return s
     def _refresh_batch(self,names,screened):
         if not names:return []
-        # Stale/missing symbols get first claim on the refresh budget; the rotating
-        # cursor then guarantees the rest of the universe is revisited continuously.
-        stale=[s for s in names if screened.get(s,{}).get('bar_age') is None or screened.get(s,{}).get('bar_age',999)>STOCK_FULL_SCAN_BAR_MAX_AGE]
-        chosen=[]
-        for s in stale:
-            if s not in chosen:chosen.append(s)
+        names=list(dict.fromkeys(names));total=len(names);start=self.refresh_cursor%total
+        rotated=names[start:]+names[:start];self.refresh_cursor=(start+STOCK_FULL_REFRESH_BATCH)%total
+        attempts=getattr(self,'refresh_selection_at',{})
+        stale=[x for x in rotated if screened.get(x,{}).get('bar_age') is None or screened[x]['bar_age']>11]
+        # Least-recently attempted stale symbols first; a permanently failing
+        # instrument cannot monopolize every batch. Position data gets first claim.
+        stale.sort(key=lambda x:attempts.get(x,-1e9))
+        chosen=list(dict.fromkeys(p['symbol'] for p in self.active() if p['symbol'] in names))
+        for symbol in stale+rotated:
             if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
-        if len(chosen)<STOCK_FULL_REFRESH_BATCH:
-            total=len(names);start=self.refresh_cursor%total
-            for step in range(total):
-                s=names[(start+step)%total]
-                if s not in chosen:chosen.append(s)
-                if len(chosen)>=STOCK_FULL_REFRESH_BATCH:break
-            self.refresh_cursor=(start+STOCK_FULL_REFRESH_BATCH)%total
-        # Always keep owned positions fresh even if they fall outside this cycle's batch.
-        for p in self.active():
-            if p['symbol'] in names and p['symbol'] not in chosen:chosen.append(p['symbol'])
+            if symbol not in chosen:chosen.append(symbol)
+        now=time.monotonic()
+        for symbol in chosen:attempts[symbol]=now
+        self.refresh_selection_at=attempts
         return chosen
     def enter(self,s):
         # Reprice/revalidate immediately before the order.  A high universe rank never
@@ -14151,7 +14257,7 @@ class StockDeskEngine(DeskEngine):
                 except Exception as e:self.event('ERROR','Stock execution: '+str(e),seed.get('symbol',''))
                 # Re-evaluate limits after each admitted attempt.  If more positions are
                 # allowed, the next-ranked READY candidate may be considered.
-                if len(self.active())>=self.config()['max_positions']:break
+                if getattr(self,'desk_name','')!='stock' and len(self.active())>=self.config()['max_positions']:break
             self.execution_status=dict(status='IDLE',generation=generation,count=len(candidates),updated=now_ist().isoformat())
         finally:self.entry_lock.release()
     def cycle(self):
@@ -14261,7 +14367,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.28-api-recovery.3',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.29-order-recovery.3',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14354,7 +14460,7 @@ def invalidate_dashboard_after_mutation(response):
 @app.route('/api/system-health')
 def dashboard_system_health():
     # Website authentication still applies. No broker calls or ledger queries.
-    return jsonify(ok=True,build='2026.09.28-api-recovery.3',
+    return jsonify(ok=True,build='2026.09.29-order-recovery.3',
         kite_session_present=bool(SESSION.get('access_token')),
         snapshots={name:dict(running=slot.running,age_seconds=round(time.monotonic()-slot.created,1) if slot.payload else None,
             error=slot.error) for name,slot in _DASHBOARD_SNAPSHOTS.items()})
@@ -14496,7 +14602,7 @@ class IndexOptionsEngine(StockDeskEngine):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.28-api-recovery.3',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.29-order-recovery.3',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
@@ -14989,7 +15095,7 @@ class IndexAdvancedDeskEngine(DeskEngine):
                 if self.get('close_requested') or not self.config()['armed'] or self.block():break
                 try:self.enter(s)
                 except Exception as e:self.event('ERROR','Index execution: '+str(e),s.get('symbol',''))
-                if len(self.active())>=self.config()['max_positions']:break
+                if getattr(self,'desk_name','')!='stock' and len(self.active())>=self.config()['max_positions']:break
             self.execution_status=dict(status='IDLE',generation=generation,count=len(candidates),updated=now_ist().isoformat())
         finally:self.entry_lock.release()
     def supervise(self):
@@ -15698,9 +15804,20 @@ class SharedAIRisk:
                     if p['status'] in ('ENTRY_PENDING','EXIT_PENDING'):pending.append(p['id'])
                     health=e.health.get(p['id'],{});bid=health.get('bid');fresh=bid is not None and now-health.get('observed_mono',0)<= (3 if name=='cas' else 15)
                     if p['qty']>0:
-                        if not fresh:missing.append(p['contract']);bid=p['entry']
+                        if not fresh:
+                            missing.append(p['contract'])
+                            if name=='stock':
+                                # At most 60 seconds from the actual exchange quote. Never
+                                # renew this window when a fetch fails or returns old data.
+                                observed=health.get('observed_mono',0)
+                                recent=bool(observed and 0<=now-observed<=60 and bid is not None and math.isfinite(float(bid)) and float(bid)>0)
+                                floor=min(float(bid),float(p['stop']),float(p['entry'])) if recent else 0.
+                                reserved+=max(0.,float(p['entry'])-floor)*p['qty']+e.exit_reserve(p,p['entry'])
+                                bid=p['entry']  # No unknown unrealised gain credited.
+                            else:bid=p['entry']
                         subtotal+=(bid-p['entry'])*p['qty']
-                        reserved+=max(0.,bid-p['stop'])*p['qty']+(e.exit_reserve(p,bid) if hasattr(e,'exit_reserve') else e.config()['fee_per_order'])
+                        if fresh or name!='stock':
+                            reserved+=max(0.,bid-p['stop'])*p['qty']+(e.exit_reserve(p,bid) if hasattr(e,'exit_reserve') else e.config()['fee_per_order'])
                     if p['status']=='ENTRY_PENDING':
                         # Reserve the unfilled part, including intents not yet submitted.
                         setup=json.loads(p.get('setup') or '{}');wanted=int(setup.get('qty') or 0)
@@ -15734,7 +15851,7 @@ class SharedAIRisk:
             new=dict(peak=peak,reason=reason,liquidate=liquidate)
             if new!=state:self.owner.put(key,new)
             blocker=reason
-            if not blocker and missing:blocker='Fresh position quotes required: '+', '.join(missing)
+            if not blocker and missing and not (len(self.engines)==1 and 'stock' in self.engines):blocker='Fresh position quotes required: '+', '.join(missing)
             if not blocker and pending:blocker='Unresolved entry/exit order in another or this AI desk'
             if not blocker and any(e.mismatches for e in self.engines.values()):blocker='Broker quantity verification required before new entries'
             if not blocker and cfg['position_limit_enabled'] and len(active)>=cfg['max_positions']:blocker='Combined AI open-position limit reached'
@@ -15805,6 +15922,10 @@ class IndependentDeskRisk(SharedAIRisk):
         cfg['daily_loss']=self.owner.config()['daily_loss']
         cfg['max_positions']=self.owner.config()['max_positions']
         cfg.pop('loss_streak',None)
+        if self.owner.desk_name=='stock':
+            cfg.update(symbol_loss_limit_enabled=False,
+                trade_limit_enabled=False,position_limit_enabled=False,one_trade_per_arm=False,
+                same_signal_lock=True)
         return cfg
     def save(self,body):
         # Serialize with this desk's controls/execution, not its scanner.
@@ -15820,6 +15941,7 @@ class IndependentDeskRisk(SharedAIRisk):
         view=super().snapshot(mode)
         for key in ('reason','entry_block'):
             if view.get(key):view[key]=view[key].replace('Combined AI','Desk').replace('in another or this AI desk','in this desk')
+        view['valuation_note']=('Position quote refresh pending: conservative stop-risk reservation for up to 60 seconds; full remaining premium reserved after that. '+', '.join(view['missing_quotes'])) if self.owner.desk_name=='stock' and view['missing_quotes'] else None
         view['scope']=self.owner.desk_name
         return view
 
