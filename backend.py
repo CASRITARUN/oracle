@@ -12771,7 +12771,7 @@ def _build_desk_engine_class():
                 elif bid>=p['target']:reason='Target reached'
                 elif datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
                 elif cfg.get('max_hold') is not None and (datetime.now(IST)-dt(p['ts'])).total_seconds()>=cfg['max_hold']*60:reason='Maximum holding time'
-                elif self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
+                elif getattr(self,'desk_name','')!='stock' and self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
                 elif sig.get('bar_age',999)<=15 and sig.get('confidence',0)>=cfg['confidence'] and sig.get('direction')!=setup.get('direction'):reason='Direction reversed'
                 elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-float((setup.get('risk_plan') or {}).get('initial_stop',p['stop'])))*float((setup.get('risk_plan') or {}).get('partial_take_r',cfg['partial_take_r'])):reason='Partial profit at planned R'
                 self.record_observation(p,q,decision=reason or 'HOLD')
@@ -13398,6 +13398,7 @@ class StockDeskEngine(DeskEngine):
         if not hasattr(self,'shared_risk'):raise ValueError('Daily risk supervisor unavailable')
         view=self.shared_risk.snapshot(cfg['mode'])
         if view['entry_block']:raise ValueError(view['entry_block'])
+        if getattr(self,'desk_name','')=='stock':return None  # Gate only; never a sizing input.
         remaining=min(float(view['remaining']),max(0.,cfg['daily_loss']+
             float(view['desk_totals'].get(self.desk_name,0))-float(view['desk_reserved'].get(self.desk_name,0))))
         return remaining
@@ -13422,7 +13423,7 @@ class StockDeskEngine(DeskEngine):
         unit=float(s['entry'])-float(s['stop']);lo=0;hi=int(s['qty'])//lot
         while lo<hi:
             mid=(lo+hi+1)//2;qty=mid*lot;cost=self.trade_cost(s['entry'],s['target'],qty)
-            if unit*qty+cost<=budget+1e-7 and s['entry']*qty+cost<=capital+1e-7:lo=mid
+            if (budget is None or unit*qty+cost<=budget+1e-7) and s['entry']*qty+cost<=capital+1e-7:lo=mid
             else:hi=mid-1
         s['qty']=lo*lot;s['lots']=lo;s['estimated_costs']=self.trade_cost(s['entry'],s['target'],s['qty'])
         if s.get('risk_plan'):s['risk_plan']['planned_loss']=unit*s['qty']+s['estimated_costs'] if s['qty'] else 0.
@@ -13496,25 +13497,41 @@ class StockDeskEngine(DeskEngine):
             ranges.append(max(high-low,abs(high-close),abs(low-close)))
         atr=sum(ranges)/len(ranges)
         entry=round(math.ceil((q['ask']*(1+cfg['slippage_bps']/10000)-1e-9)/tick)*tick,2)
-        distance=max(abs(float(s['option_delta']))*atr*1.5,entry*.05,3*(q['ask']-q['bid']),2*tick)
+        independent=getattr(self,'desk_name','')=='stock'
+        atr_multiple=1.25+.5*strength if independent else 1.5
+        distance=max(abs(float(s['option_delta']))*atr*atr_multiple,entry*.05,3*(q['ask']-q['bid']),2*tick)
         if not math.isfinite(distance) or distance>entry*.30:raise ValueError('Volatility/liquidity requires a stop over 30% of premium; choose another contract')
         fees=2*cfg['fee_per_order'];one_lot=distance*lot+fees
-        # Both desks allocate a strength-weighted share of remaining daily risk.
-        budget=remaining*(.20+.20*strength)
-        ceiling=min(cfg['capital'],funds) if funds is not None else cfg['capital']
+        # Stock trade stops and quantities do not consume a daily loss allocation.
+        # Index retains its own existing allocation policy.
+        budget=None if independent else remaining*(.20+.20*strength)
+        if independent:
+            if cfg['mode']=='live':
+                if funds is None or not math.isfinite(float(funds)) or funds<0:raise ValueError('Valid broker available funds required')
+                ceiling=float(funds)
+            else:
+                # In paper mode capital means a simulated cash pool, not a per-trade cap.
+                committed=sum(max(0.,float(p['entry']))*int(p['qty']) for p in self.active() if p['mode']=='paper')
+                ceiling=max(0.,float(cfg['capital'])-committed)
+        else:ceiling=min(cfg['capital'],funds) if funds is not None else cfg['capital']
         capital_share=.15+.25*strength
-        allocation=ceiling*capital_share
         reward=1.5+strength
+        allocation=ceiling*capital_share
+        if independent:
+            one_lot_cash=entry*lot+self.trade_cost(entry,entry+distance*reward,lot)
+            allocation=min(ceiling,max(allocation,one_lot_cash))
         effective=dict(cfg,capital=allocation,risk=budget,stop_pct=100*distance/entry,reward_r=reward,lots=0)
         sized=self.size_contract(q,lot,tick,effective,funds)
-        if not sized['qty'] and sized['lot_limits']['risk']==0:
+        if not independent and not sized['qty'] and sized['lot_limits']['risk']==0:
             sized['size_reason']=f"Adaptive daily-risk allocation ₹{budget:,.0f}; one lot requires ₹{one_lot:,.0f}; daily risk remaining ₹{remaining:,.0f}"
         sized['risk_plan']=dict(policy='adaptive-v1',strength=round(strength,4),confidence=confidence,
             underlying_atr=atr,stop_distance=distance,stop_pct=100*distance/entry,reward_r=reward,
             capital_fraction=capital_share,capital_allocation=allocation,remaining_daily_risk=remaining,
             risk_budget=budget,planned_loss=distance*sized['qty']+fees if sized['qty'] else 0,
-            initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=False,quality=quality,
-            note='Estimated stop loss including fees; gaps and fills can exceed the plan')
+            initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=bool(independent and allocation>ceiling*capital_share),quality=quality,
+            sizing_basis='trade-independent-v2' if independent else 'daily-allocation-v1',
+            atr_multiple=atr_multiple,available_cash=ceiling,
+            note='Trade-local planned loss including estimated costs; daily loss is an entry gate only' if independent else 'Estimated stop loss including fees; gaps and fills can exceed the plan')
         self.fit_costed_size(sized,budget,allocation,lot)
         diagnostic=self.sizing_diagnostics(sized,lot,budget,allocation,remaining,funds)
         sized['sizing_diagnostics']=diagnostic
@@ -13575,13 +13592,13 @@ class StockDeskEngine(DeskEngine):
         depth=sum(int(x['quantity']) for x in q.get('ask_levels',[]) if 0<float(x['price'])<=entry+1e-9)
         if 'ask_levels' not in q:depth=int(q.get('ask_qty') or 0)
         limits=dict(capital=max(0,int((capital-fees)//(entry*lot))),
-                    risk=max(0,int((cfg['risk']-fees+1e-7)//(unit_risk*lot))),depth=max(0,depth//lot))
+                    risk=max(0,int((capital-fees)//(entry*lot))) if cfg.get('risk') is None else max(0,int((cfg['risk']-fees+1e-7)//(unit_risk*lot))),depth=max(0,depth//lot))
         max_lots=min(limits.values());lots=int(cfg['lots'] or max_lots)
         qty=lots*lot if 0<lots<=max_lots else 0
         reasons=[]
         required=max(1,int(cfg['lots']))
         if limits['capital']<required:reasons.append(f"premium budget: need ₹{entry*lot*required+fees:,.0f}, available ₹{capital:,.0f} (desk cap ₹{cfg['capital']:,.0f})")
-        if limits['risk']<required:reasons.append(f"stop risk: need ₹{unit_risk*lot*required+fees:,.0f}, limit ₹{cfg['risk']:,.0f}")
+        if cfg.get('risk') is not None and limits['risk']<required:reasons.append(f"stop risk: need ₹{unit_risk*lot*required+fees:,.0f}, limit ₹{cfg['risk']:,.0f}")
         if limits['depth']<required:reasons.append(f"ask depth within ₹{entry:.2f}: {depth} units, need {lot*required}")
         return dict(entry=entry,stop=entry-unit_risk,target=entry+unit_risk*cfg['reward_r'],qty=qty,
             lots=lots if qty else 0,max_lots=max_lots,requested_lots=cfg['lots'],depth_qty=depth,
@@ -13619,7 +13636,7 @@ class StockDeskEngine(DeskEngine):
             capital_allocation=allocation,risk_allocation=budget,daily_risk_remaining=remaining,
             broker_available=funds,failures=[])
         if premium+cost>allocation+1e-7:d['failures'].append(f"premium allocation: one lot + costs ₹{premium+cost:,.0f}, allocated ₹{allocation:,.0f}")
-        if loss+cost>budget+1e-7:d['failures'].append(f"loss allocation: one lot + costs ₹{loss+cost:,.0f}, allocated ₹{budget:,.0f} (daily remaining ₹{remaining:,.0f})")
+        if budget is not None and loss+cost>budget+1e-7:d['failures'].append(f"loss allocation: one lot + costs ₹{loss+cost:,.0f}, allocated ₹{budget:,.0f} (daily remaining ₹{remaining:,.0f})")
         if sized['depth_qty']<lot:d['failures'].append(f"ask depth: {sized['depth_qty']} units at/below ₹{sized['entry']:.2f}, one lot needs {lot}")
         return d
     def inspect_contracts(self,symbol):
@@ -13730,7 +13747,62 @@ class StockDeskEngine(DeskEngine):
         cfg=super().save_config(body)
         if auto is not None:cfg['auto_start']=auto;self.put('config',cfg)
         return cfg
+    def reprice_stock_entry(self,p):
+        # Reprice only an unsent, unfilled intent. Never replace an uncertain order.
+        if p['qty'] or p['status']!='ENTRY_PENDING':return None
+        if self.rows('SELECT id FROM desk_orders WHERE position_id=?',(p['id'],)):return None
+        setup=json.loads(p.get('setup') or '{}');cfg=self.config()
+        quality=self.model_quality()
+        if not quality['live_ok']:raise ValueError('Model quality changed before entry')
+        setup['model_quality']=quality
+        setup['underlying_check']=self.check_underlying(setup)
+        funds=self.available_funds(force=True)
+        # Final option read is a real broker fetch, after the other slower checks.
+        # One bounded read; broker spacing/cooldown still applies.
+        q,err=self.a.quote_batch(p['exchange'],[p['contract']],bypass_cache=True).get(p['contract'],(None,'Missing final quote'))
+        if err:raise ValueError(err)
+        if not self.entry_quote_fresh(q):raise ValueError('Fresh option quote unavailable after final refresh; entry deferred')
+        if q.get('spread_pct') is None or not 0<=q['spread_pct']<=cfg['max_spread']:raise ValueError('Fresh spread exceeds configured limit')
+        old=dict(entry=setup.get('entry'),qty=setup.get('qty'),stop=setup.get('stop'),target=setup.get('target'))
+        setup.update(self.adaptive_entry_plan(setup,q,int(setup['lot']),float(setup['tick']),funds,None))
+        if setup['qty']<=0:raise ValueError(setup.get('size_reason') or 'Fresh quote cannot fund one executable lot')
+        setup['spread']=q['spread_pct']
+        if not self.entry_quality_gate(setup):raise ValueError(setup['reason'])
+        setup['execution_reprice']=dict(previous=old,ask=q['ask'],quote_ts=q.get('quote_ts'),
+            limit=setup['entry'],qty=setup['qty'],allowance_bps=cfg['slippage_bps'],source='Final uncached broker quote')
+        plan=setup['risk_plan']
+        setup.setdefault('risk_config_at_entry',{}).update(risk=None,capital=plan['capital_allocation'],
+            stop_pct=plan['stop_pct'],reward_r=plan['reward_r'],lots=setup['lots'],adaptive_risk=True)
+        with self.shared_risk.lock:
+            cfg=self.config();view=self.shared_risk.snapshot('live')
+            if not cfg['armed'] or self.get('close_requested') or self.get('halt'):raise ValueError('Entries paused before submission')
+            if view['reason']:raise ValueError(view['reason'])
+            block=view.get('entry_block')
+            # This unsent intent is the expected pending record, not another order.
+            if block and 'Unresolved entry/exit order' not in block:raise ValueError(block)
+            if any(x['id']!=p['id'] and x['mode']=='live' and x['status'] in ('ENTRY_PENDING','EXIT_PENDING') for x in self.active()):raise ValueError('Another order is unresolved')
+            if self.mismatches:raise ValueError('Broker quantities need reconciliation')
+            if not self.a.market_open() or now_ist().strftime('%H:%M')>=cfg['square_off']:raise ValueError('Entry window closed during refresh')
+            if not self.entry_quote_fresh(q):raise ValueError('Final quote aged during checks; entry deferred')
+            with self.db() as c:
+                changed=c.execute("UPDATE desk_positions SET stop=?,target=?,risk=?,setup=? WHERE id=? AND status='ENTRY_PENDING' AND qty=0 AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=?)",
+                    (setup['stop'],setup['target'],(setup['entry']-setup['stop'])*setup['qty'],json.dumps(setup),p['id'],p['id'])).rowcount
+            if changed!=1:return None
+        self.record_trade(p['id'],'ENTRY_REPRICED',setup['execution_reprice'])
+        self.signals[p['symbol']]=setup
+        refreshed=dict(p,stop=setup['stop'],target=setup['target'],setup=json.dumps(setup))
+        return refreshed,setup['qty'],setup['entry']
     def submit(self,p,side,qty,price,reason):
+        if side=='BUY' and p['mode']=='live' and getattr(self,'desk_name','')=='stock':
+            try:
+                repriced=self.reprice_stock_entry(p)
+                if repriced is None:return
+                p,qty,price=repriced
+            except Exception as e:
+                with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0 AND status='ENTRY_PENDING' AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=?)",(str(e),p['id'],p['id']))
+                self.signals[p['symbol']]=dict(self.signals.get(p['symbol'],{}),decision='WAIT',reason=str(e))
+                self.event('WAIT',str(e),p['symbol']);return
+            return super().submit(p,side,qty,price,reason)
         if side=='BUY' and p['mode']=='live':
             try:
                 setup=json.loads(p.get('setup') or '{}')
@@ -14367,7 +14439,7 @@ class StockDeskEngine(DeskEngine):
         if hm:hm={k:v for k,v in hm.items() if k not in ('mu','sd','w','bias','per_symbol','coverage')}
         archive=self._history_archive_coverage();hist_ready=bool(hm and hm.get('valid') and archive.get('ready'))
         selector_status='BLENDED' if hist_ready and sm and sm.get('valid') else 'HISTORICAL BOOTSTRAP' if hist_ready else 'LIVE OPTION MODEL' if sm and sm.get('valid') else 'DIRECTIONAL FALLBACK'
-        s.update(runtime_build='2026.09.29-order-recovery.3',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
+        s.update(runtime_build='2026.09.29-fresh-limit.5',build=STOCK_AI_BUILD,universe=self.get('stock_universe_info',{}),scan=dict(self.scan_status),ban_status=self.ban_error or 'Daily list checked',watchlist=list(self.a.symbols),
             full_fo_monitoring=self._full_mode(),deep_check_limit=STOCK_FULL_SCAN_DEEP_N,refresh_batch=STOCK_FULL_REFRESH_BATCH,
             execution=dict(self.execution_status),success_model=sm,live_success_model=sm,historical_success_model=hm,success_selector_status=selector_status,
             historical_archive=archive,history_backfill=dict(self.history_backfill_status))
@@ -14460,7 +14532,7 @@ def invalidate_dashboard_after_mutation(response):
 @app.route('/api/system-health')
 def dashboard_system_health():
     # Website authentication still applies. No broker calls or ledger queries.
-    return jsonify(ok=True,build='2026.09.29-order-recovery.3',
+    return jsonify(ok=True,build='2026.09.29-fresh-limit.5',
         kite_session_present=bool(SESSION.get('access_token')),
         snapshots={name:dict(running=slot.running,age_seconds=round(time.monotonic()-slot.created,1) if slot.payload else None,
             error=slot.error) for name,slot in _DASHBOARD_SNAPSHOTS.items()})
@@ -14602,7 +14674,7 @@ class IndexOptionsEngine(StockDeskEngine):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.29-order-recovery.3',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.09.29-fresh-limit.5',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
@@ -15790,7 +15862,7 @@ class SharedAIRisk:
         with self.lock:
             cfg=self.config();today=now_ist().date().isoformat();now=time.monotonic()
             key='shared_risk_day:'+mode+':'+today;state=self.owner.get(key,{})
-            total=0.;reserved=0.;active=[];closed=[];attempts=0;missing=[];pending=[];desk_totals={};desk_reserved={}
+            total=0.;reserved=0.;active=[];closed=[];attempts=0;missing=[];long_quote_gap=[];pending=[];desk_totals={};desk_reserved={}
             for name,e in self.engines.items():
                 rows=e.rows("SELECT * FROM desk_positions WHERE mode=? AND (ts LIKE ? OR exit_ts LIKE ? OR status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING'))",(mode,today+'%',today+'%'))
                 subtotal=0.;reserved_before=reserved
@@ -15811,9 +15883,10 @@ class SharedAIRisk:
                                 # renew this window when a fetch fails or returns old data.
                                 observed=health.get('observed_mono',0)
                                 recent=bool(observed and 0<=now-observed<=60 and bid is not None and math.isfinite(float(bid)) and float(bid)>0)
+                                if not recent:long_quote_gap.append(p['contract'])
                                 floor=min(float(bid),float(p['stop']),float(p['entry'])) if recent else 0.
-                                reserved+=max(0.,float(p['entry'])-floor)*p['qty']+e.exit_reserve(p,p['entry'])
-                                bid=p['entry']  # No unknown unrealised gain credited.
+                                bid=min(float(bid),float(p['entry'])) if recent else p['entry']  # Never credit stale unrealised gains.
+                                reserved+=max(0.,float(bid)-floor)*p['qty']+e.exit_reserve(p,p['entry'])
                             else:bid=p['entry']
                         subtotal+=(bid-p['entry'])*p['qty']
                         if fresh or name!='stock':
@@ -15847,18 +15920,23 @@ class SharedAIRisk:
             for name,e in self.engines.items():
                 if desk_totals[name]<=-e.config()['daily_loss']:financial=name+' daily loss limit reached'
             if financial:reason=financial;liquidate=True
+            if len(self.engines)==1 and 'stock' in self.engines and reason and 'daily loss limit reached' in reason:
+                # Daily SL stops new entries only; independent position exits continue.
+                # A separately enabled profit-giveback exit still takes precedence.
+                liquidate=bool(cfg['profit_protection_enabled'] and not missing and peak>=cfg['profit_activation'] and peak-total>=cfg['profit_giveback'])
             if not reason and cfg['trade_limit_enabled'] and attempts>=cfg['max_trades']:reason='Combined AI daily entry-attempt limit reached'
             new=dict(peak=peak,reason=reason,liquidate=liquidate)
             if new!=state:self.owner.put(key,new)
             blocker=reason
             if not blocker and missing and not (len(self.engines)==1 and 'stock' in self.engines):blocker='Fresh position quotes required: '+', '.join(missing)
+            if not blocker and long_quote_gap:blocker='Position valuation unavailable for over 60 seconds; daily loss cannot be checked: '+', '.join(long_quote_gap)
             if not blocker and pending:blocker='Unresolved entry/exit order in another or this AI desk'
             if not blocker and any(e.mismatches for e in self.engines.values()):blocker='Broker quantity verification required before new entries'
             if not blocker and cfg['position_limit_enabled'] and len(active)>=cfg['max_positions']:blocker='Combined AI open-position limit reached'
             if not blocker and globals().get('BROKER_GATE') and BROKER_GATE.status()['cooldown_seconds']>0:blocker='Broker rate-limit cooldown; new entries paused'
             floor=max(-cfg['daily_loss'],peak-cfg['profit_giveback']) if cfg['profit_protection_enabled'] and peak>=cfg['profit_activation'] else -cfg['daily_loss']
             return dict(mode=mode,date=today,net=round(total,2),peak=round(peak,2),reserved=round(reserved,2),
-                remaining=round(max(0.,total-reserved-floor),2),reason=reason,entry_block=blocker,liquidate=liquidate,
+                remaining=round(max(0.,cfg['daily_loss']+total) if len(self.engines)==1 and 'stock' in self.engines else max(0.,total-reserved-floor),2),reason=reason,entry_block=blocker,liquidate=liquidate,
                 attempts=attempts,loss_streak=streak,positions=len(active),missing_quotes=missing,closed=closed,config=cfg,desk_reserved=desk_reserved,desk_totals=desk_totals)
     def signal_key(self,e,s):
         if e.desk_name=='cas':
@@ -15884,6 +15962,17 @@ class SharedAIRisk:
         if cfg.get('adaptive_risk'):
             plan=s.get('risk_plan') or {}
             if plan.get('policy')!='adaptive-v1':return 'Missing adaptive entry risk plan'
+            if e.desk_name=='stock':
+                if plan.get('sizing_basis')!='trade-independent-v2':return 'Refresh candidate for independent trade sizing'
+                lot=int(s['lot']);allocation=float(plan['capital_allocation'])
+                if lot<=0 or not math.isfinite(allocation) or allocation<=0:return 'Invalid trade cash allocation'
+                e.fit_costed_size(s,None,allocation,lot)
+                if s['qty']<=0:return 'Available trade cash cannot cover one lot including charges'
+                if not e.entry_quality_gate(s):return s['reason']
+                planned=(float(s['entry'])-float(s['stop']))*s['qty']+s['estimated_costs']
+                plan.update(admitted_daily_risk=None,admitted_risk_budget=None,planned_loss=planned)
+                s['shared_signal_key']=signal;s['shared_risk_at_entry']={k:v for k,v in view.items() if k!='closed'}
+                return None
             available=min(float(view['remaining']),max(0.,cfg['daily_loss']+view['desk_totals'][e.desk_name]-view['desk_reserved'][e.desk_name]))
             budget=min(float(plan['risk_budget']),available)
             lot=int(s['lot']);unit=float(s['entry'])-float(s['stop'])
@@ -15941,7 +16030,7 @@ class IndependentDeskRisk(SharedAIRisk):
         view=super().snapshot(mode)
         for key in ('reason','entry_block'):
             if view.get(key):view[key]=view[key].replace('Combined AI','Desk').replace('in another or this AI desk','in this desk')
-        view['valuation_note']=('Position quote refresh pending: conservative stop-risk reservation for up to 60 seconds; full remaining premium reserved after that. '+', '.join(view['missing_quotes'])) if self.owner.desk_name=='stock' and view['missing_quotes'] else None
+        view['valuation_note']=('Position quote refresh pending: no stale gains credited; entries pause after 60 seconds without valuation. Reserved risk is informational, not a trade-sizing budget. '+', '.join(view['missing_quotes'])) if self.owner.desk_name=='stock' and view['missing_quotes'] else None
         view['scope']=self.owner.desk_name
         return view
 
