@@ -1,0 +1,17 @@
+[Unit]
+Description=Read-only Stock and Index AI journal backup to private GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/home/opc/oracle
+EnvironmentFile=/home/opc/.config/oracle-journal-backup.env
+ExecStart=/usr/bin/python3 /home/opc/oracle/journal_backup/trade_journal_backup.py --data-dir /home/opc/oracle
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

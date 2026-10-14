@@ -1,0 +1,11 @@
+[Unit]
+Description=Mirror trade journal every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=oracle-journal-backup.service
+
+[Install]
+WantedBy=timers.target
