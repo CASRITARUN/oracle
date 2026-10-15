@@ -31,7 +31,11 @@ check('default tab opens only after presentation helpers',()=>{
 });
 window.eval('initStockTradeAIUI()');await new Promise(r=>setTimeout(r,100));
 check('cold backend snapshot renders without JavaScript error',()=>assert.match(window.document.getElementById('skConnectionState').textContent,/connected/));
-response={...response,connected:true,market_open:true,model:{id:'test'},last_cycle:new Date().toISOString(),config:{...response.config,armed:false,mode:'paper'},dashboard:{status:'CURRENT',stale:false,age_seconds:0},signals:[
+check('incomplete historical analytics are visible without a false disconnect',()=>{assert.equal(window.document.getElementById('skDisplayWarnings').hidden,false);assert.match(window.document.getElementById('skDisplayWarnings').textContent,/Paper history/);assert.doesNotMatch(window.document.getElementById('skConnectionState').textContent,/failed|interrupted/)});
+response.dashboard={status:'ERROR',stale:true,has_snapshot:false,error:'The saved ledger is busy; retrying automatically. Reference TEST',failure:{code:'DATABASE_BUSY',phase:'position and order ledger'}};
+await window.eval('refreshStockTradeAI()');
+check('display error identifies the failed read and keeps Disarm available',()=>{assert.match(window.document.getElementById('skConnectionState').textContent,/read failed/);assert.match(window.document.getElementById('skDataAge').textContent,/DATABASE_BUSY/);assert.equal(window.document.getElementById('skArm').disabled,true);assert.equal(window.document.getElementById('skDisarm').disabled,false)});
+response={...response,positions:[],display_warnings:[],connected:true,market_open:true,model:{id:'test'},last_cycle:new Date().toISOString(),config:{...response.config,armed:false,mode:'paper'},dashboard:{status:'CURRENT',stale:false,age_seconds:0},signals:[
  {symbol:'READYTEST',rank:1,decision:'READY',confidence:.7,rank_score:70,reason:'Eligible',market_regime:{name:'TREND_UP'}},
  {symbol:'WAITTEST',rank:2,decision:'WAIT',confidence:.51,reason:'Direction below confidence threshold'}
 ]};
@@ -43,6 +47,7 @@ response.dashboard={status:'STALE',stale:true,age_seconds:25};await window.eval(
 check('stale data disables entry controls while Disarm remains available',()=>{assert.equal(window.document.getElementById('skArm').disabled,true);assert.equal(window.document.getElementById('skMode').disabled,true);assert.equal(window.document.getElementById('skDisarm').disabled,false)});
 response.dashboard={status:'CURRENT',stale:false,age_seconds:1};await window.eval('refreshStockTradeAI()');
 check('recovered connection restores mode controls',()=>assert.equal(window.document.getElementById('skMode').disabled,false));
+check('recovered optional statistics warning is cleared',()=>assert.equal(window.document.getElementById('skDisplayWarnings').hidden,true));
 response.command={action:'arm',status:'QUEUED'};await window.eval('refreshStockTradeAI()');
 check('queued arm is never displayed as completed',()=>{assert.match(window.document.getElementById('skNotice').textContent,/Queued/);assert.equal(window.document.getElementById('skArm').disabled,true)});
 response.command={action:'arm',status:'FAILED',message:'Daily loss limit reached'};await window.eval('refreshStockTradeAI()');

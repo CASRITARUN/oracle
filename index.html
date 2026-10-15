@@ -1019,6 +1019,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
   <header class="sk-head"><div class="sk-brand"><span class="sk-mark" aria-hidden="true"><svg viewbox="0 0 24 24"><path d="M4 19h16M6 15V9m6 6V5m6 10v-4M4 7l5-3 6 3 5-4"></path></svg></span><div><div class="desk-brand-kicker">WECON / STOCK OPTIONS</div><h1>Stock AI<span class="sr-live-dot" aria-hidden="true"></span></h1><p>Market signals. Clear decisions.</p></div></div><div class="sk-head-right"><span id="skMarket" class="sk-badge">Connecting</span><span id="skClock">— IST</span></div></header>
   <div class="sk-toolbar"><nav aria-label="Trading stockdesk views"><button class="selected" data-view="overview">Overview</button><button data-view="learning">Learning lab</button><button data-view="journal">Trade journal</button><button data-view="risk">Risk &amp; controls</button></nav><div class="sk-actions"><select id="skMode" aria-label="Execution mode"><option value="live">Live trading</option><option value="paper">Paper trading</option></select><button id="skArm" class="sk-primary">Arm entries</button><button id="skDisarm">Disarm</button></div></div>
   <div class="sr-connection"><span id="skConnectionState">Starting Stock AI</span><span id="skDataAge">Awaiting snapshot</span><button type="button" id="skRetryConnection">Refresh status ↻</button></div>
+  <div id="skDisplayWarnings" class="sk-notice" role="status" hidden></div>
   <div id="skNotice" role="status" aria-live="polite">Connecting to your trading engine…</div>
   <section class="sk-view" data-pane="overview">
     <section class="sr-command-center" aria-label="Stock operations"><div><p class="sk-eyebrow">OPERATIONS</p><h2 id="skOperationalTitle">Your desk is starting</h2><p id="skOperationalDetail">The dashboard loads independently of scanning and model training.</p></div><div class="sr-system-grid" id="skWorkerCards"><article><span>Scanner</span><strong>Waiting</strong></article><article><span>Protection</span><strong>Waiting</strong></article><article><span>Learning</span><strong>Waiting</strong></article></div></section>
@@ -2650,22 +2651,29 @@ function initStockTradeAIUI(){
   skEl('skExport').onclick=()=>{if(!stockdeskState)return;const keys=['ts','symbol','mode','contract','qty','entry','status','pnl','fees','exit_reason'];const csv=[keys.join(','),...stockdeskState.trades.map(r=>keys.map(k=>'"'+String(r[k]??'').replace(/"/g,'""').replace(/^[=+@-]/,"'")+'"').join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');a.href=url;a.download='stock-ai-trades.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
   skEl('skShowAll').onclick=()=>{deskShowAllStocks=!deskShowAllStocks;if(stockdeskState)skRender(stockdeskState)};deskGroupSettings('sk');skEl('skSymbolSelect').onchange=e=>{stockdeskSymbol=e.target.value;if(stockdeskState)skRender(stockdeskState)};
   skEl('skRankingDetails')?.closest('details')?.addEventListener('toggle',event=>{if(event.target.open&&stockdeskState)skRender(stockdeskState)});
-  refreshStockTradeAI();stockdeskTimer=setInterval(()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI()},3000);
+  window.addEventListener('online',()=>refreshStockTradeAI());
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI()});
+  refreshStockTradeAI();
+}
+function scheduleStockRefresh(delay=3000){
+ clearTimeout(stockdeskTimer);stockdeskTimer=setTimeout(()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI();else scheduleStockRefresh(3000)},Math.max(750,Math.min(10000,delay)));
 }
 async function refreshStockTradeAI(){
- if(stockdeskBusy)return;stockdeskBusy=true;
+ if(stockdeskBusy)return;stockdeskBusy=true;let nextDelay=3000;
  try{
   const next=await skRequest('state');stockdeskLastResponse=Date.now();
-  if(next.dashboard?.status==='LOADING'){
-   renderStockRuntime(next);skNotice(next.dashboard.error||'Loading the saved Stock ledger. Scanning and protection run independently.');
+  nextDelay=next.dashboard?.refresh_after_ms||(next.dashboard?.stale?1000:3000);
+  if(['LOADING','ERROR'].includes(next.dashboard?.status)&&next.dashboard?.has_snapshot!==true){
+   renderStockRuntime(next);skNotice(next.dashboard.error||'Reading the saved Stock ledger. Automatic refresh is active.',!!next.dashboard.error);
    ['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});return;
   }
   stockdeskState=next;skRender(next);
  }catch(e){
+  nextDelay=2000;
   skNotice(e.message+' Last received values are retained.',true);skText('skConnectionState','Connection interrupted');
   skText('skDataAge',stockdeskLastResponse?'Last response '+Math.round((Date.now()-stockdeskLastResponse)/1000)+'s ago':'No response yet');
   skText('skPulse','STALE');['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});
- }finally{stockdeskBusy=false}
+ }finally{stockdeskBusy=false;scheduleStockRefresh(nextDelay)}
 }
 function skRender(s){
   renderSizingDiagnostics('skSizingDiagnostics',s.signals);renderDeskExecution('sk',s);
@@ -3694,12 +3702,13 @@ function deskGroupSettings(prefix){
 <script id="stock-runtime-script">
 function renderStockRuntime(s){
  const d=s.dashboard||{},workers=s.workers||{},cfg=s.config||{},risk=s.risk_display?.states?.[cfg.mode],riskAge=s.risk_age_seconds;
- const stale=!!d.stale,loading=d.status==='LOADING';
- skText('skConnectionState',loading?'Loading saved ledger':stale?'Saved snapshot · awaiting refresh':'Dashboard connected');
+ const stale=!!d.stale,loading=d.status==='LOADING',readError=d.status==='ERROR',warnings=s.display_warnings||[];
+ skText('skConnectionState',readError?'Dashboard read failed · retrying':loading?'Reading saved ledger':stale?'Dashboard refresh delayed':warnings.length?'Dashboard connected · partial statistics':'Dashboard connected');
  skEl('skConnectionState')?.classList.toggle('sr-stale',stale);
- skText('skDataAge',d.age_seconds==null?'Waiting for first read':`Snapshot ${Math.round(d.age_seconds)}s old`);
+ skText('skDataAge',d.age_seconds==null?(d.failure?`${d.failure.code} · ${d.failure.phase}`:'Waiting for first read'):`Snapshot ${Math.round(d.age_seconds)}s old`);
+ const warningBox=skEl('skDisplayWarnings');if(warningBox){warningBox.hidden=!warnings.length;warningBox.textContent=warnings.length?'Some statistics are unavailable: '+warnings.slice(0,3).join(' '):'';}
  const command=s.command||{};
- skText('skOperationalTitle',loading?'Opening your Stock desk':s.halt?'Protection needs attention':!s.market_open?'Ready for the next session':cfg.armed?'Watching for the next setup':'Learning with entries paused');
+ skText('skOperationalTitle',readError?'Retrying the dashboard read':loading?'Opening your Stock desk':s.halt?'Protection needs attention':s.connected===false?'Kite sign-in required':!s.market_open?'Ready for the next session':cfg.armed?'Watching for the next setup':'Learning with entries paused');
  skText('skOperationalDetail',command.status==='QUEUED'?`${command.action} is queued. Disarm cancels a queued arm request.`:s.execution?.reason||s.block||'Qualified setups receive final price, funds and portfolio checks before submission.');
  skHTML('skWorkerCards',[['scan','Scanner'],['risk','Protection'],['learning','Learning']].map(([key,label])=>{
   const w=workers[key]||{},seconds=w.updated?Math.max(0,(Date.now()-new Date(w.updated).getTime())/1000):null;
@@ -3715,7 +3724,8 @@ function renderStockRuntime(s){
  const review=s.forward_review||{},recent=review.recent||{},promotion=s.model_promotion||{},obs=review.observations||{};
  skHTML('skLearningReview',`<h3>${review.drift?'Prediction drift detected':'Forward performance monitor'}</h3><div class="sr-learning-numbers"><div><span>Recorded outcomes in recent window</span><b>${skEsc(recent.samples||0)}</b></div><div><span>Forward Brier · lower is better</span><b>${skNum(recent.brier,3)}</b></div><div><span>Forward AUC</span><b>${skNum(recent.auc,3)}</b></div><div><span>Unusable / expired outcomes</span><b>${skEsc(obs.excluded||0)}</b></div></div><p>${skEsc(review.drift?'A deterioration signal has scheduled review after market close. Existing stops and risk limits stay active.':'Predictions are recorded first; outcomes are measured later. Fresh evidence adjusts the forward contribution within its configured cap.')}</p><p><b>Model review:</b> ${skEsc(promotion.reason||'The current model stays active while a replacement is trained and compared.')}</p><p>Scores measure prediction quality, not guaranteed trade returns. No automatic change to your daily loss limit.</p>`);
  const sig=(s.signals||[]).find(x=>x.symbol===stockdeskSymbol);if(sig?.market_regime)skText('skRegime',sig.market_regime.name.replaceAll('_',' '));
- if(stale){skNotice(d.error||'Showing a saved snapshot. Fresh status is pending; entry controls are temporarily unavailable.',true);['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});}
+ if(stale){skNotice(d.error||'Dashboard refresh pending. This is the age of displayed data; it does not by itself mean Kite disconnected.',true);['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});}
+ else if(d.error)skNotice(d.error,true);
  else if(command.status==='QUEUED'){skNotice(`Queued: ${command.action}. Waiting for supervision; Disarm remains available.`);skEl('skArm').disabled=true;}
  else if(['FAILED','EXPIRED'].includes(command.status))skNotice(command.message||'Control was not applied.',true);
 }

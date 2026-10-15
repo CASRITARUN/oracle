@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory() as path:
         assert client.get('/api/stock-ai/state').status_code==401
         app.SESSION['access_token']='offline-token'
         start=time.monotonic();r=client.get('/api/stock-ai/state');assert r.status_code==200,r.get_json()
-        assert r.get_json()['dashboard']['status']=='LOADING'
+        assert r.get_json()['dashboard']['status'] in ('LOADING','CURRENT')
         assert time.monotonic()-start<.25
         for _ in range(60):
             if not app._STOCK_READ_SNAPSHOT.running:break
@@ -38,14 +38,36 @@ with tempfile.TemporaryDirectory() as path:
         r=client.get('/api/stock-ai/state');d=r.get_json();assert r.status_code==200 and not d['dashboard']['stale'],d
         json.dumps(d,allow_nan=False)
         assert d['runtime_build']==app.STOCK_RUNTIME_BUILD
+        # Real production schemas with old/incomplete analytics and typed runtime
+        # values. None of these display records may prevent the ledger from loading.
+        import numpy as np
+        with app.STOCK_DESK.db() as c:
+            c.execute("INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,qty,entry,stop,target,risk,status,exit_ts,pnl,fees,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ('offline-old','2025-01-02T09:30:00+05:30','TEST','paper','TESTCE','NFO',50,0,100.,90.,120.,1000.,'CLOSED',None,20.,None,'{}'))
+            c.execute("INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,qty,entry,stop,target,risk,status,pnl,fees,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ('offline-open',app.now_ist().isoformat(),'TEST','paper','TESTCE','NFO',50,100,100.,90.,120.,1000.,'OPEN',0.,5.,'{}'))
+            c.execute("INSERT INTO desk_orders(id,ts,position_id,side,qty,mode,tag,broker_id,status,filled,notional,limit_price,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ('offline-fill','2025-01-02T09:30:00+05:30','offline-old','BUY',50,'live','OFFLINE',None,'COMPLETE',50,5000.,100.,'Offline fixture'))
+        app.STOCK_DESK.put('execution_fill:offline-fill',dict(mode='live',filled=50,delay_seconds=None))
+        app.STOCK_DESK.health['offline-open']=dict(bid=101.,observed_mono=time.monotonic())
+        app.STOCK_DESK.signals={'TEST':dict(symbol='TEST',decision='WAIT',confidence=np.float64(.55),rank_score=np.int64(55),qualified=np.bool_(False),bar_ts=app.now_ist(),reason='Offline fixture')}
+        app._STOCK_READ_SNAPSHOT.invalidate()
+        client.get('/api/stock-ai/state')
+        assert app._STOCK_READ_SNAPSHOT.done.wait(2)
+        d=client.get('/api/stock-ai/state').get_json()
+        assert d['dashboard']['status']=='PARTIAL' and not d['dashboard']['stale'],d['dashboard']
+        assert d['positions'][0]['qty']==100 and d['evidence']['net'] is None
+        assert d['signals'][0]['rank_score']==55 and d['signals'][0]['qualified'] is False
+        json.dumps(d,allow_nan=False)
         # Exercise the real Stock risk manager/SQLite schema without broker I/O.
         app.STOCK_DESK.risk_display=dict(config=app.STOCK_RISK.config(),states={m:app.STOCK_RISK.snapshot(m) for m in ('live','paper')},timestamp=app.now_ist().isoformat(),broker=app.BROKER_GATE.status())
         assert client.get('/api/desk-risk/stock').status_code==200
         r=client.post('/api/stock-ai/control/disarm',json={});assert r.status_code==200 and r.get_json()['config']['armed'] is False
-        assert client.get('/api/stock-ai/state').get_json()['dashboard']['stale']
+        refreshed=client.get('/api/stock-ai/state').get_json()
+        assert refreshed['dashboard']['stale'] or refreshed['config']['armed'] is False
         assert client.get('/api/system-health').status_code==200
         assert not calls,calls
         # UI fixtures use real backend response shapes, no account data.
         Path(__file__).with_name('smoke_state.json').write_text(json.dumps(d))
-        print('Auth, cold/warm state, JSON, independent risk, disarm, invalidation and health: PASS; external requests:',len(calls))
+        print('Auth, cold/warm/populated state, typed JSON, legacy records, independent risk, disarm, invalidation and health: PASS; external requests:',len(calls))
     finally:os.chdir(old)

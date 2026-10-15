@@ -93,7 +93,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(box.payload)
     def test_invalidation_prevents_inflight_precommand_snapshot_becoming_current(self):
         box=Read();gate=threading.Event()
-        e=SimpleNamespace(state=lambda:(gate.wait(1) or {'config':{}}),config_defaults={})
+        e=SimpleNamespace(state=lambda:(gate.wait(1),{'config':{}})[1],config_defaults={})
         box.response(e);box.invalidate();gate.set()
         for _ in range(50):
             if not box.running:break

@@ -14975,7 +14975,7 @@ class StockDeskEngine(DeskEngine):
             return cfg
 
 # Stock-only runtime. Index keeps the existing StockDeskEngine base unchanged.
-STOCK_RUNTIME_BUILD='2026.10.15-stock-runtime.1'
+STOCK_RUNTIME_BUILD='2026.10.15-stock-display.2'
 
 class StockRuntimeAdapter(StockDeskAdapter):
     @contextmanager
@@ -14993,7 +14993,9 @@ class StockRuntimeAdapter(StockDeskAdapter):
         # WAL readers do not wait behind the scanner's Python or broker locks.
         path=os.path.join(os.path.dirname(__file__),'stock_options_ai.db')
         c=sqlite3.connect(path,timeout=.15);c.row_factory=sqlite3.Row
-        deadline=time.monotonic()+.6
+        # This runs in one background display job, not in the HTTP request.
+        # A busy VM must not discard an otherwise valid read after only 600 ms.
+        deadline=time.monotonic()+2.
         try:
             c.execute('PRAGMA query_only=ON');c.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
             c.execute('BEGIN');yield c
@@ -15019,6 +15021,8 @@ class StockRuntimeEngine(StockDeskEngine):
             c.executescript('''CREATE INDEX IF NOT EXISTS stock_obs_due ON desk_observations(target_ts) WHERE label IS NULL AND outcome_status='PENDING';
                 CREATE INDEX IF NOT EXISTS stock_obs_settled ON desk_observations(ts DESC) WHERE label IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS stock_position_status ON desk_positions(status,mode);
+                CREATE INDEX IF NOT EXISTS stock_position_time ON desk_positions(ts DESC);
+                CREATE INDEX IF NOT EXISTS stock_paper_closed_time ON desk_positions(exit_ts) WHERE status='CLOSED' AND mode='paper';
                 CREATE INDEX IF NOT EXISTS stock_order_position ON desk_orders(position_id,ts DESC);
                 CREATE INDEX IF NOT EXISTS stock_order_time ON desk_orders(ts DESC);
                 CREATE INDEX IF NOT EXISTS stock_model_time ON desk_models(ts DESC);''')
@@ -15066,9 +15070,10 @@ class StockRuntimeEngine(StockDeskEngine):
         if manager and time.monotonic()>=getattr(self,'_display_risk_at',0.) and manager.lock.acquire(False):
             try:
                 self._display_risk_at=time.monotonic()+3
-                self.risk_display=dict(config=manager.config(),states={mode:manager.snapshot(mode) for mode in ('paper','live')},
+                display=dict(config=manager.config(),states={mode:manager.snapshot(mode) for mode in ('paper','live')},
                     timestamp=now_ist().isoformat(),scope='Stock only',broker=BROKER_GATE.status())
-                for view in self.risk_display['states'].values():view.pop('closed',None)
+                for view in display['states'].values():view.pop('closed',None)
+                self.risk_display=display  # Publish only after construction; readers see one complete object.
             finally:manager.lock.release()
     def control(self,action,body):
         if action in ('disarm','close'):
@@ -15382,43 +15387,88 @@ class StockRuntimeEngine(StockDeskEngine):
             previous=dict(bar=bar,direction=direction,count=min(2,int(previous.get('count',0))+1) if consecutive else 1)
             self.put(key,previous)
         return previous.get('count',0)>=2
+    @staticmethod
+    def display_number(value):
+        if value is None or isinstance(value,(bool,np.bool_)):return None
+        try:number=float(value)
+        except (TypeError,ValueError,OverflowError):return None
+        return number if math.isfinite(number) else None
+    def display_paper_evidence(self,paper,warnings):
+        # Optional historical analytics must not take down current orders/positions.
+        # Missing amounts are unknown, never silently replaced by zero.
+        number=self.display_number;n=len(paper);values=[];multiples=[];dates=[];curve=[];total=0.
+        for p in paper:
+            pnl=number(p.get('pnl'));fees=number(p.get('fees'));risk=number(p.get('risk'))
+            start=_ai_ts_naive(p.get('ts'));end=_ai_ts_naive(p.get('exit_ts'))
+            dates.append((start,end))
+            if pnl is None or fees is None:continue
+            net=pnl-fees;values.append(net);total+=net
+            if risk is not None and risk>0:multiples.append(net/risk)
+            if end:curve.append(dict(ts=p['exit_ts'],pnl=round(total,2)))
+        amounts_ok=len(values)==n;dates_ok=all(start and end and end>=start for start,end in dates)
+        span=(max(end for _,end in dates)-min(start for start,_ in dates)).total_seconds()/86400 if dates and dates_ok else 0. if not dates else None
+        wins=sum(max(0.,v) for v in values);losses=-sum(min(0.,v) for v in values)
+        avg=sum(multiples)/n if n and len(multiples)==n else 0. if not n else None
+        win_rate=100*sum(v>0 for v in values)/max(1,n) if amounts_ok else None
+        factor=wins/losses if amounts_ok and losses else None
+        if not amounts_ok or not dates_ok or len(multiples)!=n:warnings.append('Paper history: incomplete dates or amounts; affected statistics are unavailable.')
+        checks=[dict(name='Closed paper trades',value=n,required=60,ok=n>=60),
+            dict(name='Record span · days',value=round(span,1) if span is not None else None,required=10,ok=span is not None and span>=10),
+            dict(name='Net win rate · %',value=round(win_rate,1) if win_rate is not None else None,required=42,ok=win_rate is not None and win_rate>=42),
+            dict(name='Net expectancy · R',value=round(avg,3) if avg is not None else None,required=.05,ok=avg is not None and avg>=.05),
+            dict(name='Profit factor',value=round(factor,2) if factor is not None else None,required=1.2,ok=factor>=1.2 if factor is not None else amounts_ok and wins>0)]
+        return dict(ready=all(x['ok'] for x in checks),checks=checks,trades=n,net=round(total,2) if amounts_ok else None,
+            win_rate=win_rate,equity=curve[-300:] if amounts_ok and dates_ok else [])
     def state(self):
         # Single bounded, read-only SQLite snapshot. No risk mutation, broker calls,
         # scan locks, training locks or per-trade queries are permitted on this path.
         import copy
+        warnings=[];self.display_read_phase='saved configuration'
+        def read_json(payload,label,expected=None,required=False,critical=False):
+            try:
+                value=json.loads(payload)
+                if value is not None and expected and not isinstance(value,expected):raise TypeError('Unexpected stored shape')
+                if required and not isinstance(value,dict):raise TypeError('Configuration must be an object')
+                return value
+            except (ValueError,TypeError):
+                if required or critical:raise ValueError('Saved '+label+' is unreadable') from None
+                warnings.append(label+': saved display data is unavailable.');return None
         with self.a.dashboard_db() as c:
             keys=['config','halt','close_requested','stock_champion_id','stock_universe_info','online_model',
                 'stock_learning_report','trade_success_model','historical_setup_success_model','stock_model_promotion']
-            meta={r['key']:json.loads(r['value']) for r in c.execute('SELECT key,value FROM desk_meta WHERE key IN ('+','.join('?' for _ in keys)+')',keys)}
+            meta={}
+            objects={'config','stock_universe_info','online_model','stock_learning_report','trade_success_model','historical_setup_success_model','stock_model_promotion'}
+            control_types={'halt':str,'close_requested':bool,'stock_champion_id':str}
+            for r in c.execute('SELECT key,value FROM desk_meta WHERE key IN ('+','.join('?' for _ in keys)+')',keys):
+                meta[r['key']]=read_json(r['value'],r['key'],dict if r['key'] in objects else control_types.get(r['key']),r['key']=='config',r['key'] in control_types)
             cfg={**self.config_defaults,**meta.get('config',{})}
+            self.display_read_phase='saved model'
             model_row=c.execute('SELECT payload FROM desk_models WHERE id=?',(meta.get('stock_champion_id'),)).fetchone()
             if not model_row:model_row=c.execute('SELECT payload FROM desk_models ORDER BY ts DESC,rowid DESC LIMIT 1').fetchone()
-            model=json.loads(model_row[0]) if model_row else None
+            model=read_json(model_row[0],'Direction model',dict) if model_row else None
+            self.display_read_phase='position and order ledger'
             active=[dict(r) for r in c.execute("SELECT * FROM desk_positions WHERE status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING') ORDER BY ts")]
             trades=[dict(r) for r in c.execute('SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100')]
             orders=[dict(r) for r in c.execute('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60')]
             pending=[dict(r) for r in c.execute("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') ORDER BY o.ts")]
             archived=[dict(r) for r in c.execute("SELECT o.*,p.contract,p.symbol FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.status='HISTORICAL_UNKNOWN' ORDER BY o.ts DESC LIMIT 30")]
+            self.display_read_phase='paper history and fill statistics'
             events=[dict(r) for r in c.execute('SELECT * FROM desk_events ORDER BY id DESC LIMIT 50')]
             paper=[dict(r) for r in c.execute("SELECT ts,exit_ts,pnl,fees,risk FROM desk_positions WHERE status='CLOSED' AND mode='paper' ORDER BY exit_ts")]
             fill_keys=['execution_fill:'+o['id'] for o in orders]
-            fills=[json.loads(r[0]) for r in c.execute('SELECT value FROM desk_meta WHERE key IN ('+','.join('?' for _ in fill_keys)+')',fill_keys)] if fill_keys else []
+            fills=[read_json(r[0],'Fill statistics',dict) for r in c.execute('SELECT value FROM desk_meta WHERE key IN ('+','.join('?' for _ in fill_keys)+')',fill_keys)] if fill_keys else []
+        self.display_read_phase='position display'
         for p in active:
             p.pop('setup',None);p.update(dict(self.health.get(p['id'],{})))
-            p['mark_age_seconds']=round(time.monotonic()-p['observed_mono'],1) if p.get('observed_mono') else None
-            p['unrealized']=(p['bid']-p['entry'])*p['qty'] if p.get('bid') is not None else None
-        values=[p['pnl']-p['fees'] for p in paper];wins=sum(max(0.,v) for v in values);losses=-sum(min(0.,v) for v in values)
-        n=len(values);span=(_ai_ts_naive(paper[-1]['exit_ts'])-_ai_ts_naive(paper[0]['ts'])).total_seconds()/86400 if paper else 0.
-        avg=sum((p['pnl']-p['fees'])/max(.01,p['risk']) for p in paper)/max(1,n);win_rate=100*sum(v>0 for v in values)/max(1,n)
-        checks=[dict(name='Closed paper trades',value=n,required=60,ok=n>=60),dict(name='Record span · days',value=round(span,1),required=10,ok=span>=10),
-            dict(name='Net win rate · %',value=round(win_rate,1),required=42,ok=win_rate>=42),dict(name='Net expectancy · R',value=round(avg,3),required=.05,ok=avg>=.05),
-            dict(name='Profit factor',value=round(wins/losses,2) if losses else None,required=1.2,ok=wins/losses>=1.2 if losses else wins>0)]
-        curve=[];total=0.
-        for p,v in zip(paper,values):total+=v;curve.append(dict(ts=p['exit_ts'],pnl=round(total,2)))
-        evidence=dict(ready=all(x['ok'] for x in checks),checks=checks,trades=n,net=round(total,2),win_rate=win_rate,equity=curve[-300:])
+            observed=self.display_number(p.get('observed_mono'));bid=self.display_number(p.get('bid'))
+            entry=self.display_number(p.get('entry'));qty=self.display_number(p.get('qty'))
+            p['mark_age_seconds']=round(max(0.,time.monotonic()-observed),1) if observed else None
+            p['unrealized']=(bid-entry)*qty if all(v is not None for v in (bid,entry,qty)) else None
+        evidence=self.display_paper_evidence(paper,warnings)
+        self.display_read_phase='worker and signal display'
         def public(m):return {k:v for k,v in (m or {}).items() if k not in ('mu','sd','w','bias','per_symbol')} or None
         signals=[dict(v) for v in list(self.signals.values())]
-        signals.sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
+        signals.sort(key=lambda x:(x.get('decision')=='READY',self.display_number(x.get('rank_score')) or 0.),reverse=True)
         for i,row in enumerate(signals,1):row['rank']=i;row.pop('features',None)
         risk=copy.deepcopy(self.risk_display);mode=cfg.get('mode','paper');view=(risk.get('states') or {}).get(mode,{})
         timestamp=now_ist().isoformat();risk_ts=_ai_ts_naive(risk.get('timestamp'))
@@ -15431,23 +15481,27 @@ class StockRuntimeEngine(StockDeskEngine):
         if meta.get('close_requested'):block='Close requested · positions remain supervised'
         learning=copy.deepcopy(self.learning_cache or meta.get('stock_learning_report') or {})
         fills=[x for x in fills if x and x.get('mode')==mode]
+        delays=[self.display_number(x.get('delay_seconds')) for x in fills];delays=[x for x in delays if x is not None and x>=0]
+        slippage=[self.display_number(x.get('slippage_vs_limit_bps')) for x in fills];slippage=[x for x in slippage if x is not None]
+        if len(delays)!=len(fills) or len(slippage)!=len(fills):warnings.append('Fill statistics: some older records have no timing or slippage measurement.')
         sm=public(meta.get('trade_success_model'));hm=public(meta.get('historical_setup_success_model'));archive=self._history_archive_coverage()
         return dict(version='stock-runtime-1',runtime_build=STOCK_RUNTIME_BUILD,build=STOCK_AI_BUILD,timestamp=timestamp,
             connected=connected,market_open=market,config=cfg,block=block,halt=meta.get('halt'),positions=active,trades=trades,orders=orders,
             pending_orders=pending,historical_unknown_orders=archived,events=events,legacy=[],recorder_error=self.recorder_error,
             signals=signals,model=public(model),online=public(meta.get('online_model')),evidence=evidence,
             observations=learning.get('observations',{}),training=dict(self.training),last_cycle=self.last_cycle,
-            universe=meta.get('stock_universe_info',{}),scan=dict(self.scan_status),watchlist=list(self.a.symbols),
+            universe=meta.get('stock_universe_info') or {},scan=dict(self.scan_status),watchlist=list(self.a.symbols),
             ban_status=self.ban_error or 'Daily list checked',execution=dict(self.execution_status),
             success_model=sm,live_success_model=sm,historical_success_model=hm,historical_archive=archive,
             success_selector_status='HISTORICAL + OPTION' if sm and sm.get('valid') and hm and hm.get('valid') else 'DIRECTION / LEARNING',
             history_backfill=dict(self.history_backfill_status),workers=copy.deepcopy(getattr(self,'worker_health',{})),
             market_feed=DESK_MARKET_FEED.state(),direction_blend=desk_blend_weights(model,meta.get('online_model'),cfg.get('forward_weight_cap',.4)),
-            execution_quality=dict(samples=len(fills),recent_fills=fills[:20],mode=mode,
-                mean_confirmation_seconds=sum(x['delay_seconds'] for x in fills)/len(fills) if fills else None,
-                mean_slippage_vs_limit_bps=sum(x.get('slippage_vs_limit_bps') or 0 for x in fills)/len(fills) if fills else None),
+            execution_quality=dict(samples=len(fills),timing_samples=len(delays),slippage_samples=len(slippage),recent_fills=fills[:20],mode=mode,
+                mean_confirmation_seconds=sum(delays)/len(delays) if delays else None,
+                mean_slippage_vs_limit_bps=sum(slippage)/len(slippage) if slippage else None),
             pnl={m:(risk.get('states') or {}).get(m,{}).get('net') for m in ('paper','live')},risk_display=risk,risk_age_seconds=risk_age,
-            learning_runtime=dict(self.learning_status),forward_review=learning,model_promotion=meta.get('stock_model_promotion'),command=dict(self.command_status))
+            learning_runtime=dict(self.learning_status),forward_review=learning,model_promotion=meta.get('stock_model_promotion'),command=dict(self.command_status),
+            display_warnings=list(dict.fromkeys(warnings)))
     @property
     def config_defaults(self):
         # Base defaults are merged once outside browser I/O. No dashboard read should
@@ -15562,38 +15616,75 @@ class StockReadSnapshot:
     def __init__(self):
         self.lock=threading.Lock();self.payload=None;self.created=0.;self.running=False
         self.generation=0;self.valid_generation=-1;self.error=None;self.retry_at=0.
+        self.done=threading.Event();self.failure=None;self.failures=0
+    @staticmethod
+    def display_json(item):
+        # Broker timestamps and numpy scalars are normal runtime values. Keep them
+        # typed in JSON instead of failing the whole page or stringifying numbers.
+        from datetime import date
+        if isinstance(item,np.generic):return StockReadSnapshot.display_json(item.item())
+        if isinstance(item,np.ndarray):return StockReadSnapshot.display_json(item.tolist())
+        if isinstance(item,(datetime,date)):return item.isoformat()
+        if isinstance(item,dict):return {k:StockReadSnapshot.display_json(v) for k,v in item.items()}
+        if isinstance(item,(list,tuple)):return [StockReadSnapshot.display_json(v) for v in item]
+        if isinstance(item,float) and not math.isfinite(item):return None
+        if item is None or isinstance(item,(str,int,float,bool)):return item
+        raise TypeError('Unsupported Stock display value type: '+type(item).__name__)
+    @staticmethod
+    def describe_error(exc,phase,reference):
+        code='DISPLAY_READ_ERROR';hint='Saved dashboard data could not be read; retrying automatically.'
+        if isinstance(exc,sqlite3.OperationalError):
+            detail=str(exc).lower()
+            if 'locked' in detail or 'busy' in detail:code='DATABASE_BUSY';hint='The saved ledger is busy; the display will retry automatically.'
+            elif 'interrupted' in detail:code='READ_TIMEOUT';hint='The saved-ledger read exceeded its time budget; retrying automatically.'
+            elif 'no such' in detail:code='SCHEMA_MISMATCH';hint='The saved ledger schema differs from this server version.'
+        elif phase=='JSON encoding':code='DISPLAY_ENCODING';hint='A dashboard value could not be encoded.'
+        elif isinstance(exc,(TypeError,ValueError,KeyError)):code='DISPLAY_DATA';hint='A saved value could not be read for '+phase+'.'
+        return dict(code=code,phase=phase,exception_type=type(exc).__name__,reference=reference,message=hint)
     def invalidate(self):
         with self.lock:self.generation+=1;self.retry_at=0.
-    def response(self,engine):
+    def response(self,engine,wait_seconds=0.):
         import copy
         now=time.monotonic()
         with self.lock:
             if not self.running and now>=self.retry_at and (self.payload is None or now-self.created>3 or self.valid_generation!=self.generation):
-                self.running=True;generation=self.generation
+                self.running=True;self.done.clear();generation=self.generation
                 def job():
+                    phase='saved ledger'
                     try:
                         value=engine.state()
-                        # Validate JSON before publication; never poison a good snapshot with NaN.
-                        def display_value(item):
-                            if isinstance(item,dict):return {k:display_value(v) for k,v in item.items()}
-                            if isinstance(item,(list,tuple)):return [display_value(v) for v in item]
-                            if isinstance(item,(float,np.floating)) and not math.isfinite(item):return None
-                            return item
-                        frozen=json.loads(json.dumps(display_value(value),allow_nan=False))
+                        phase='JSON encoding'
+                        if not isinstance(value,dict):raise TypeError('Stock state must be an object')
+                        frozen=json.loads(json.dumps(self.display_json(value),allow_nan=False))
                         with self.lock:
                             if generation==self.generation:
-                                self.payload=frozen;self.created=time.monotonic();self.valid_generation=generation;self.error=None
-                    except Exception:
-                        reference=secrets.token_hex(6);logger.exception('Stock display read failed; reference %s',reference)
-                        with self.lock:self.error='Display read failed · reference '+reference;self.retry_at=time.monotonic()+5
+                                self.payload=frozen;self.created=time.monotonic();self.valid_generation=generation
+                                self.error=None;self.failure=None;self.failures=0;self.retry_at=0.
+                    except Exception as exc:
+                        if phase!='JSON encoding':phase=getattr(engine,'display_read_phase',phase)
+                        reference=secrets.token_hex(6);failure=self.describe_error(exc,phase,reference)
+                        logger.exception('Stock display read failed; reference %s; phase %s; code %s',reference,phase,failure['code'])
+                        with self.lock:
+                            if generation==self.generation:
+                                self.failures+=1;self.failure=failure
+                                self.error=failure['message']+' Reference '+reference
+                                self.retry_at=time.monotonic()+min(5.,.5*2**min(4,self.failures-1))
                     finally:
-                        with self.lock:self.running=False
+                        with self.lock:self.running=False;self.done.set()
                 threading.Thread(target=job,daemon=True,name='stock-display').start()
+            first_read=self.payload is None and self.running
+        # A fast first read can be returned immediately. A slow one never holds a
+        # request beyond this small bound, and browsers retry without another 3s gap.
+        if first_read and wait_seconds:self.done.wait(min(.1,max(0.,wait_seconds)))
+        with self.lock:
+            now=time.monotonic()
             value=copy.deepcopy(self.payload) if self.payload is not None else dict(config=engine.config_defaults,positions=[],signals=[],trades=[],orders=[],events=[],pnl={},model=None,training={},evidence={},runtime_build=STOCK_RUNTIME_BUILD)
             age=round(max(0.,now-self.created),1) if self.payload is not None else None
-            stale=self.payload is None or age>10 or self.valid_generation!=self.generation
-            value['dashboard']=dict(status='LOADING' if self.payload is None else 'STALE' if stale else 'CURRENT',age_seconds=age,
-                refreshing=self.running,error=self.error,stale=stale)
+            stale=self.payload is None or age>10 or self.valid_generation!=self.generation or bool(self.error)
+            status=('ERROR' if self.error else 'LOADING') if self.payload is None else 'STALE' if stale else 'PARTIAL' if value.get('display_warnings') else 'CURRENT'
+            value['dashboard']=dict(status=status,age_seconds=age,refreshing=self.running,error=self.error,stale=stale,
+                has_snapshot=self.payload is not None,failure=copy.deepcopy(self.failure),failure_count=self.failures,
+                retry_after_seconds=round(max(0.,self.retry_at-now),1),refresh_after_ms=1000 if stale or self.error else 3000)
             return value
 
 STOCK_DESK=StockRuntimeEngine(StockRuntimeAdapter())
@@ -15670,7 +15761,8 @@ def dashboard_system_health():
     return jsonify(ok=True,build='2026.10.12-execution-quality.11',
         stock_runtime=dict(build=STOCK_RUNTIME_BUILD,display_running=_STOCK_READ_SNAPSHOT.running,
             display_age_seconds=round(time.monotonic()-_STOCK_READ_SNAPSHOT.created,1) if _STOCK_READ_SNAPSHOT.payload is not None else None,
-            display_error=_STOCK_READ_SNAPSHOT.error,learning=dict(STOCK_DESK.learning_status),command=dict(STOCK_DESK.command_status)),
+            display_error=_STOCK_READ_SNAPSHOT.error,display_failure=_STOCK_READ_SNAPSHOT.failure,
+            display_phase=getattr(STOCK_DESK,'display_read_phase',None),learning=dict(STOCK_DESK.learning_status),command=dict(STOCK_DESK.command_status)),
         kite_session_present=bool(SESSION.get('access_token')),
         snapshots={name:dict(running=slot.running,age_seconds=round(time.monotonic()-slot.created,1) if slot.payload else None,
             error=slot.error) for name,slot in _DASHBOARD_SNAPSHOTS.items()})
@@ -15678,7 +15770,7 @@ def dashboard_system_health():
 @app.route('/api/stock-ai/state')
 def stock_ai_state():
     if not require_session():return jsonify(error='Connect Kite first'),401
-    return jsonify(_STOCK_READ_SNAPSHOT.response(STOCK_DESK))
+    return jsonify(_STOCK_READ_SNAPSHOT.response(STOCK_DESK,wait_seconds=.1))
 
 @app.route('/api/stock-ai/config',methods=['POST'])
 def stock_ai_config():
