@@ -66,8 +66,8 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # this process starts) — do NOT hardcode real keys/secrets directly in this file,
 # especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
-API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
+API_KEY = os.environ.get("KITE_API_KEY", "PUT_YOUR_KITE_API_KEY")
+API_SECRET = os.environ.get("KITE_API_SECRET", "PUT_YOUR_KITE_API_SECRET")
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
@@ -14974,7 +14974,631 @@ class StockDeskEngine(DeskEngine):
             if action=='arm':self.execution_event.set()
             return cfg
 
-STOCK_DESK=StockDeskEngine(StockDeskAdapter())
+# Stock-only runtime. Index keeps the existing StockDeskEngine base unchanged.
+STOCK_RUNTIME_BUILD='2026.10.15-stock-runtime.1'
+
+class StockRuntimeAdapter(StockDeskAdapter):
+    @contextmanager
+    def db(self):
+        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'stock_options_ai.db'),timeout=1.5)
+        c.row_factory=sqlite3.Row
+        try:yield c;c.commit()
+        except Exception:c.rollback();raise
+        finally:c.close()
+    def __init__(self):
+        super().__init__()
+        with self.db() as c:c.execute('PRAGMA journal_mode=WAL')
+    @contextmanager
+    def dashboard_db(self):
+        # WAL readers do not wait behind the scanner's Python or broker locks.
+        path=os.path.join(os.path.dirname(__file__),'stock_options_ai.db')
+        c=sqlite3.connect(path,timeout=.15);c.row_factory=sqlite3.Row
+        deadline=time.monotonic()+.6
+        try:
+            c.execute('PRAGMA query_only=ON');c.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+            c.execute('BEGIN');yield c
+        finally:c.close()
+    def place(self,exchange,contract,side,qty,price,tag):
+        if side=='BUY' and getattr(self,'entry_paused',lambda:False)():
+            raise BrokerDeferred('Stock entry paused locally before broker submission; no request was sent.')
+        return super().place(exchange,contract,side,qty,price,tag)
+
+class StockRuntimeEngine(StockDeskEngine):
+    """Stock-only display/learning isolation with recorded, prospective evidence."""
+    def __init__(self,adapter):
+        self.operator_pause=threading.Event();self.operator_lock=threading.RLock();self.command_lock=threading.Lock();self.command_epoch=0
+        self.command_status={};self.learning_event=threading.Event();self.learning_status={'status':'STARTING'};self.challenger_lock=threading.Lock()
+        self.learning_cache={};self.risk_display={};self.runtime_cache_lock=threading.Lock();self.runtime_cache={}
+        super().__init__(adapter)
+        self.a.entry_paused=self.operator_pause.is_set
+        with self.db() as c:
+            columns={r[1] for r in c.execute('PRAGMA table_info(desk_observations)')}
+            for name,definition in [('outcome_status',"TEXT NOT NULL DEFAULT 'PENDING'"),('historical_prob','REAL'),
+                ('forward_prob','REAL'),('recorded_at','TEXT'),('regime','TEXT'),('next_check','TEXT')]:
+                if name not in columns:c.execute('ALTER TABLE desk_observations ADD COLUMN '+name+' '+definition)
+            c.executescript('''CREATE INDEX IF NOT EXISTS stock_obs_due ON desk_observations(target_ts) WHERE label IS NULL AND outcome_status='PENDING';
+                CREATE INDEX IF NOT EXISTS stock_obs_settled ON desk_observations(ts DESC) WHERE label IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS stock_position_status ON desk_positions(status,mode);
+                CREATE INDEX IF NOT EXISTS stock_order_position ON desk_orders(position_id,ts DESC);
+                CREATE INDEX IF NOT EXISTS stock_order_time ON desk_orders(ts DESC);
+                CREATE INDEX IF NOT EXISTS stock_model_time ON desk_models(ts DESC);''')
+        incumbent=super().model()
+        if incumbent and not self.get('stock_champion_id'):self.put('stock_champion_id',incumbent['id'])
+        self.learning_cache=self.get('stock_learning_report',{})
+    def model(self):
+        # Immutable model objects cached briefly; inference no longer decodes a large
+        # coverage payload once per stock in every universe pass.
+        clock=time.monotonic();cache=getattr(self,'runtime_cache',{}).get('model')
+        if cache and clock-cache[0]<3:return cache[1]
+        identity=self.get('stock_champion_id');rows=self.rows('SELECT ts,payload FROM desk_models WHERE id=?',(identity,)) if identity else []
+        model=json.loads(rows[0]['payload']) if rows else super().model()
+        if model and not _ai_ts_naive(model.get('ts')) and rows:model['ts']=rows[0]['ts']
+        if hasattr(self,'runtime_cache'):self.runtime_cache['model']=(clock,model)
+        return model
+    def block(self):
+        if self.operator_pause.is_set():return 'Entries disarmed by operator'
+        # Refresh training keeps using the frozen champion. Other entry checks still
+        # run, including metadata/age checks at final order validation.
+        if self.train_lock.locked() and self.model():
+            return self._block_with_champion()
+        return super().block()
+    def _block_with_champion(self):
+        cfg=self.config()
+        if not self.a.connected():return 'Connect Kite to receive market data'
+        if not self.a.market_open():return 'Market closed'
+        if self.get('halt'):return self.get('halt')
+        if not cfg['armed']:return 'Entries disarmed · learning continues'
+        if now_ist().strftime('%H:%M')>=cfg['square_off']:return 'Square-off window · no new entries'
+        if self.get('close_requested'):return 'Close requested · waiting for exits'
+        if cfg['mode']=='live' and not (cfg.get('live_override') or self.evidence()['ready']):return 'Live locked · build the forward paper record'
+        view=self.shared_risk.snapshot(cfg['mode']) if hasattr(self,'shared_risk') else {}
+        return view.get('entry_block') or ('Daily loss limit reached' if self.day_pnl(cfg['mode'])<=-cfg['daily_loss'] else None)
+    @staticmethod
+    def _supervision_transport_error(error):
+        return isinstance(error,BrokerDeferred) or getattr(error,'code',None)==429 or StockDeskEngine._supervision_transport_error(error)
+    @staticmethod
+    def _owned_connection_halt(message):
+        return StockDeskEngine._owned_connection_halt(message) or (str(message).startswith('Position supervision error:') and 'Broker request deferred locally' in str(message))
+    def supervise(self):
+        super().supervise()
+        # Display snapshots are produced by the worker, never by a browser read.
+        manager=getattr(self,'shared_risk',None)
+        if manager and time.monotonic()>=getattr(self,'_display_risk_at',0.) and manager.lock.acquire(False):
+            try:
+                self._display_risk_at=time.monotonic()+3
+                self.risk_display=dict(config=manager.config(),states={mode:manager.snapshot(mode) for mode in ('paper','live')},
+                    timestamp=now_ist().isoformat(),scope='Stock only',broker=BROKER_GATE.status())
+                for view in self.risk_display['states'].values():view.pop('closed',None)
+            finally:manager.lock.release()
+    def control(self,action,body):
+        if action in ('disarm','close'):
+            # Stop new broker BUY calls immediately. Orders already transmitted may
+            # still fill and remain owned/reconciled by the supervisor.
+            with self.operator_lock:self.operator_pause.set();self.command_epoch+=1
+            today=now_ist().date().isoformat()
+            with self.db() as c:
+                c.execute('BEGIN IMMEDIATE')
+                row=c.execute("SELECT value FROM desk_meta WHERE key='config'").fetchone()
+                cfg=json.loads(row[0]) if row else {};cfg['armed']=False
+                for key,value in [('config',cfg),('auto_start_paused_day',today)]+([('close_requested',True)] if action=='close' else []):
+                    c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',(key,json.dumps(value)))
+            with self.candidate_lock:self.execution_candidates=[]
+            self.execution_event.clear();self.risk_event.set()
+            self.command_status=dict(action=action,status='APPLIED',updated=now_ist().isoformat())
+            self.event('CONTROL',action);return self.config()
+        with self.operator_lock:epoch=self.command_epoch
+        result=super().control(action,body)
+        with self.operator_lock:
+            superseded=epoch!=self.command_epoch
+            if not superseded and action=='arm':self.operator_pause.clear();self.execution_event.set()
+        if superseded:
+            # A concurrent disarm can arrive while base control validates broker
+            # state. Its pause wins even if that older command saved config later.
+            with self.db() as c:
+                c.execute('BEGIN IMMEDIATE')
+                row=c.execute("SELECT value FROM desk_meta WHERE key='config'").fetchone()
+                cfg=json.loads(row[0]) if row else {};cfg['armed']=False
+                c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',('config',json.dumps(cfg)))
+            raise ValueError('Control superseded by disarm/close; entries remain disarmed')
+        return result
+    def queue_control(self,action,body):
+        if action not in ('arm','mode','live-override','clear-halt'):raise ValueError('Unknown action')
+        if not self.command_lock.acquire(False):raise ValueError('One control is already queued; its status is shown on the dashboard')
+        epoch=self.command_epoch;identity=secrets.token_hex(6)
+        self.command_status=dict(id=identity,action=action,status='QUEUED',updated=now_ist().isoformat())
+        def job():
+            try:
+                deadline=time.monotonic()+15
+                while not self.stop_event.is_set() and time.monotonic()<deadline:
+                    if epoch!=self.command_epoch:
+                        self.command_status=dict(id=identity,action=action,status='CANCELLED',message='Superseded by disarm/close');return
+                    if not self.control_lock.acquire(timeout=.1):continue
+                    try:
+                        if epoch!=self.command_epoch:continue
+                        self.control(action,body)
+                        self.command_status=dict(id=identity,action=action,status='APPLIED',updated=now_ist().isoformat());return
+                    finally:self.control_lock.release()
+                self.command_status=dict(id=identity,action=action,status='EXPIRED',message='Not applied: supervision did not release its lock within 15 seconds. Refresh before another command.')
+            except Exception as exc:self.command_status=dict(id=identity,action=action,status='FAILED',message=str(exc))
+            finally:self.command_lock.release()
+        threading.Thread(target=job,daemon=True,name='stock-control').start()
+        return dict(ok=True,queued=True,command_id=identity)
+    @staticmethod
+    def market_regime(bars):
+        if len(bars)<50:return dict(name='UNKNOWN',note='Need 50 completed candles',size_factor=1.)
+        closes=np.asarray([float(r['close']) for r in bars[-61:]],float)
+        highs=np.asarray([float(r['high']) for r in bars[-61:]],float);lows=np.asarray([float(r['low']) for r in bars[-61:]],float)
+        if not np.isfinite(closes).all() or np.any(closes<=0) or not np.isfinite(highs).all() or not np.isfinite(lows).all() or np.any(highs<lows):return dict(name='UNKNOWN',note='Invalid candles',size_factor=1.)
+        ranges=np.maximum(highs[1:]-lows[1:],np.maximum(np.abs(highs[1:]-closes[:-1]),np.abs(lows[1:]-closes[:-1])))
+        atr=float(ranges[-14:].mean());reference=float(np.median(ranges[:-14])) if len(ranges)>14 else atr
+        expansion=atr/max(reference,closes[-1]*.0001)
+        path=float(np.abs(np.diff(closes[-21:])).sum());efficiency=abs(float(closes[-1]-closes[-21]))/max(path,1e-9)
+        direction='UP' if closes[-1]>closes[-21] else 'DOWN'
+        name='VOLATILE' if expansion>=1.8 else ('TREND_'+direction if efficiency>=.35 else 'RANGE')
+        return dict(name=name,efficiency=round(efficiency,4),atr=round(atr,6),volatility_ratio=round(expansion,4),
+            size_factor=.70 if name=='VOLATILE' else .85 if name=='RANGE' else 1.,
+            note='Completed-candle heuristic; changes ranking/size, never represents a win probability')
+    def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=15):
+        s=super().direction_snapshot(symbol,refresh,False,max_bar_age)
+        if s.get('p_up') is None:return s
+        bars=[r for r in self.a.bars(symbol,61) if _ai_ts_naive(r.get('ts')) and _ai_ts_naive(r['ts'])+timedelta(minutes=5)<=now_ist()]
+        regime=self.market_regime(bars);s['market_regime']=regime
+        report=self.learning_cache or {};paired=report.get('paired',{})
+        weight=float((s.get('direction_blend') or {}).get('forward_weight') or 0.)
+        online=self.get('online_model') or {};online_ts=_ai_ts_naive(online.get('ts'))
+        if paired.get('samples',0)>=100 and s.get('online_probability') is not None and online_ts and 0<=(now_ist()-online_ts).total_seconds()<=2*86400:
+            # Performance observed AFTER recording predictions; no fitting on these
+            # outcomes here. Blend changes smoothly, remains within the user's cap.
+            advantage=float(paired['historical_brier'])-float(paired['forward_brier'])
+            target=self.config()['forward_weight_cap']*min(1.,paired['samples']/600.)/(1+math.exp(-max(-20.,min(20.,advantage*40.))))
+            weight=.5*weight+.5*target
+        weight=min(self.config()['forward_weight_cap'],max(0.,weight))
+        hp=float(s['historical_probability']);op=s.get('online_probability')
+        p=(1-weight)*hp+weight*float(op) if op is not None else hp
+        s.update(p_up=p,direction='UP' if p>=.5 else 'DOWN',confidence=max(p,1-p))
+        s['direction_blend']={**(s.get('direction_blend') or {}),'forward_weight':weight,'historical_weight':1-weight,
+            'reason':'Bounded validation weights plus recorded forward outcomes; no AUC/Brier entry cutoff'}
+        if s.get('decision')=='CANDIDATE' or s.get('reason')=='Direction below confidence threshold':
+            qualified=s['confidence']>=self.config()['confidence']
+            s.update(decision='CANDIDATE' if qualified else 'WAIT',reason='Direction qualifies for option check' if qualified else 'Direction below confidence threshold')
+        ts=_ai_ts_naive(s.get('bar_ts'));target=ts+timedelta(minutes=15) if ts else None
+        if record_observation and self.a.market_open() and target and target.date()==ts.date() and target.strftime('%H:%M')<='15:25' and target+timedelta(minutes=5)>now_ist() and 0<=float(s.get('bar_age',999))<=max_bar_age:
+            zone=timezone(timedelta(hours=5,minutes=30));stamp=ts.replace(tzinfo=zone).isoformat()
+            with self.db() as c:
+                c.execute('INSERT OR IGNORE INTO desk_observations(id,symbol,ts,target_ts,spot,features,model_id,prob,historical_prob,forward_prob,recorded_at,regime) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (symbol+stamp,symbol,stamp,target.replace(tzinfo=zone).isoformat(),float(s['spot']),json.dumps(s['features']),s['model_id'],p,hp,op,now_ist().isoformat(),regime['name']))
+        return s
+    @staticmethod
+    def rank_signal(s,max_spread):
+        rank=StockDeskEngine.rank_signal(s,max_spread)
+        regime=s.get('market_regime') or {};name=regime.get('name','UNKNOWN')
+        # Small, explicit tie-breaker. Existing confidence and liquidity checks decide eligibility.
+        penalty=3. if name=='VOLATILE' else 1.5 if name=='RANGE' else 0.
+        if name.startswith('TREND_') and name!='TREND_'+s.get('direction',''):penalty=4.
+        return round(max(0.,rank-penalty),2)
+    def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
+        sized=super().adaptive_entry_plan(s,q,lot,tick,funds,remaining)
+        factor=float((s.get('market_regime') or {}).get('size_factor',1.))
+        # Never squeeze stop distance to fit a daily allocation; reduce whole lots only.
+        if sized.get('qty',0)>lot and factor<1:
+            sized['qty']=max(lot,int(sized['qty']/lot*factor)*lot);sized['lots']=sized['qty']//lot
+            self.fit_costed_size(sized,None,sized['risk_plan']['capital_allocation'],lot)
+        sized['risk_plan'].update(regime=s.get('market_regime'),regime_size_factor=factor)
+        return sized
+    def settle_observations(self):
+        # Scanner only signals the independent learner; no fitting/large writes here.
+        self.learning_event.set()
+    def _settle_batch(self):
+        now=now_ist();due=(now-timedelta(minutes=5)).replace(tzinfo=IST).isoformat()
+        expired=(now-timedelta(days=7)).replace(tzinfo=IST).isoformat()
+        with self.db() as c:
+            c.execute("UPDATE desk_observations SET outcome_status='EXPIRED' WHERE label IS NULL AND outcome_status='PENDING' AND target_ts<?",(expired,))
+            pending=[dict(r) for r in c.execute("SELECT id,symbol,target_ts,spot,recorded_at FROM desk_observations WHERE label IS NULL AND outcome_status='PENDING' AND target_ts<=? AND (next_check IS NULL OR next_check<=?) ORDER BY target_ts LIMIT 750",(due,now.isoformat()))]
+        groups={}
+        for r in pending:groups.setdefault(r['symbol'],[]).append(r)
+        updates=[];deferred=[]
+        for symbol,items in groups.items():
+            # Local archive only; never initiate broker history requests from learning.
+            lookup={_ai_ts_naive(r['ts']):float(r['close']) for r in self.a.bars(symbol,750)}
+            for r in items:
+                target=_ai_ts_naive(r['target_ts']);recorded=_ai_ts_naive(r.get('recorded_at'))
+                if target is None or recorded and recorded>=target+timedelta(minutes=5):
+                    updates.append((None,'EXCLUDED',now.isoformat(),r['id']));continue
+                if target in lookup and target+timedelta(minutes=5)<=now:
+                    price=lookup[target]
+                    if math.isfinite(price) and price>0 and math.isfinite(r['spot']) and r['spot']>0:
+                        updates.append((int(price>r['spot']),'SETTLED',now.isoformat(),r['id']))
+                elif target<now-timedelta(days=2):updates.append((None,'MISSING',now.isoformat(),r['id']))
+                else:deferred.append(((now+timedelta(minutes=10)).isoformat(),r['id']))
+        if deferred:
+            with self.db() as c:c.executemany('UPDATE desk_observations SET next_check=? WHERE id=?',deferred)
+        if updates:
+            with self.db() as c:c.executemany('UPDATE desk_observations SET label=?,outcome_status=?,settled_ts=? WHERE id=? AND label IS NULL',updates)
+        return len(updates)
+    @staticmethod
+    def outcome_report(rows):
+        # Only genuinely recorded probabilities, not scores recomputed after the fact.
+        data=[r for r in rows if r.get('recorded_at') and r.get('label') in (0,1) and r.get('prob') is not None]
+        def metrics(items,key='prob'):
+            items=[r for r in items if r.get(key) is not None and math.isfinite(float(r[key])) and 0<=float(r[key])<=1]
+            if not items:return dict(samples=0)
+            y=np.array([r['label'] for r in items]);p=np.array([float(r[key]) for r in items])
+            return dict(samples=len(items),brier=round(float(np.mean((p-y)**2)),6),accuracy=round(float(np.mean((p>=.5)==y)*100),3),auc=_stock_success_auc(y,p))
+        recent=data[-300:];prior=data[-600:-300];current=metrics(recent);previous=metrics(prior)
+        drift=bool(current['samples']>=150 and previous['samples']>=150 and current['brier']>previous['brier']+.03)
+        paired=[r for r in data[-600:] if all(isinstance(r.get(k),(int,float)) and math.isfinite(r[k]) and 0<=r[k]<=1 for k in ('historical_prob','forward_prob'))]
+        hp=metrics(paired,'historical_prob');fp=metrics(paired,'forward_prob')
+        return dict(recent=current,previous=previous,drift=drift,
+            paired=dict(samples=min(hp['samples'],fp['samples']),historical_brier=hp.get('brier'),forward_brier=fp.get('brier')),
+            regimes={name:metrics([r for r in data[-600:] if r.get('regime')==name]) for name in sorted({str(r.get('regime')) for r in data[-600:] if r.get('regime')})},
+            note='Forward-only diagnostics. Correlated observations are not independent trades; drift is a review/retraining signal, not proof of profitability.')
+    def _learn_once(self):
+        self.learning_status=dict(status='SETTLING',updated=now_ist().isoformat())
+        settled=self._settle_batch()
+        rows=self.rows("SELECT * FROM desk_observations WHERE label IS NOT NULL ORDER BY ts DESC LIMIT 6000");rows.reverse()
+        report=self.outcome_report(rows);report.update(updated=now_ist().isoformat(),settled_in_batch=settled)
+        with self.db() as c:
+            counts=c.execute("SELECT COUNT(*) total,SUM(label IS NOT NULL) settled,SUM(label IS NULL AND outcome_status='PENDING') pending,SUM(outcome_status IN ('EXPIRED','MISSING','EXCLUDED')) excluded FROM desk_observations").fetchone()
+            report['observations']=dict(counts)
+        self.learning_cache=report;self.put('stock_learning_report',report)
+        last=rows[-1]['id'] if rows else None
+        if len(rows)>=300 and last!=self.get('stock_online_last') and time.monotonic()>=getattr(self,'_online_retry_at',0.):
+            self._online_retry_at=time.monotonic()+300
+            self._fit_forward(rows)
+            self.put('stock_online_last',last)
+        self.learning_status=dict(status='WATCHING',updated=now_ist().isoformat(),drift=report['drift'])
+        if report['drift'] and time.monotonic()>=getattr(self,'_drift_retry_at',0.):
+            self._drift_retry_at=time.monotonic()+21600;self.put('stock_retrain_requested',True)
+        self.maybe_train()
+    @staticmethod
+    def predict_batch(model,X):
+        z=np.clip((np.asarray(X,float)-np.asarray(model['mu']))/np.asarray(model['sd']),-6,6)
+        logits=z@np.asarray(model['w'])+float(model['bias']);calibration=model.get('calibration') or {}
+        if calibration.get('enabled'):logits=np.clip(logits,-13.81551,13.81551)*float(calibration['scale'])+float(calibration['offset'])
+        return _stock_success_sigmoid(logits)
+    def _fit_forward(self,rows):
+        # Disjoint chronological fit/calibration/validation, purged at each boundary.
+        cut1=rows[int(len(rows)*.7)]['ts'];cut2=rows[int(len(rows)*.8)]['ts']
+        train=[r for r in rows if r['target_ts']<cut1]
+        calibration=[r for r in rows if r['ts']>=cut1 and r['target_ts']<cut2]
+        val=[r for r in rows if r['ts']>=cut2]
+        if len(train)<100 or len(val)<60 or len({r['label'] for r in train})<2:return
+        self.learning_status=dict(status='FITTING FORWARD',updated=now_ist().isoformat())
+        X=[json.loads(r['features']) for r in train];Y=[r['label'] for r in train]
+        with _AI_TRAINING_SLOT:
+            m=_stock_success_fit(X,Y)
+            if calibration:m['calibration']=desk_fit_calibration(_stock_success_predict(m,[json.loads(r['features']) for r in calibration]),[r['label'] for r in calibration])
+            p=self.predict_batch(m,[json.loads(r['features']) for r in val]);y=np.array([r['label'] for r in val])
+        m.update(id=secrets.token_hex(6),samples=len(rows),validation_samples=len(val),train_samples=len(train),calibration_samples=len(calibration),
+            accuracy=float(np.mean((p>=.5)==y)*100),auc=_stock_success_auc(y,p),brier=float(np.mean((p-y)**2)),baseline=float(max(y.mean(),1-y.mean())*100),
+            validation_prior=float(y.mean()),ts=now_ist().isoformat(),train_end=max(r['target_ts'] for r in train),validation_start=cut2,
+            features=STOCK_DIRECTION_FEATURES,validation_report=desk_validation_report(p,y),schema=4)
+        with self.db() as c:
+            for key,value in [('online_model',m),('online_trained_count',len(rows)),('online_last_sample',rows[-1]['ts']),('online_trained_at',m['ts'])]:
+                c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',(key,json.dumps(value)))
+    def train(self):
+        # Heavy archive fitting runs outside market hours once a champion exists.
+        if self.a.market_open() and self.model():
+            self.put('stock_retrain_requested',True)
+            self.training=dict(status='SCHEDULED AFTER CLOSE',progress=0);return True
+        if not self.challenger_lock.acquire(False):return False
+        try:
+            started=super().train()
+            if not started:self.challenger_lock.release()
+            return started
+        except Exception:self.challenger_lock.release();raise
+    def _train(self):
+        self._base_train_entered=False
+        try:return self._train_challenger()
+        except Exception as exc:
+            self.training=dict(status='ERROR',progress=0,error='Challenger review: '+str(exc))
+            self.event('ERROR',self.training['error'])
+        finally:
+            if not self._base_train_entered and self.train_lock.locked():self.train_lock.release()
+            self.challenger_lock.release()
+    def _train_challenger(self):
+        incumbent=self.model()
+        if incumbent and not self.get('stock_champion_id'):self.put('stock_champion_id',incumbent['id'])
+        # Base fitter stores a challenger, but model() continues serving the champion.
+        self._base_train_entered=True
+        super()._train()
+        if self.training.get('status')!='COMPLETE':return
+        candidate=StockDeskEngine.model(self)
+        if not candidate:return
+        decision=self._promote_challenger(incumbent,candidate)
+        self.put('stock_model_promotion',decision);self.put('stock_retrain_requested',False)
+        self.training={**self.training,'promotion':decision,'status':'COMPLETE' if decision['promoted'] else 'CHAMPION RETAINED'}
+    def _promote_challenger(self,incumbent,candidate):
+        decision=dict(champion=(incumbent or {}).get('id'),challenger=candidate['id'],promoted=False,updated=now_ist().isoformat())
+        if not incumbent:
+            decision.update(promoted=True,reason='First chronologically validated model')
+        else:
+            cut=_ai_ts_naive(candidate.get('validation_start'));old_end=max(filter(None,[_ai_ts_naive(incumbent.get('train_end')),_ai_ts_naive(incumbent.get('calibration_end'))]),default=None)
+            if not cut or not old_end or old_end>=cut:
+                decision['reason']='No shared unseen holdout; champion retained';return decision
+            X=[];Y=[];days=set()
+            for symbol in tuple(self.a.symbols):
+                bars=self.a.bars(symbol,6000)
+                arr={k:np.array([float(r[k] or 0) for r in bars]) for k in ('close','high','low','volume')};arr['ts']=[str(r['ts']) for r in bars]
+                eligible=[i for i in range(200,len(bars)-3,3) if _ai_ts_naive(bars[i]['ts'])>=cut and _ai_ts_naive(bars[i+3]['ts'])-_ai_ts_naive(bars[i]['ts'])==timedelta(minutes=15) and _ai_ts_naive(bars[i+3]['ts'])+timedelta(minutes=5)<=now_ist()]
+                for j in np.linspace(0,len(eligible)-1,min(40,len(eligible)),dtype=int):
+                    i=eligible[j]
+                    f=self.a.features(bars,i,arr);x=[f[k] for k in STOCK_DIRECTION_FEATURES]
+                    if all(math.isfinite(v) for v in x):X.append(x);Y.append(int(bars[i+3]['close']>bars[i]['close']));days.add(str(bars[i]['ts'])[:10])
+                time.sleep(.002)
+            if len(Y)<200 or len(days)<3 or len(set(Y))<2:
+                decision.update(reason='Need 200 shared holdout observations across 3 sessions and both outcomes',samples=len(Y),sessions=len(days));return decision
+            y=np.asarray(Y);old=self.predict_batch(incumbent,X);new=self.predict_batch(candidate,X)
+            old_b=float(np.mean((old-y)**2));new_b=float(np.mean((new-y)**2))
+            old_a=_stock_success_auc(y,old);new_a=_stock_success_auc(y,new)
+            decision.update(samples=len(y),sessions=len(days),champion_brier=old_b,challenger_brier=new_b,champion_auc=old_a,challenger_auc=new_a,
+                promoted=bool(new_b<=old_b-.0005 and new_a>=old_a-.01),reason='Shared chronological holdout comparison; Brier improvement and AUC non-inferiority required for model replacement only')
+        if decision['promoted']:
+            self.put('stock_champion_id',candidate['id']);self.runtime_cache.pop('model',None)
+        return decision
+    def maybe_train(self):
+        if not self.a.market_open() and self.get('stock_retrain_requested') and not self.train_lock.locked() and time.monotonic()>=getattr(self,'_requested_retry_at',0.):
+            self._requested_retry_at=time.monotonic()+900;self.train();return
+        return super().maybe_train()
+    def start(self):
+        if self.started:return
+        super().start()
+        def learner():
+            while not self.stop_event.is_set():
+                self.learning_event.wait(30);self.learning_event.clear()
+                if self.stop_event.is_set():break
+                if self.a.connected():self._worker_tick('learning',self._learn_once)
+                self.stop_event.wait(15)
+        threading.Thread(target=learner,daemon=True,name='stock-learning').start()
+    def model_quality(self):
+        result=super().model_quality()
+        review=self.get('stock_model_promotion') or {};reviewed=_ai_ts_naive(review.get('updated'))
+        model=self.model() or {}
+        # A retained champion can be freshly revalidated without claiming it was
+        # retrained today. All structural/data validation checks still apply.
+        if review.get('champion')==model.get('id') and reviewed and 0<=(now_ist()-reviewed).total_seconds()<=2*86400 and review.get('samples',0)>=200 and review.get('sessions',0)>=3 and review.get('champion_brier') is not None:
+            result['issues']=[x for x in result['issues'] if not x.startswith('model trained ')]
+            result['live_ok']=not result['issues'];result['revalidated_at']=review['updated']
+            if result['live_ok']:
+                result['risk_weight']=min(1.,max(.25,(float(review.get('champion_auc') or .5)-.5)/.15))*min(1.,float(review['samples'])/300.)
+        return result
+    def _risk_tick(self):
+        # Yesterday's manual pause must not silently prevent the already-authorized
+        # next-day schedule. Today's pause always remains authoritative.
+        if self.operator_pause.is_set() and self.get('auto_start_paused_day')!=now_ist().date().isoformat():self.operator_pause.clear()
+        return super()._risk_tick()
+    def reversal_exit_ready(self,p,signal,setup,cfg):
+        ts=_ai_ts_naive(signal.get('bar_ts'));direction=signal.get('direction')
+        fresh=bool(ts and 0<=(now_ist()-ts).total_seconds()<=900)
+        opposite=fresh and direction in ('UP','DOWN') and direction!=setup.get('direction') and signal.get('confidence',0)>=cfg['confidence']
+        key='stock_reversal:'+p['id'];previous=self.get(key,{})
+        if not opposite:
+            if previous:self.put(key,{})
+            return False
+        bar=ts.isoformat()
+        if previous.get('bar')!=bar:
+            previous_ts=_ai_ts_naive(previous.get('bar'))
+            consecutive=bool(previous_ts and timedelta(0)<ts-previous_ts<=timedelta(minutes=5) and previous.get('direction')==direction)
+            previous=dict(bar=bar,direction=direction,count=min(2,int(previous.get('count',0))+1) if consecutive else 1)
+            self.put(key,previous)
+        return previous.get('count',0)>=2
+    def state(self):
+        # Single bounded, read-only SQLite snapshot. No risk mutation, broker calls,
+        # scan locks, training locks or per-trade queries are permitted on this path.
+        import copy
+        with self.a.dashboard_db() as c:
+            keys=['config','halt','close_requested','stock_champion_id','stock_universe_info','online_model',
+                'stock_learning_report','trade_success_model','historical_setup_success_model','stock_model_promotion']
+            meta={r['key']:json.loads(r['value']) for r in c.execute('SELECT key,value FROM desk_meta WHERE key IN ('+','.join('?' for _ in keys)+')',keys)}
+            cfg={**self.config_defaults,**meta.get('config',{})}
+            model_row=c.execute('SELECT payload FROM desk_models WHERE id=?',(meta.get('stock_champion_id'),)).fetchone()
+            if not model_row:model_row=c.execute('SELECT payload FROM desk_models ORDER BY ts DESC,rowid DESC LIMIT 1').fetchone()
+            model=json.loads(model_row[0]) if model_row else None
+            active=[dict(r) for r in c.execute("SELECT * FROM desk_positions WHERE status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING') ORDER BY ts")]
+            trades=[dict(r) for r in c.execute('SELECT id,ts,symbol,mode,contract,qty,entry,status,exit_ts,pnl,fees,risk,exit_reason FROM desk_positions ORDER BY ts DESC LIMIT 100')]
+            orders=[dict(r) for r in c.execute('SELECT * FROM desk_orders ORDER BY ts DESC LIMIT 60')]
+            pending=[dict(r) for r in c.execute("SELECT o.*,p.contract,p.symbol,p.exchange FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.mode='live' AND o.status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') ORDER BY o.ts")]
+            archived=[dict(r) for r in c.execute("SELECT o.*,p.contract,p.symbol FROM desk_orders o JOIN desk_positions p ON p.id=o.position_id WHERE o.status='HISTORICAL_UNKNOWN' ORDER BY o.ts DESC LIMIT 30")]
+            events=[dict(r) for r in c.execute('SELECT * FROM desk_events ORDER BY id DESC LIMIT 50')]
+            paper=[dict(r) for r in c.execute("SELECT ts,exit_ts,pnl,fees,risk FROM desk_positions WHERE status='CLOSED' AND mode='paper' ORDER BY exit_ts")]
+            fill_keys=['execution_fill:'+o['id'] for o in orders]
+            fills=[json.loads(r[0]) for r in c.execute('SELECT value FROM desk_meta WHERE key IN ('+','.join('?' for _ in fill_keys)+')',fill_keys)] if fill_keys else []
+        for p in active:
+            p.pop('setup',None);p.update(dict(self.health.get(p['id'],{})))
+            p['mark_age_seconds']=round(time.monotonic()-p['observed_mono'],1) if p.get('observed_mono') else None
+            p['unrealized']=(p['bid']-p['entry'])*p['qty'] if p.get('bid') is not None else None
+        values=[p['pnl']-p['fees'] for p in paper];wins=sum(max(0.,v) for v in values);losses=-sum(min(0.,v) for v in values)
+        n=len(values);span=(_ai_ts_naive(paper[-1]['exit_ts'])-_ai_ts_naive(paper[0]['ts'])).total_seconds()/86400 if paper else 0.
+        avg=sum((p['pnl']-p['fees'])/max(.01,p['risk']) for p in paper)/max(1,n);win_rate=100*sum(v>0 for v in values)/max(1,n)
+        checks=[dict(name='Closed paper trades',value=n,required=60,ok=n>=60),dict(name='Record span · days',value=round(span,1),required=10,ok=span>=10),
+            dict(name='Net win rate · %',value=round(win_rate,1),required=42,ok=win_rate>=42),dict(name='Net expectancy · R',value=round(avg,3),required=.05,ok=avg>=.05),
+            dict(name='Profit factor',value=round(wins/losses,2) if losses else None,required=1.2,ok=wins/losses>=1.2 if losses else wins>0)]
+        curve=[];total=0.
+        for p,v in zip(paper,values):total+=v;curve.append(dict(ts=p['exit_ts'],pnl=round(total,2)))
+        evidence=dict(ready=all(x['ok'] for x in checks),checks=checks,trades=n,net=round(total,2),win_rate=win_rate,equity=curve[-300:])
+        def public(m):return {k:v for k,v in (m or {}).items() if k not in ('mu','sd','w','bias','per_symbol')} or None
+        signals=[dict(v) for v in list(self.signals.values())]
+        signals.sort(key=lambda x:(x.get('decision')=='READY',float(x.get('rank_score') or 0)),reverse=True)
+        for i,row in enumerate(signals,1):row['rank']=i;row.pop('features',None)
+        risk=copy.deepcopy(self.risk_display);mode=cfg.get('mode','paper');view=(risk.get('states') or {}).get(mode,{})
+        timestamp=now_ist().isoformat();risk_ts=_ai_ts_naive(risk.get('timestamp'))
+        risk_age=(now_ist()-risk_ts).total_seconds() if risk_ts else None
+        connected=self.a.connected();market=self.a.market_open()
+        block=meta.get('halt') or ('Entries disarmed · learning continues' if not cfg.get('armed') else None) or view.get('entry_block')
+        if not connected:block='Connect Kite to receive market data'
+        elif not market:block='Market closed'
+        elif risk_age is None or risk_age>15:block=block or 'Risk supervisor status is delayed; execution performs its own checks'
+        if meta.get('close_requested'):block='Close requested · positions remain supervised'
+        learning=copy.deepcopy(self.learning_cache or meta.get('stock_learning_report') or {})
+        fills=[x for x in fills if x and x.get('mode')==mode]
+        sm=public(meta.get('trade_success_model'));hm=public(meta.get('historical_setup_success_model'));archive=self._history_archive_coverage()
+        return dict(version='stock-runtime-1',runtime_build=STOCK_RUNTIME_BUILD,build=STOCK_AI_BUILD,timestamp=timestamp,
+            connected=connected,market_open=market,config=cfg,block=block,halt=meta.get('halt'),positions=active,trades=trades,orders=orders,
+            pending_orders=pending,historical_unknown_orders=archived,events=events,legacy=[],recorder_error=self.recorder_error,
+            signals=signals,model=public(model),online=public(meta.get('online_model')),evidence=evidence,
+            observations=learning.get('observations',{}),training=dict(self.training),last_cycle=self.last_cycle,
+            universe=meta.get('stock_universe_info',{}),scan=dict(self.scan_status),watchlist=list(self.a.symbols),
+            ban_status=self.ban_error or 'Daily list checked',execution=dict(self.execution_status),
+            success_model=sm,live_success_model=sm,historical_success_model=hm,historical_archive=archive,
+            success_selector_status='HISTORICAL + OPTION' if sm and sm.get('valid') and hm and hm.get('valid') else 'DIRECTION / LEARNING',
+            history_backfill=dict(self.history_backfill_status),workers=copy.deepcopy(getattr(self,'worker_health',{})),
+            market_feed=DESK_MARKET_FEED.state(),direction_blend=desk_blend_weights(model,meta.get('online_model'),cfg.get('forward_weight_cap',.4)),
+            execution_quality=dict(samples=len(fills),recent_fills=fills[:20],mode=mode,
+                mean_confirmation_seconds=sum(x['delay_seconds'] for x in fills)/len(fills) if fills else None,
+                mean_slippage_vs_limit_bps=sum(x.get('slippage_vs_limit_bps') or 0 for x in fills)/len(fills) if fills else None),
+            pnl={m:(risk.get('states') or {}).get(m,{}).get('net') for m in ('paper','live')},risk_display=risk,risk_age_seconds=risk_age,
+            learning_runtime=dict(self.learning_status),forward_review=learning,model_promotion=meta.get('stock_model_promotion'),command=dict(self.command_status))
+    @property
+    def config_defaults(self):
+        # Base defaults are merged once outside browser I/O. No dashboard read should
+        # call config()/block(), which can acquire independent trading dependencies.
+        return dict(mode='paper',armed=False,capital=300000.,risk=1500.,daily_loss=5000.,max_positions=3,confidence=.58,
+            stop_pct=12.,reward_r=1.8,max_spread=1.,max_hold=90,square_off='15:15',lots=0,cooldown=10,
+            slippage_bps=5.,fee_per_order=25.,partial_take_r=1.,auto_start=False,**DESK_EXECUTION_DEFAULTS)
+
+    def manage(self,close_all=False):
+        # This Stock-only override is outside the base engine factory, so keep
+        # its timezone parser local rather than referring to the factory closure.
+        def dt(value):
+            parsed=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+            return parsed.replace(tzinfo=IST) if parsed.tzinfo is None else parsed.astimezone(IST)
+        cfg=self.config()
+        position_quotes={}
+        if getattr(self,'desk_name','') in ('stock','index'):
+            groups={}
+            for pos in self.active():
+                if pos['qty']>0 and pos['id'] not in self.mismatches:
+                    groups.setdefault(pos['exchange'],[]).append(pos['contract'])
+            for exchange,contracts in groups.items():
+                try:batch=self.a.quote_batch(exchange,list(dict.fromkeys(contracts)),bypass_cache=True)
+                except Exception as exc:batch={contract:(None,'Position quote refresh failed: '+str(exc)) for contract in contracts}
+                position_quotes.update({(exchange,contract):value for contract,value in batch.items()})
+            marks={}
+            for pos in self.active():
+                q,err=position_quotes.get((pos['exchange'],pos['contract']),(None,'Missing quote'))
+                if pos['qty']<=0 or err or not q:continue
+                try:
+                    age=(datetime.now(IST)-dt(q['quote_ts'])).total_seconds()
+                    bid=float(q['bid'])
+                    if not math.isfinite(bid) or bid<=0 or not 0<=age<=60:continue
+                    marks[pos['id']]=dict(bid=bid,observed_mono=time.monotonic()-age,reason='HOLD · within plan')
+                except (KeyError,TypeError,ValueError,OverflowError):continue
+            if hasattr(self,'shared_risk'):
+                with self.shared_risk.lock:
+                    self.health.update(marks)
+                    view=self.shared_risk.snapshot(cfg['mode'])
+                if view['liquidate']:
+                    # Persist a pause even when there are no positions left to iterate.
+                    cfg=self.config()
+                    if cfg['armed']:cfg['armed']=False;self.put('config',cfg)
+                    today=now_ist().date().isoformat()
+                    if self.get('auto_start_paused_day')!=today:self.put('auto_start_paused_day',today)
+        if hasattr(self,'shared_risk'):
+            for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
+                try:liquidate=self.shared_risk.snapshot('live')['liquidate']
+                except Exception:liquidate=False
+                if liquidate and o['broker_id']:
+                    try:self.a.cancel(o['broker_id'])
+                    except Exception as e:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(e)))
+        for p in self.active():
+            if p['qty']<=0:continue
+            if p['id'] in self.mismatches:
+                self.record_observation(p,error='Broker quantity mismatch; automated exit suspended');continue
+            q,err=position_quotes.get((p['exchange'],p['contract']),(None,None)) if getattr(self,'desk_name','') in ('stock','index') else self.a.quote(p['exchange'],p['contract'])
+            if q is None and not err:err='Position quote unavailable'
+            if getattr(self,'desk_name','') in ('stock','index') and not err:
+                try:
+                    age=(datetime.now(IST)-dt(q['quote_ts'])).total_seconds()
+                    if not 0<=age<=60 or not math.isfinite(float(q['bid'])) or float(q['bid'])<=0:err='Position quote stale or invalid'
+                except (KeyError,TypeError,ValueError,OverflowError):err='Position quote timestamp unavailable'
+            if err:
+                self.health[p['id']]={**(self.health.get(p['id'],{}) if getattr(self,'desk_name','') in ('stock','index') else {}),'reason':err};self.record_observation(p,error=err);continue
+            if hasattr(self,'adaptive_position_update'):
+                try:self.adaptive_position_update(p,q,cfg)
+                except Exception as e:self.record_trade(p['id'],'ADAPTIVE_STOP_ERROR',dict(error=str(e),note='Prior stop and normal exit supervision retained'))
+            bid=q['bid'];quote_age=max(0.,(datetime.now(IST)-dt(q['quote_ts'])).total_seconds()) if q.get('quote_ts') else 0.
+            if getattr(self,'desk_name','')!='stock':
+                self.health[p['id']]=dict(bid=bid,observed_mono=time.monotonic()-quote_age,reason='HOLD · within plan')
+            else:self.health.setdefault(p['id'],dict(reason='Quote timestamp unavailable'))
+            setup=json.loads(p['setup']);sig=self.signals.get(p['symbol'],{})
+            signal_ts=_ai_ts_naive(sig.get('bar_ts'));signal_fresh=bool(signal_ts and 0<=(now_ist()-signal_ts).total_seconds()<=900)
+            resume=self.get('exit_resume:'+p['id'],{}) if getattr(self,'desk_name','') in ('stock','index') else {}
+            resume=resume or {};resume_ts=_ai_ts_naive(resume.get('retry_after'))
+            resume_ready=bool(resume and resume_ts and now_ist()>=resume_ts)
+            reason=None
+            try:shared=self.shared_risk.snapshot(p['mode']) if hasattr(self,'shared_risk') else {}
+            except Exception:
+                shared={};self.record_trade(p['id'],'RISK_DATA_GAP',dict(note='Shared risk calculation unavailable; local stop/target supervision continues.'))
+            if shared.get('liquidate'):reason=shared['reason']
+            elif close_all:reason='Manual close all'
+            elif bid<=p['stop']:reason='Stop reached'
+            elif bid>=p['target']:reason='Target reached'
+            elif datetime.now(IST).strftime('%H:%M')>=cfg['square_off']:reason='Intraday square-off'
+            elif cfg.get('max_hold') is not None and (datetime.now(IST)-dt(self.get('first_fill:'+p['id']) or p['ts'])).total_seconds()>=cfg['max_hold']*60:reason='Maximum holding time'
+            elif getattr(self,'desk_name','')!='stock' and self.day_pnl(p['mode'])<=-cfg['daily_loss']:reason='Daily loss limit'
+            elif self.reversal_exit_ready(p,sig,setup,cfg):reason='Direction reversed'
+            elif resume_ready:reason=resume['reason']
+            elif not p.get('reduced') and p['qty']>=2*p['lot'] and bid>=p['entry']+max(.01,p['entry']-float((setup.get('risk_plan') or {}).get('initial_stop',p['stop'])))*float((setup.get('risk_plan') or {}).get('partial_take_r',cfg['partial_take_r'])):reason='Partial profit at planned R'
+            self.record_observation(p,q,decision=reason or 'HOLD')
+            if reason:
+                self.health[p['id']]['reason']=reason
+                if p['status']!='OPEN':
+                    pending=self.rows("SELECT * FROM desk_orders WHERE position_id=? AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')",(p['id'],))
+                    for o in pending:
+                        if o['mode']=='live' and o['side']=='BUY' and o['broker_id']:self.a.cancel(o['broker_id'])
+                    continue
+                price=bid*(1-cfg['slippage_bps']/10000);tick=setup.get('tick',.05)
+                desired=max(p['lot'],(p['qty']//p['lot']//2)*p['lot']) if reason=='Partial profit at planned R' else p['qty']
+                if resume_ready and reason==resume['reason']:desired=min(p['qty'],int(resume['qty']))
+                if resume and not resume_ready and reason==resume.get('reason'):continue
+                qty=min(desired,int(q['bid_qty']))
+                if qty<=0:continue
+                # Paper simulates only visible bid quantity. Live exits use owned quantity;
+                # exchange partial fills remain pending and are reconciled, not fabricated.
+                self.submit(p,'SELL',qty if p['mode']=='paper' else desired,max(tick,round(math.floor(price/tick)*tick,2)),reason)
+
+class StockReadSnapshot:
+    """Single display job, last good data retained with explicit age/error metadata."""
+    def __init__(self):
+        self.lock=threading.Lock();self.payload=None;self.created=0.;self.running=False
+        self.generation=0;self.valid_generation=-1;self.error=None;self.retry_at=0.
+    def invalidate(self):
+        with self.lock:self.generation+=1;self.retry_at=0.
+    def response(self,engine):
+        import copy
+        now=time.monotonic()
+        with self.lock:
+            if not self.running and now>=self.retry_at and (self.payload is None or now-self.created>3 or self.valid_generation!=self.generation):
+                self.running=True;generation=self.generation
+                def job():
+                    try:
+                        value=engine.state()
+                        # Validate JSON before publication; never poison a good snapshot with NaN.
+                        def display_value(item):
+                            if isinstance(item,dict):return {k:display_value(v) for k,v in item.items()}
+                            if isinstance(item,(list,tuple)):return [display_value(v) for v in item]
+                            if isinstance(item,(float,np.floating)) and not math.isfinite(item):return None
+                            return item
+                        frozen=json.loads(json.dumps(display_value(value),allow_nan=False))
+                        with self.lock:
+                            if generation==self.generation:
+                                self.payload=frozen;self.created=time.monotonic();self.valid_generation=generation;self.error=None
+                    except Exception:
+                        reference=secrets.token_hex(6);logger.exception('Stock display read failed; reference %s',reference)
+                        with self.lock:self.error='Display read failed · reference '+reference;self.retry_at=time.monotonic()+5
+                    finally:
+                        with self.lock:self.running=False
+                threading.Thread(target=job,daemon=True,name='stock-display').start()
+            value=copy.deepcopy(self.payload) if self.payload is not None else dict(config=engine.config_defaults,positions=[],signals=[],trades=[],orders=[],events=[],pnl={},model=None,training={},evidence={},runtime_build=STOCK_RUNTIME_BUILD)
+            age=round(max(0.,now-self.created),1) if self.payload is not None else None
+            stale=self.payload is None or age>10 or self.valid_generation!=self.generation
+            value['dashboard']=dict(status='LOADING' if self.payload is None else 'STALE' if stale else 'CURRENT',age_seconds=age,
+                refreshing=self.running,error=self.error,stale=stale)
+            return value
+
+STOCK_DESK=StockRuntimeEngine(StockRuntimeAdapter())
+_STOCK_READ_SNAPSHOT=StockReadSnapshot()
+
 
 class DashboardSnapshot:
     """One bounded background state job per desk; never queue one per browser poll."""
@@ -15034,6 +15658,7 @@ def desk_control_response(engine,action,body):
 @app.after_request
 def invalidate_dashboard_after_mutation(response):
     if request.method=='POST':
+        if request.path.startswith(('/api/stock-ai/','/api/desk-risk/stock','/api/order-recovery/stock/')):_STOCK_READ_SNAPSHOT.invalidate()
         for name in ('stock','index'):
             if request.path.startswith(('/api/'+name+'-ai/','/api/desk-risk/'+name,'/api/order-recovery/'+name+'/')):
                 _DASHBOARD_SNAPSHOTS[name].invalidate();_DASHBOARD_SNAPSHOTS[name+'-risk'].invalidate()
@@ -15043,6 +15668,9 @@ def invalidate_dashboard_after_mutation(response):
 def dashboard_system_health():
     # Website authentication still applies. No broker calls or ledger queries.
     return jsonify(ok=True,build='2026.10.12-execution-quality.11',
+        stock_runtime=dict(build=STOCK_RUNTIME_BUILD,display_running=_STOCK_READ_SNAPSHOT.running,
+            display_age_seconds=round(time.monotonic()-_STOCK_READ_SNAPSHOT.created,1) if _STOCK_READ_SNAPSHOT.payload is not None else None,
+            display_error=_STOCK_READ_SNAPSHOT.error,learning=dict(STOCK_DESK.learning_status),command=dict(STOCK_DESK.command_status)),
         kite_session_present=bool(SESSION.get('access_token')),
         snapshots={name:dict(running=slot.running,age_seconds=round(time.monotonic()-slot.created,1) if slot.payload else None,
             error=slot.error) for name,slot in _DASHBOARD_SNAPSHOTS.items()})
@@ -15050,13 +15678,15 @@ def dashboard_system_health():
 @app.route('/api/stock-ai/state')
 def stock_ai_state():
     if not require_session():return jsonify(error='Connect Kite first'),401
-    return dashboard_state_response('stock',STOCK_DESK)
+    return jsonify(_STOCK_READ_SNAPSHOT.response(STOCK_DESK))
 
 @app.route('/api/stock-ai/config',methods=['POST'])
 def stock_ai_config():
     if not require_session():return jsonify(error='Connect Kite first'),401
     try:
-        with STOCK_DESK.control_lock:return jsonify(ok=True,config=STOCK_DESK.save_config(request.get_json(silent=True) or {}))
+        if not STOCK_DESK.control_lock.acquire(timeout=.2):return jsonify(error='Settings not saved: supervision is active. Try again after it finishes.'),409
+        try:return jsonify(ok=True,config=STOCK_DESK.save_config(request.get_json(silent=True) or {}))
+        finally:STOCK_DESK.control_lock.release()
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 @app.route('/api/stock-ai/control/<action>',methods=['POST'])
@@ -15086,8 +15716,11 @@ def stock_ai_control(action):
                 finally:STOCK_DESK.train_lock.release()
             threading.Thread(target=job,daemon=True,name='stock-ai-job').start()
             return jsonify(ok=True,started=True)
-        if action=='train':return jsonify(ok=True,started=STOCK_DESK.train())
-        return desk_control_response(STOCK_DESK,action,body)
+        if action=='train':
+            started=STOCK_DESK.train()
+            return jsonify(ok=True,started=started,training=dict(STOCK_DESK.training))
+        if action in ('disarm','close'):return jsonify(ok=True,config=STOCK_DESK.control(action,body))
+        return jsonify(STOCK_DESK.queue_control(action,body)),202
     except (ValueError,TypeError) as e:return jsonify(error=str(e)),400
 
 
@@ -16838,6 +17471,12 @@ def independent_ai_risk(desk):
             if not isinstance(body,dict):raise ValueError('Settings object required')
             manager.save(body)
         if request.method=='POST':return jsonify(ok=True,config=manager.config())
+        if desk=='stock':
+            data=STOCK_DESK.risk_display
+            if not data:return jsonify(error='Risk supervisor is starting; retrying automatically',retryable=True),503
+            ts=_ai_ts_naive(data.get('timestamp'))
+            if not ts or (now_ist()-ts).total_seconds()>15:return jsonify(error='Risk supervision is delayed; displayed values are stale',retryable=True),503
+            return jsonify(data)
         def build():
             states={}
             for mode in ('paper','live'):
