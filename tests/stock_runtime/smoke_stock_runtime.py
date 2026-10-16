@@ -27,10 +27,17 @@ with tempfile.TemporaryDirectory() as path:
         assert client.get('/api/stock-ai/state').status_code==401
         with client.session_transaction() as session:
             session['website_authenticated']=True;session['website_generation']=app._site_generation()
-        assert client.get('/api/stock-ai/state').status_code==401
+        # An old authenticated cookie without CSRF heals on the status endpoint.
+        auth=client.get('/api/website-status');assert auth.status_code==200 and auth.get_json()['csrf']
+        # The saved ledger remains readable without a Kite session, with an honest
+        # disconnected flag. Website authentication is still required above.
+        assert client.get('/api/stock-ai/state').status_code==200
+        assert app._STOCK_READ_SNAPSHOT.done.wait(2)
+        assert client.get('/api/stock-ai/state').get_json()['connected'] is False
         app.SESSION['access_token']='offline-token'
+        app._STOCK_READ_SNAPSHOT.invalidate()
         start=time.monotonic();r=client.get('/api/stock-ai/state');assert r.status_code==200,r.get_json()
-        assert r.get_json()['dashboard']['status'] in ('LOADING','CURRENT')
+        assert r.get_json()['dashboard']['status'] in ('LOADING','CURRENT','STALE')  # pre-login snapshot may be retained while invalidation refreshes
         assert time.monotonic()-start<.25
         for _ in range(60):
             if not app._STOCK_READ_SNAPSHOT.running:break
@@ -66,8 +73,15 @@ with tempfile.TemporaryDirectory() as path:
         refreshed=client.get('/api/stock-ai/state').get_json()
         assert refreshed['dashboard']['stale'] or refreshed['config']['armed'] is False
         assert client.get('/api/system-health').status_code==200
+        csrf=auth.get_json()['csrf'];generation=app._site_generation()
+        lock=client.post('/website-logout',headers={'X-Website-CSRF':csrf})
+        assert lock.status_code==200 and lock.get_json()['locked']
+        assert app._site_generation()!=generation
+        assert client.get('/api/stock-ai/state').status_code==401
         assert not calls,calls
         # UI fixtures use real backend response shapes, no account data.
         Path(__file__).with_name('smoke_state.json').write_text(json.dumps(d))
         print('Auth, cold/warm/populated state, typed JSON, legacy records, independent risk, disarm, invalidation and health: PASS; external requests:',len(calls))
-    finally:os.chdir(old)
+    finally:
+        if 'app' in locals():app._STOCK_READ_SNAPSHOT.done.wait(2)
+        os.chdir(old)

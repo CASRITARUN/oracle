@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
 <style>
-html.website-connection-warning:not(.website-checking)::after { content:'Connection interrupted — displayed data may be stale'; position:fixed; bottom:12px; right:12px; z-index:10000; padding:8px 12px; background:#593c13; color:#fff2d5; border-radius:8px; font:13px system-ui; pointer-events:none; }
+html.website-connection-warning:not(.website-checking)::after { content:attr(data-website-message); position:fixed; bottom:12px; right:12px; z-index:10000; padding:8px 12px; background:#593c13; color:#fff2d5; border-radius:8px; font:13px system-ui; pointer-events:none; }
 </style>
 <script>
 const websiteFetch = window.fetch.bind(window);
 let websiteRevoked=false, websiteStatusBusy=false, websiteCsrf='', websiteLockBusy=false;
 let websiteVerified=false, websiteNextCheck=0, websiteFailures=0;
-function websiteHide(){document.documentElement.classList.add('website-connection-warning')}
+function websiteHide(message='Website access check delayed · retrying'){document.documentElement.dataset.websiteMessage=message;document.documentElement.classList.add('website-connection-warning')}
 function websiteSignOut(){
   websiteRevoked=true;websiteHide();window.location.replace('/website-login');
 }
@@ -38,7 +38,7 @@ async function websiteCheck(force=false){
     if(!websiteRevoked&&!websiteLockBusy&&!document.hidden)document.documentElement.classList.remove('website-connection-warning');
   }catch{
     websiteFailures++;websiteNextCheck=Date.now()+Math.min(30000,5000*2**Math.min(websiteFailures-1,3));
-    if(!websiteRevoked&&!websiteLockBusy)document.documentElement.classList.add('website-connection-warning');
+    if(!websiteRevoked&&!websiteLockBusy)websiteHide('Website access check delayed · retrying. Stock data status is shown in the desk.');
   }finally{clearTimeout(timer);websiteStatusBusy=false}
 }
 async function websiteLockAll(event){
@@ -61,7 +61,7 @@ async function websiteLockAll(event){
     alert('Could not confirm that all devices are locked. Check your connection and try Lock all devices again.');
   }finally{clearTimeout(timer);websiteLockBusy=false;if(!websiteRevoked){if(websiteVerified)document.documentElement.classList.remove('website-connection-warning');websiteCheck(true)}}
 }
-window.addEventListener('offline',()=>{if(websiteVerified)document.documentElement.classList.add('website-connection-warning')});
+window.addEventListener('offline',()=>{if(websiteVerified)websiteHide('Browser is offline · reconnecting when the network returns')});
 window.addEventListener('online',()=>websiteCheck(true));
 window.addEventListener('focus',()=>websiteCheck());
 window.addEventListener('pageshow',()=>websiteCheck());
@@ -2659,18 +2659,18 @@ function scheduleStockRefresh(delay=3000){
  clearTimeout(stockdeskTimer);stockdeskTimer=setTimeout(()=>{if(!document.hidden&&skEl('stockdesk')?.getClientRects().length)refreshStockTradeAI();else scheduleStockRefresh(3000)},Math.max(750,Math.min(10000,delay)));
 }
 async function refreshStockTradeAI(){
- if(stockdeskBusy)return;stockdeskBusy=true;let nextDelay=3000;
+ if(stockdeskBusy)return;stockdeskBusy=true;let nextDelay=3000,phase='request';
  try{
-  const next=await skRequest('state');stockdeskLastResponse=Date.now();
+  const next=await skRequest('state');stockdeskLastResponse=Date.now();phase='render';
   nextDelay=next.dashboard?.refresh_after_ms||(next.dashboard?.stale?1000:3000);
   if(['LOADING','ERROR'].includes(next.dashboard?.status)&&next.dashboard?.has_snapshot!==true){
    renderStockRuntime(next);skNotice(next.dashboard.error||'Reading the saved Stock ledger. Automatic refresh is active.',!!next.dashboard.error);
    ['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});return;
   }
-  stockdeskState=next;skRender(next);
+  phase='render';stockdeskState=next;skRender(next);
  }catch(e){
   nextDelay=2000;
-  skNotice(e.message+' Last received values are retained.',true);skText('skConnectionState','Connection interrupted');
+  skNotice((phase==='render'?'Stock display could not render: ':'')+e.message+' Last received values are retained.',true);skText('skConnectionState',phase==='render'?'Display rendering failed · retrying':'Stock request interrupted · retrying');
   skText('skDataAge',stockdeskLastResponse?'Last response '+Math.round((Date.now()-stockdeskLastResponse)/1000)+'s ago':'No response yet');
   skText('skPulse','STALE');['skArm','skMode','skLiveOverride'].forEach(id=>{if(skEl(id))skEl(id).disabled=true});
  }finally{stockdeskBusy=false;scheduleStockRefresh(nextDelay)}
@@ -2680,7 +2680,7 @@ function skRender(s){
   renderSharedRisk('sk');
   if(!(s.signals||[]).some(x=>x.symbol===stockdeskSymbol))stockdeskSymbol=s.signals?.[0]?.symbol||'';
   const hb=s.history_backfill||{};
-  skText('skScanStatus',`${s.universe?.mode||'Universe pending'} · monitoring ${s.watchlist?.length||0}/${s.universe?.total_fo||0} F&O stocks · ${s.scan?.status||'IDLE'} ${s.scan?.completed||0}/${s.scan?.total||0} · deep ${s.scan?.deep_completed||0}/${s.scan?.deep_total||0} · fresh ${s.scan?.fresh_universe||0} · READY ${s.scan?.ready||0} · history ${hb.status||'WAITING'} ${hb.archive_complete_symbols||0}/${hb.total||0} resolved (${hb.archive_full_year_symbols||0} full-year + ${hb.archive_max_available_symbols||0} max-available)${hb.pause_reason?' · '+hb.pause_reason:''} · execution ${s.execution?.status||'IDLE'}${s.execution?.best?' ('+s.execution.best+(s.execution.best_success_probability!=null?' · '+skNum(s.execution.best_success_probability*100,1)+'% success':'')+')':''} · ${s.scan?.phase||''} · ${s.ban_status||''}`);
+  skText('skScanStatus',`${s.universe?.mode||'Universe pending'} · monitoring ${s.watchlist?.length||0}/${s.universe?.total_fo||0} F&O stocks · ${s.scan?.status||'IDLE'} ${s.scan?.completed||0}/${s.scan?.total||0} · deep ${s.scan?.deep_completed||0}/${s.scan?.deep_total||0} · fresh ${s.scan?.fresh_universe??'—'} · READY ${(s.signals||[]).filter(x=>x.decision==='READY').length} · history ${s.history_refresh?.status||hb.status||'WAITING'}${s.history_refresh?.symbol?' '+s.history_refresh.symbol:''} · execution ${s.execution?.status||'IDLE'}${s.execution?.reason?' · '+s.execution.reason:''} · ${s.scan?.phase||''} · ${s.ban_status||''}`);
   if(skEl('skRankingDetails')?.closest('details')?.open)skHTML('skRankingDetails',skTable(['Rank','Stock','Score / 100','Stage','CE / PE','Direction conf.','Historical setup','Live option','Combined success','Option EV proxy','Spread','Entry','Stop','Target','Planned loss','Estimated costs','Contracts checked','Sizing basis','Status / reason'],(s.signals||[]).map(x=>[x.rank,x.symbol,skNum(x.rank_score,1),x.scan_stage||'—',x.option_type||'—',x.confidence==null?'—':skNum(x.confidence*100,1)+'%',x.historical_setup_probability==null?(x.historical_setup_status||'Learning'):skNum(x.historical_setup_probability*100,1)+'%',x.live_success_probability==null?'Learning':skNum(x.live_success_probability*100,1)+'%',x.success_probability==null?'Fallback':skNum(x.success_probability*100,1)+'%',x.option_expected_r==null?'Not available':skNum(x.option_expected_r,2)+'R',x.spread==null?'—':skNum(x.spread)+'%',skMoney(x.entry),skMoney(x.stop),skMoney(x.target),skMoney(x.risk_plan?.planned_loss),skMoney(x.estimated_costs),x.contracts_compared||'—',x.risk_plan?.sizing_basis==='trade-independent-v2'?'Trade-local · cash-based':skMoney(x.risk_plan?.risk_budget),x.decision+' · '+(x.reason||'')])));
   renderStockCandidates(s);
   const cfg=s.config||{},ev=s.evidence||{},model=s.model||{},obs=s.observations||{};
@@ -2699,7 +2699,7 @@ function skRender(s){
   skHTML('skModels',skKV('Historical model',sig.historical_probability==null?'—':skNum(sig.historical_probability*100,1)+'% UP')+skKV('Forward model',sig.online_probability==null?'Collecting evidence':skNum(sig.online_probability*100,1)+'% UP'));
   const factors=sig.factors||[],max=Math.max(.01,...factors.map(f=>Math.abs(f.impact)));
   skHTML('skFactors',factors.length?factors.map(f=>`<div class="sk-factor"><span>${skEsc(f.name.replace(/_/g,' '))}</span><div class="sk-factor-track"><i style="width:${Math.abs(f.impact)/max*100}%;background:${f.impact>0?'#b1ef65':'#8bb6ff'}"></i></div><b>${f.impact>0?'+':''}${skNum(f.impact)}</b></div>`).join(''):'<span class="sk-muted">Feature contributions appear with a prediction.</span>');
-  skText('skContract',sig.contract||'No qualified contract');skHTML('skPlan',skKV('Status',sig.decision||'WAIT')+skKV('Selection basis',sig.selection_basis||'Directional model / execution checks')+skKV('Historical setup',sig.historical_setup_probability==null?(sig.historical_setup_status||'Learning'):skNum(sig.historical_setup_probability*100,1)+'%')+skKV('Live option success',sig.live_success_probability==null?'Learning':skNum(sig.live_success_probability*100,1)+'%')+skKV('Combined success estimate',sig.success_probability==null?'Directional fallback':skNum(sig.success_probability*100,1)+'%')+skKV('Expected value',sig.expected_r==null?'—':skNum(sig.expected_r,2)+'R')+skKV('Lots',sig.lots??'—')+skKV('Quantity',sig.qty??'—')+skKV('Estimated entry',skMoney(sig.entry))+skKV('Stop / target',skMoney(sig.stop)+' / '+skMoney(sig.target))+skKV('Spread',sig.spread==null?'—':skNum(sig.spread)+'%'));
+  skText('skContract',sig.contract||'No qualified contract');skHTML('skPlan',skKV('Status',sig.decision||'WAIT')+skKV('Selection basis',sig.selection_basis||'Directional model / execution checks')+skKV('Historical setup',sig.historical_setup_probability==null?(sig.historical_setup_status||'Learning'):skNum(sig.historical_setup_probability*100,1)+'%')+skKV('Live option success',sig.live_success_probability==null?'Learning':skNum(sig.live_success_probability*100,1)+'%')+skKV('Combined success estimate',sig.success_probability==null?'Directional fallback':skNum(sig.success_probability*100,1)+'%')+skKV('Expected value',sig.expected_r==null?'—':skNum(sig.expected_r,2)+'R')+skKV('Lots',sig.lots??'—')+skKV('Quantity',sig.qty??'—')+skKV('Estimated entry',skPrice(sig.entry))+skKV('Stop / target',skPrice(sig.stop)+' / '+skPrice(sig.target))+skKV('Spread',sig.spread==null?'—':skNum(sig.spread)+'%'));
   skText('skLiveLock',cfg.live_override?'Manual override':ev.ready?'Eligible':'Locked');skText('skLiveOverride',cfg.live_override?'Disable manual override':'Enable manual override');skEl('skLiveOverride').disabled=false;skHTML('skGates',(ev.checks||[]).map(g=>`<div class="sk-gate ${g.ok?'pass':''}"><i>${g.ok?'✓':'○'}</i><span>${skEsc(g.name)}</span><b>${skEsc(g.value==null?(g.ok?'No losses':'—'):g.value)} / ${g.required}</b></div>`).join(''));
   skHTML('skPositions',skTable(['Stock / option','Mode','Qty','Entry','Bid','Current stop','Target','Open P&L','Status / action'],(s.positions||[]).map(p=>[p.symbol+' / '+p.contract,p.mode,p.qty,skNum(p.entry),skNum(p.bid),skNum(p.stop),skNum(p.target),skMoney(p.unrealized),p.status+' · '+(p.reason||'Reconciling')])));
   skHTML('skEvents',(s.events||[]).slice(0,8).map(e=>`<div class="sk-event"><time>${skTime(e.ts)}</time><b>${skEsc(e.kind)}</b><span>${skEsc((e.symbol?e.symbol+' · ':'')+e.detail)}</span></div>`).join('')||'<div class="sk-empty">The next scan will add its decision and reason here.</div>');
@@ -3644,10 +3644,11 @@ let deskShowAllStocks=false;
 function deskPill(label,tone='learn'){return `<span class="desk-pill ${tone}">${skEsc(label||'WAIT')}</span>`;}
 function deskConfidence(r){const v=Number(r.confidence);return r.confidence==null||!Number.isFinite(v)?'<span class="desk-confidence">—</span>':`<span class="desk-confidence">${skNum(v*100,1)}%</span><div class="desk-confidence-track"><i style="width:${Math.max(0,Math.min(100,v*100))}%"></i></div>`;}
 function deskDecision(r){const tone=r.decision==='READY'?'ready':r.decision==='WAIT'?'wait':'learn';return deskPill(r.decision||'WAIT',tone);}
+function skPrice(value){return value==null||!Number.isFinite(Number(value))?'—':'₹'+Number(value).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}
 function renderStockCandidates(s){
  const allRows=s.signals||[];const filtered=stockCandidateFilter==='ALL'?allRows:allRows.filter(r=>r.decision===stockCandidateFilter);const rows=deskShowAllStocks?filtered:filtered.slice(0,12);
- const table=rows.length?`<table class="desk-candidate-table"><thead><tr>${['#','Stock / contract','Side','Direction confidence','Trade plan','Planned loss','Spread','Status / reason'].map(x=>`<th>${skEsc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map((r,i)=>`<tr><td>${skEsc(r.rank||i+1)}</td><td><button type="button" class="desk-symbol-button" data-symbol="${skEsc(r.symbol)}">${skEsc(r.symbol)}</button><small class="desk-contract">${skEsc(r.contract||r.scan_stage||'Awaiting option check')}</small></td><td>${r.option_type?deskPill(r.option_type,r.option_type==='CE'?'ce':'pe'):'—'}</td><td>${deskConfidence(r)}</td><td class="desk-plan-cell">${skMoney(r.entry)} <small>entry</small><br><small>SL ${skMoney(r.stop)} · T ${skMoney(r.target)}</small><br><small>${skEsc(r.qty??'—')} units · ${skEsc(r.lots??'—')} lots</small></td><td>${skMoney(r.risk_plan?.planned_loss)}<small class="desk-contract">including est. costs</small></td><td>${r.spread==null?'—':skNum(r.spread,2)+'%'}</td><td class="desk-reason-cell">${deskDecision(r)}<span class="desk-reason">${skEsc(r.reason||'Awaiting checks')}</span></td></tr>`).join('')}</tbody></table>`:'<div class="sk-empty">No setups in this filter yet.</div>';
- const mobile=`<div class="desk-mobile-candidates">${rows.map((r,i)=>`<article class="desk-candidate-card"><div class="desk-card-head"><button type="button" class="desk-symbol-button" data-symbol="${skEsc(r.symbol)}">${skEsc(r.rank||i+1)} · ${skEsc(r.symbol)}</button>${deskDecision(r)}</div><span class="desk-contract">${skEsc(r.contract||'Awaiting an eligible option')}</span><div class="desk-card-plan"><div><span>Direction confidence</span><b>${r.confidence==null?'—':skNum(r.confidence*100,1)+'%'}</b></div><div><span>Side / quantity</span><b>${skEsc(r.option_type||'—')} · ${skEsc(r.qty??'—')}</b></div><div><span>Planned loss</span><b>${skMoney(r.risk_plan?.planned_loss)}</b></div><div><span>Entry</span><b>${skMoney(r.entry)}</b></div><div><span>Stop</span><b>${skMoney(r.stop)}</b></div><div><span>Target</span><b>${skMoney(r.target)}</b></div></div><span class="desk-reason">${skEsc(r.reason||'Awaiting checks')}</span></article>`).join('')}</div>`;
+ const table=rows.length?`<table class="desk-candidate-table"><thead><tr>${['#','Stock / contract','Side','Direction confidence','Trade plan','Planned loss','Spread','Status / reason'].map(x=>`<th>${skEsc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map((r,i)=>`<tr><td>${skEsc(r.rank||i+1)}</td><td><button type="button" class="desk-symbol-button" data-symbol="${skEsc(r.symbol)}">${skEsc(r.symbol)}</button><small class="desk-contract">${skEsc(r.contract||r.scan_stage||'Awaiting option check')}</small></td><td>${r.option_type?deskPill(r.option_type,r.option_type==='CE'?'ce':'pe'):'—'}</td><td>${deskConfidence(r)}</td><td class="desk-plan-cell">${skPrice(r.entry)} <small>entry</small><br><small>SL ${skPrice(r.stop)} · T ${skPrice(r.target)}</small><br><small>${skEsc(r.qty??'—')} units · ${skEsc(r.lots??'—')} lots</small></td><td>${skMoney(r.risk_plan?.planned_loss)}<small class="desk-contract">including est. costs</small></td><td>${r.spread==null?'—':skNum(r.spread,2)+'%'}</td><td class="desk-reason-cell">${deskDecision(r)}<span class="desk-reason">${skEsc(r.reason||'Awaiting checks')}</span></td></tr>`).join('')}</tbody></table>`:'<div class="sk-empty">No setups in this filter yet.</div>';
+ const mobile=`<div class="desk-mobile-candidates">${rows.map((r,i)=>`<article class="desk-candidate-card"><div class="desk-card-head"><button type="button" class="desk-symbol-button" data-symbol="${skEsc(r.symbol)}">${skEsc(r.rank||i+1)} · ${skEsc(r.symbol)}</button>${deskDecision(r)}</div><span class="desk-contract">${skEsc(r.contract||'Awaiting an eligible option')}</span><div class="desk-card-plan"><div><span>Direction confidence</span><b>${r.confidence==null?'—':skNum(r.confidence*100,1)+'%'}</b></div><div><span>Side / quantity</span><b>${skEsc(r.option_type||'—')} · ${skEsc(r.qty??'—')}</b></div><div><span>Planned loss</span><b>${skMoney(r.risk_plan?.planned_loss)}</b></div><div><span>Entry</span><b>${skPrice(r.entry)}</b></div><div><span>Stop</span><b>${skPrice(r.stop)}</b></div><div><span>Target</span><b>${skPrice(r.target)}</b></div></div><span class="desk-reason">${skEsc(r.reason||'Awaiting checks')}</span></article>`).join('')}</div>`;
  skHTML('skRanking',table+mobile);
  const count=allRows.filter(r=>r.decision==='READY').length;
  skText('skReadyCount',String(count));skText('skReadyNote',`${allRows.length} stocks in current results`);
@@ -3709,10 +3710,10 @@ function renderStockRuntime(s){
  const warningBox=skEl('skDisplayWarnings');if(warningBox){warningBox.hidden=!warnings.length;warningBox.textContent=warnings.length?'Some statistics are unavailable: '+warnings.slice(0,3).join(' '):'';}
  const command=s.command||{};
  skText('skOperationalTitle',readError?'Retrying the dashboard read':loading?'Opening your Stock desk':s.halt?'Protection needs attention':s.connected===false?'Kite sign-in required':!s.market_open?'Ready for the next session':cfg.armed?'Watching for the next setup':'Learning with entries paused');
- skText('skOperationalDetail',command.status==='QUEUED'?`${command.action} is queued. Disarm cancels a queued arm request.`:s.execution?.reason||s.block||'Qualified setups receive final price, funds and portfolio checks before submission.');
- skHTML('skWorkerCards',[['scan','Scanner'],['risk','Protection'],['learning','Learning']].map(([key,label])=>{
+ skText('skOperationalDetail',!cfg.armed&&cfg.mode==='paper'?'Paper entries are paused. Select Arm entries to start simulated trades; no broker orders are sent.':command.status==='QUEUED'?`${command.action} is queued. Disarm cancels a queued arm request.`:s.execution?.reason||s.block||'Qualified setups receive final price, funds and portfolio checks before submission.');
+ skHTML('skWorkerCards',[['scan','Scanner'],['risk','Protection'],['execution','Entries']].map(([key,label])=>{
   const w=workers[key]||{},seconds=w.updated?Math.max(0,(Date.now()-new Date(w.updated).getTime())/1000):null;
-  const detail=key==='scan'?s.scan?.phase:key==='learning'?s.learning_runtime?.status:null;
+  const detail=key==='scan'?s.scan?.phase:key==='execution'?s.execution?.reason:null;
   return `<article><span>${label}</span><strong>${skEsc(w.status==='ERROR'?'Retrying / inspect':w.status||'Starting')}</strong><small>${skEsc(detail|| (seconds==null?'Awaiting heartbeat':`${Math.round(seconds)}s since update`))}</small></article>`;
  }).join(''));
  const riskStale=riskAge==null||riskAge>15;skEl('skDayPeak')?.closest('.sr-risk-strip')?.classList.toggle('sr-risk-stale',riskStale);
