@@ -57,6 +57,12 @@ response.command={action:'arm',status:'FAILED',message:'Daily loss limit reached
 check('failed command is explicit',()=>assert.match(window.document.getElementById('skNotice').textContent,/Daily loss limit/));
 response.forward_review={drift:true,recent:{samples:300,brier:.3,auc:.48},observations:{excluded:17}};await window.eval('refreshStockTradeAI()');
 check('forward drift and excluded outcomes are visible',()=>{assert.match(window.document.getElementById('skLearningReview').textContent,/drift detected/);assert.match(window.document.getElementById('skLearningReview').textContent,/17/)});
+response.forward_review.trade_review={updated:new Date().toISOString(),window:'Latest 500 closed positions',modes:{paper:{trades:2,net:180,average_net:90,cost_turned_losses:0,excluded:0,groups:[{dimension:'exit',label:'Target reached',trades:2,net:180,fees:20}]},live:{trades:1,net:-50,average_net:-50,cost_turned_losses:1,excluded:1,groups:[]}}};
+await window.eval('refreshStockTradeAI()');
+check('paper outcome breakdown includes costs and sample count',()=>{const t=window.document.getElementById('skTradeOutcomes').textContent;assert.match(t,/Paper trade outcomes/);assert.match(t,/Target reached/);assert.match(t,/180/)});
+response.config.mode='live';await window.eval('refreshStockTradeAI()');
+check('live outcome panel never mixes paper results',()=>{const t=window.document.getElementById('skTradeOutcomes').textContent;assert.match(t,/Live trade outcomes/);assert.match(t,/50/);assert.doesNotMatch(t,/180/);assert.match(t,/1 incomplete records excluded/)});
+response.config.mode='paper';await window.eval('refreshStockTradeAI()');
 window.eval("window.__savedStockRender=renderStockCandidates;renderStockCandidates=()=>{throw Error('Test render error')}");
 await window.eval('refreshStockTradeAI()');
 check('rendering exceptions are not mislabelled as network disconnects',()=>{assert.match(window.document.getElementById('skConnectionState').textContent,/Display rendering failed/);assert.match(window.document.getElementById('skNotice').textContent,/Test render error/)});
