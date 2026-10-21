@@ -14992,7 +14992,7 @@ class StockDeskEngine(DeskEngine):
             return cfg
 
 # Stock-only runtime. Index keeps the existing StockDeskEngine base unchanged.
-STOCK_RUNTIME_BUILD='2026.10.20-stock-logic.4'
+STOCK_RUNTIME_BUILD='2026.10.21-stock-evidence.5'
 
 class StockRuntimeAdapter(StockDeskAdapter):
     @contextmanager
@@ -15024,7 +15024,10 @@ class StockRuntimeAdapter(StockDeskAdapter):
 
 class StockRuntimeEngine(StockDeskEngine):
     """Stock-only display/learning isolation with recorded, prospective evidence."""
+    OPTION_POLICY_FEATURES=STOCK_SUCCESS_FEATURES+['holding_minutes','minutes_to_square_off']
     def __init__(self,adapter):
+        self.evidence_lock=threading.RLock();self.entry_traces={};self.trace_positions={};self.trace_context={}
+        self.trace_dirty=set();self.trade_marks={};self.mark_dirty=set();self.evidence_status={};self._trace_mode=None
         self.operator_pause=threading.Event();self.operator_lock=threading.RLock();self.command_lock=threading.Lock();self.command_epoch=0
         self.command_status={};self.learning_event=threading.Event();self.learning_status={'status':'STARTING'};self.challenger_lock=threading.Lock()
         self.learning_cache={};self.risk_display={};self.runtime_cache_lock=threading.Lock();self.runtime_cache={}
@@ -15044,10 +15047,196 @@ class StockRuntimeEngine(StockDeskEngine):
                 CREATE INDEX IF NOT EXISTS stock_paper_closed_time ON desk_positions(exit_ts) WHERE status='CLOSED' AND mode='paper';
                 CREATE INDEX IF NOT EXISTS stock_order_position ON desk_orders(position_id,ts DESC);
                 CREATE INDEX IF NOT EXISTS stock_order_time ON desk_orders(ts DESC);
-                CREATE INDEX IF NOT EXISTS stock_model_time ON desk_models(ts DESC);''')
+                CREATE INDEX IF NOT EXISTS stock_model_time ON desk_models(ts DESC);
+                CREATE TABLE IF NOT EXISTS stock_execution_trace(id TEXT PRIMARY KEY,mode TEXT,symbol TEXT,position_id TEXT,updated TEXT,payload TEXT);
+                CREATE INDEX IF NOT EXISTS stock_trace_time ON stock_execution_trace(updated DESC);
+                CREATE INDEX IF NOT EXISTS stock_trace_position ON stock_execution_trace(position_id);
+                CREATE TABLE IF NOT EXISTS stock_trade_metrics(position_id TEXT PRIMARY KEY,updated TEXT,payload TEXT);
+                CREATE TABLE IF NOT EXISTS stock_option_versions(id TEXT PRIMARY KEY,mode TEXT,created TEXT,payload TEXT);
+                CREATE INDEX IF NOT EXISTS stock_option_version_time ON stock_option_versions(mode,created DESC);''')
+            for row in c.execute('SELECT payload FROM stock_execution_trace ORDER BY updated DESC LIMIT 100'):
+                try:
+                    trace=json.loads(row[0])
+                    if not isinstance(trace,dict) or not isinstance(trace.get('id'),str) or trace.get('mode') not in ('paper','live') or not isinstance(trace.get('updated'),str) or not isinstance(trace.get('events'),list):continue
+                    self.entry_traces[trace['id']]=trace
+                    if trace.get('position_id'):self.trace_positions[trace['position_id']]=trace['id']
+                except (ValueError,TypeError,KeyError,AttributeError):pass
+            for row in c.execute("SELECT m.position_id,m.payload,p.setup FROM stock_trade_metrics m JOIN desk_positions p ON p.id=m.position_id WHERE p.status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING')"):
+                try:
+                    mark=json.loads(row['payload'])
+                    if not isinstance(mark,dict) or mark.get('position_id')!=row['position_id'] or not isinstance(mark.get('updated'),str):continue
+                    mark['restart_gap']=True;self.trade_marks[row['position_id']]=mark;self.mark_dirty.add(row['position_id'])
+                    self.trace_context[row['position_id']]=json.loads(row['setup'])
+                except (ValueError,TypeError):pass
+            for row in c.execute("SELECT id,mode,setup FROM desk_positions WHERE status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING')"):
+                try:
+                    context=json.loads(row['setup']);context['execution_mode']=row['mode']
+                    context['execution_trace_id']=context.get('execution_trace_id') or self.trace_positions.get(row['id'])
+                    self.trace_context[row['id']]=context
+                except (ValueError,TypeError):pass
         incumbent=super().model()
         if incumbent and not self.get('stock_champion_id'):self.put('stock_champion_id',incumbent['id'])
         self.learning_cache=self.get('stock_learning_report',{})
+    def _entry_trace(self,s,stage,reason='',pid=None,details=None):
+        # Observation only. Never acquire broker/trading locks or write the DB here.
+        try:
+            import uuid
+            mode=s.get('execution_mode') or self._trace_mode
+            if mode not in ('paper','live'):return None
+            identity=s.get('execution_trace_id') or uuid.uuid5(uuid.NAMESPACE_URL,json.dumps(
+                [mode,s.get('symbol'),s.get('contract'),s.get('bar_ts'),s.get('model_id'),s.get('direction')])).hex
+            now=now_ist().isoformat()
+            with self.evidence_lock:
+                trace=self.entry_traces.get(identity)
+                if trace is None:
+                    if len(self.entry_traces)>=256:
+                        oldest=min(self.entry_traces,key=lambda k:self.entry_traces[k]['updated'])
+                        if oldest in self.trace_dirty:self.evidence_status['dropped_traces']=self.evidence_status.get('dropped_traces',0)+1
+                        removed=self.entry_traces.pop(oldest);self.trace_dirty.discard(oldest)
+                        if removed.get('position_id'):self.trace_positions.pop(removed['position_id'],None)
+                    trace=dict(id=identity,mode=mode,symbol=s.get('symbol'),contract=s.get('contract'),qualified_at=now,updated=now,events=[],attempts=0)
+                    self.entry_traces[identity]=trace
+                if pid:trace['position_id']=pid;self.trace_positions[pid]=identity
+                if stage=='QUALIFIED' and trace['events']:return identity
+                if trace.get('stage')==stage and trace.get('reason')==reason and not details:return identity
+                if stage=='CHECKING':trace['attempts']+=1
+                trace.update(stage=stage,reason=str(reason)[:400],updated=now)
+                for event_stage,key in [('CHECKING','first_check_at'),('SUBMITTING','submitted_at'),('ACKNOWLEDGED','acknowledged_at'),('PARTIAL_FILL','first_fill_at'),('FILLED','first_fill_at')]:
+                    if stage==event_stage:trace.setdefault(key,now)
+                trace['events']=(trace['events']+[dict(ts=now,stage=stage,reason=str(reason)[:400],details=details or {})])[-40:]
+                self.trace_dirty.add(identity)
+            return identity
+        except Exception:
+            self.evidence_status['error']='Execution diagnostics incomplete; trading ledger remains authoritative'
+            return s.get('execution_trace_id')
+    def _publish_execution_candidates(self,ranked):
+        mode=self.config()['mode'];self._trace_mode=mode;prepared=[]
+        for source in ranked:
+            s=dict(source)
+            if s.get('decision')=='READY':
+                s['execution_mode']=mode;s['execution_trace_id']=self._entry_trace(s,'QUALIFIED','Setup qualified; awaiting final checks')
+            prepared.append(s)
+        return super()._publish_execution_candidates(prepared)
+    def record_trade(self,pid,kind,payload):
+        if not hasattr(self,'evidence_lock'):return super().record_trade(pid,kind,payload)
+        payload=dict(payload)
+        recorded=False
+        try:
+            if kind=='ENTRY_PLAN':
+                if not payload.get('execution_trace_id'):payload['execution_trace_id']=self._entry_trace(payload,'CHECKING','Fresh qualifying setup',pid)
+                self.trace_context[pid]=dict(payload)
+            context=self.trace_context.get(pid,{})
+            if kind=='ENTRY_CHECKS_PASSED':
+                context={**context,**payload};self.trace_context[pid]=context
+            if kind=='ORDER_INTENT':
+                self.trace_context[pid]={**context,'intent_at':now_ist().isoformat(),'intent_side':payload.get('side')}
+            if kind=='FILL':
+                quote=context.get('entry_quote') or {};side=payload.get('side')
+                if side=='BUY' and context.get('intent_side')=='BUY':
+                    price=self.display_number(payload.get('incremental_fill_price'))
+                    bid=self.display_number(quote.get('bid'));ask=self.display_number(quote.get('ask'))
+                    mid=(bid+ask)/2 if bid and ask and ask>=bid else None
+                    submitted=_ai_ts_naive(context.get('intent_at'))
+                    payload['execution_measurement']=dict(arrival_quote=quote,
+                        confirmation_seconds=max(0.,(now_ist()-submitted).total_seconds()) if submitted else None,
+                        slippage_vs_ask_bps=10000*(price/ask-1) if price and ask else None,
+                        shortfall_vs_mid_bps=10000*(price/mid-1) if price and mid else None,
+                        note='Incremental fill vs final observed quote; local confirmation delay. Paper fills are simulated.')
+            result=super().record_trade(pid,kind,payload)
+            recorded=True
+            stages={'ENTRY_PLAN':'CHECKING','ENTRY_CHECKS_PASSED':'CHECKS_PASSED','ORDER_INTENT':'SUBMITTING',
+                'BROKER_ACK':'ACKNOWLEDGED','SUBMISSION_UNCERTAIN':'UNKNOWN','ENTRY_CANCELLED_BEFORE_SUBMISSION':'WAIT'}
+            stage=stages.get(kind)
+            if kind=='FILL':stage=('FILLED' if payload.get('status')=='COMPLETE' else 'PARTIAL_FILL') if payload.get('side')=='BUY' else 'EXIT_FILL'
+            elif kind=='ORDER_STATUS':stage=payload.get('status','ORDER_UPDATE')
+            if stage and context.get('execution_trace_id'):
+                self._entry_trace(context,stage,payload.get('reason') or payload.get('error') or kind,pid,
+                    {k:payload[k] for k in ('order_id','broker_id','side','qty','filled_total','fill_delta','average_price','execution_measurement') if k in payload})
+            return result
+        except Exception:
+            # Instrumentation must not turn an acknowledged order into a failure.
+            self.evidence_status['error']='Some execution measurements are unavailable'
+            return result if recorded else super().record_trade(pid,kind,payload)
+    def reprice_stock_entry(self,p):
+        started=time.monotonic();result=super().reprice_stock_entry(p)
+        if result:
+            updated,qty,price=result;setup=json.loads(updated['setup'])
+            self.record_trade(p['id'],'ENTRY_CHECKS_PASSED',dict(setup,checks_seconds=round(time.monotonic()-started,3)))
+        return result
+    def record_observation(self,p,q=None,error=None,decision=None):
+        result=super().record_observation(p,q,error,decision)
+        if not hasattr(self,'evidence_lock'):return result
+        try:
+            now=now_ist();quote_time=_ai_ts_naive((q or {}).get('quote_ts'));bid=self.display_number((q or {}).get('bid'))
+            if error or not quote_time or not bid or bid<=0 or not 0<=(now-quote_time).total_seconds()<=10:
+                with self.evidence_lock:
+                    if p['id'] in self.trade_marks:
+                        self.trade_marks[p['id']]['data_gap']=True;self.mark_dirty.add(p['id'])
+                return result
+            setup=json.loads(p.get('setup') or '{}');brokerage=float((setup.get('entry_policy') or {}).get('fee_per_order',25.))
+            reserve=self.order_charge('SELL',bid*p['qty'],brokerage=brokerage)
+            net=float(p['pnl'])-float(p['fees'])+(bid-float(p['entry']))*int(p['qty'])-reserve
+            with self.evidence_lock:
+                mark=self.trade_marks.setdefault(p['id'],dict(schema=1,position_id=p['id'],mode=p['mode'],symbol=p['symbol'],
+                    samples=0,peak_net=None,trough_net=None,max_gap_seconds=0.,horizons={},note='Sampled liquidation value after estimated exit fees; unobserved prices are unknown.'))
+                previous=_ai_ts_naive(mark.get('last_quote_ts'))
+                if previous and quote_time<=previous:return result
+                gap=(quote_time-previous).total_seconds() if previous else 0.
+                mark.update(samples=mark['samples']+1,updated=now.isoformat(),last_quote_ts=quote_time.isoformat(),last_net=round(net,2),
+                    peak_net=round(max(net,mark['peak_net']) if mark['peak_net'] is not None else net,2),
+                    trough_net=round(min(net,mark['trough_net']) if mark['trough_net'] is not None else net,2),
+                    max_gap_seconds=max(mark['max_gap_seconds'],gap))
+                if gap>30:mark['data_gap']=True
+                self.mark_dirty.add(p['id'])
+            # Read the durable first-fill timestamp, never use plan time as fill time.
+            first=_ai_ts_naive(self.get('first_fill:'+p['id']))
+            if first:
+                elapsed=(quote_time-first).total_seconds()
+                with self.evidence_lock:
+                    mark['first_fill_at']=first.isoformat()
+                    for minute in (15,30,60,90):
+                        if 0<=elapsed-minute*60<=15 and str(minute) not in mark['horizons']:
+                            mark['horizons'][str(minute)]=dict(net=round(net,2),quote_ts=quote_time.isoformat(),elapsed_seconds=elapsed)
+            if len(self.trade_marks)>512:
+                with self.evidence_lock:
+                    removable=[k for k in self.trade_marks if k not in self.mark_dirty and k!=p['id']]
+                    for key in removable[:len(self.trade_marks)-512]:self.trade_marks.pop(key,None);self.trace_context.pop(key,None)
+        except Exception:self.evidence_status['error']='Some trade-path measurements are unavailable'
+        return result
+    def _flush_evidence(self):
+        # Independent diagnostics worker; no broker calls, training or trading locks.
+        with self.evidence_lock:
+            traces={k:json.dumps(self.entry_traces[k]) for k in list(self.trace_dirty)[:128] if k in self.entry_traces}
+            marks={k:json.dumps(self.trade_marks[k]) for k in list(self.mark_dirty)[:128] if k in self.trade_marks}
+        if not traces and not marks:return
+        try:
+            with self.db() as c:
+                for key,payload in traces.items():
+                    row=json.loads(payload);c.execute('INSERT OR REPLACE INTO stock_execution_trace VALUES(?,?,?,?,?,?)',
+                        (key,row['mode'],row['symbol'],row.get('position_id'),row['updated'],payload))
+                for key,payload in marks.items():
+                    row=json.loads(payload);c.execute('INSERT OR REPLACE INTO stock_trade_metrics VALUES(?,?,?)',(key,row['updated'],payload))
+            with self.evidence_lock:
+                for key,payload in traces.items():
+                    if key in self.entry_traces and json.dumps(self.entry_traces[key])==payload:self.trace_dirty.discard(key)
+                for key,payload in marks.items():
+                    if key in self.trade_marks and json.dumps(self.trade_marks[key])==payload:self.mark_dirty.discard(key)
+                self.evidence_status.update(updated=now_ist().isoformat(),status='RECORDING',error=None,pending=len(self.trace_dirty)+len(self.mark_dirty))
+        except Exception as exc:
+            self.evidence_status.update(status='RETRY',error='Diagnostics write delayed: '+type(exc).__name__,pending=len(self.trace_dirty)+len(self.mark_dirty))
+    def trade_review(self,pid):
+        result=super().trade_review(pid)
+        saved=self.rows('SELECT payload FROM stock_trade_metrics WHERE position_id=?',(pid,))
+        traces=self.rows('SELECT payload FROM stock_execution_trace WHERE position_id=? ORDER BY updated DESC LIMIT 3',(pid,))
+        result['execution_trace']=[json.loads(r['payload']) for r in traces]
+        result['trade_metrics']=json.loads(saved[0]['payload']) if saved else None
+        if result['trade_metrics'] and result['position']['status']=='CLOSED':
+            peak=result['trade_metrics'].get('peak_net')
+            result['trade_metrics']['giveback_from_sampled_peak']=max(0.,peak-result['outcome']['net_realized']) if peak is not None else None
+        result['option_learning_note']='Stock option outcomes use frozen entry features and the recorded holding/exit policy. Paper and live training stay separate.'
+        research=self.get('stock_exit_replay:'+pid)
+        result['exit_research']=research if isinstance(research,dict) else None
+        return result
     def entry_history(self,symbol,day=None):
         # A cancelled *unsent* plan is not a trade. Preserve the audit row, while
         # still counting any order intent, fill, rejection or uncertain submission.
@@ -15137,10 +15326,12 @@ class StockRuntimeEngine(StockDeskEngine):
             self.scan_status.update(status='ERROR',error=str(exc));self.event('ERROR','Stock scan: '+str(exc))
         finally:self.lock.release()
     def enter(self,s):
-        cfg=self.config();recent=self.entry_history(s['symbol'])[:1]
+        cfg=self.config();self._trace_mode=cfg['mode'];s=dict(s,execution_mode=cfg['mode']);s['execution_trace_id']=self._entry_trace(s,'CHECKING','Refreshing price, funds and portfolio checks')
+        recent=self.entry_history(s['symbol'])[:1]
         stamp=_ai_ts_naive((recent[0].get('exit_ts') or recent[0]['ts'])) if recent else None
         if cfg['cooldown']>0 and stamp and (now_ist()-stamp).total_seconds()<cfg['cooldown']*60:
-            self.signals[s['symbol']]=dict(s,decision='WAIT',reason='Re-entry cooldown active; waiting for the configured interval');return
+            self.signals[s['symbol']]=dict(s,decision='WAIT',reason='Re-entry cooldown active; waiting for the configured interval')
+            self._entry_trace(s,'WAIT',self.signals[s['symbol']]['reason']);return
         return super().enter(s)
     def execute_candidates(self):
         if not self.entry_lock.acquire(False):return
@@ -15150,6 +15341,7 @@ class StockRuntimeEngine(StockDeskEngine):
             status=dict(generation=generation,count=len(candidates),updated=now_ist().isoformat(),mode=self.config()['mode'])
             blocker=self.block()
             if blocker or self.get('close_requested'):
+                for s in candidates[:12]:self._entry_trace(dict(s,execution_mode=status['mode']),'PAUSED',blocker or 'Close requested')
                 self.execution_status=dict(status,status='PAUSED',reason=blocker or 'Close requested');return
             if not candidates:
                 self.execution_status=dict(status,status='NO READY CANDIDATE',reason='Waiting for a fresh qualifying setup');return
@@ -15160,6 +15352,7 @@ class StockRuntimeEngine(StockDeskEngine):
                 active=self.active();cfg=self.config()
                 if any(p['symbol']==symbol for p in active):continue
                 if len(active)>=cfg['max_positions']:
+                    self._entry_trace(seed,'WAIT','Maximum active positions reached')
                     outcomes.append(dict(symbol=symbol,status='WAIT',reason='Maximum active positions reached'));break
                 blocker=self.block()
                 if blocker:
@@ -15186,6 +15379,7 @@ class StockRuntimeEngine(StockDeskEngine):
                     delay=min(10.,2.*attempts)
                     self.entry_retry[symbol]=dict(key=key,at=time.monotonic()+delay,attempts=attempts,reason=reason)
                     outcome=dict(symbol=symbol,status='WAIT',reason=reason,retry_seconds=delay)
+                    self._entry_trace(seed,'WAIT',reason)
                 outcomes.append(outcome)
             self.entry_retry={k:v for k,v in self.entry_retry.items() if k in self.a.symbols}
             last=outcomes[-1] if outcomes else dict(status='POSITION ACTIVE',reason='Candidates already have active positions')
@@ -15238,6 +15432,8 @@ class StockRuntimeEngine(StockDeskEngine):
                 self.risk_display=display  # Publish only after construction; readers see one complete object.
             finally:manager.lock.release()
     def control(self,action,body):
+        if action=='rollback-option-model':
+            with self.risk_lock:return self.rollback_option_model(self.config()['mode'])
         if action in ('disarm','close'):
             # Stop new broker BUY calls immediately. Orders already transmitted may
             # still fill and remain owned/reconciled by the supervisor.
@@ -15269,7 +15465,7 @@ class StockRuntimeEngine(StockDeskEngine):
             raise ValueError('Control superseded by disarm/close; entries remain disarmed')
         return result
     def queue_control(self,action,body):
-        if action not in ('arm','mode','live-override','clear-halt'):raise ValueError('Unknown action')
+        if action not in ('arm','mode','live-override','clear-halt','rollback-option-model'):raise ValueError('Unknown action')
         if not self.command_lock.acquire(False):raise ValueError('One control is already queued; its status is shown on the dashboard')
         epoch=self.command_epoch;identity=secrets.token_hex(6)
         self.command_status=dict(id=identity,action=action,status='QUEUED',updated=now_ist().isoformat())
@@ -15349,7 +15545,7 @@ class StockRuntimeEngine(StockDeskEngine):
             if s.get('historical_success_model_valid') and hp is not None:rank+=4*(float(hp)-.5)
             ev=s.get('option_expected_r')
             if s.get('live_success_model_valid') and ev is not None and math.isfinite(float(ev)):
-                rank+=5*math.tanh(float(ev))
+                rank+=min(10.,max(0.,float(s.get("option_rank_weight",5.))))*math.tanh(float(ev))
             risk=(float(s.get('entry') or 0)-float(s.get('stop') or 0))*int(s.get('qty') or 0)
             if risk>0:rank-=min(8.,8*float(s.get('estimated_costs') or 0)/risk)
         regime=s.get('market_regime') or {};name=regime.get('name','UNKNOWN')
@@ -15357,14 +15553,112 @@ class StockRuntimeEngine(StockDeskEngine):
         penalty=3. if name=='VOLATILE' else 1.5 if name=='RANGE' else 0.
         if name.startswith('TREND_') and name!='TREND_'+s.get('direction',''):penalty=4.
         return round(max(0.,min(100.,rank-penalty)),2)
+    @staticmethod
+    def option_contract_bonus(s):
+        ev=s.get('option_expected_r')
+        if not s.get('live_success_model_valid') or ev is None or not math.isfinite(float(ev)):return 0.
+        return min(10.,max(0.,float(s.get('option_rank_weight',5.))))*math.tanh(float(ev))
+    def inspect_contracts(self,symbol):
+        s=self.direction_snapshot(symbol,refresh=True,record_observation=True,max_bar_age=11)
+        if s.get('decision')!='CANDIDATE':return s
+        cfg=self.config();typ='CE' if s['p_up']>.5 else 'PE'
+        s['model_quality']=self.model_quality()
+        if cfg['mode']=='live' and not s['model_quality']['live_ok']:
+            s.update(decision='WAIT',reason='Model quality: '+'; '.join(s['model_quality']['issues']));return s
+        data,err=self.a.chain(symbol)
+        if err:s.update(decision='WAIT',reason='Option chain: '+str(err));return s
+        candidates=[];counts=dict(side=0,delta=0,quote=0,spread=0);best_spread=None
+        for o in data.get('chain',[]):
+            if o.get('instrument_type')!=typ:continue
+            counts['side']+=1
+            try:delta=abs(float(o.get('delta')))
+            except (TypeError,ValueError):continue
+            if not math.isfinite(delta) or not .3<=delta<=.7:continue
+            counts['delta']+=1
+            ask=float(o.get('ask') or 0);bid=float(o.get('bid') or 0)
+            if not all(math.isfinite(x) for x in (ask,bid)) or not 0<bid<=ask:continue
+            counts['quote']+=1;spread=(ask-bid)/((ask+bid)/2)*100
+            best_spread=spread if best_spread is None else min(best_spread,spread)
+            if spread>cfg['max_spread']:continue
+            counts['spread']+=1;candidates.append((abs(delta-.5)+spread/10,o))
+        s.update(option_type=typ,contract_checks=counts)
+        if not candidates:
+            detail=f"best spread {best_spread:.2f}% vs limit {cfg['max_spread']:.2f}%" if best_spread is not None else 'no valid two-sided quotes in delta range 0.30–0.70'
+            s.update(decision='WAIT',reason=f"No qualifying {typ}: {detail}; {counts['side']} contracts after volume/OI filter, {counts['delta']} with valid delta")
+            return s
+        try:funds=self.available_funds()
+        except Exception as e:s.update(decision='WAIT',reason='Funds check: '+str(e));return s
+        try:remaining=self.remaining_entry_risk()
+        except Exception as e:s.update(decision='WAIT',reason='Daily risk: '+str(e));return s
+        failures=[];qualified=[];diagnostics=[]
+        # Bound quote traffic, but test several contracts instead of rejecting the stock
+        # solely because its nearest-ATM contract cannot fit one lot.
+        shortlisted=sorted(candidates,key=lambda r:r[0])[:8]
+        quotes,recheck=self.fresh_entry_quotes(symbol,[o['tradingsymbol'] for _,o in shortlisted])
+        s.update(contracts_compared=len(shortlisted),quote_recheck=recheck)
+        for _,o in shortlisted:
+            trial=dict(s,contract=o['tradingsymbol'],exchange=self.a.exchange(symbol),
+                lot=int(o.get('lot_size') or data.get('lot_size') or 0),tick=float(o.get('tick_size') or .05),
+                option_delta=float(o['delta']),option_volume=float(o.get('volume') or 0),option_oi=float(o.get('oi') or 0),
+                option_expiry=str(o.get('expiry')),dte=None)
+            try:trial['dte']=(o['expiry']-now_ist().date()).days
+            except (TypeError,KeyError):pass
+            q,why=quotes.get(trial['contract'],(None,'Missing quote'))
+            detail=dict(contract=trial['contract'],lot=trial['lot'],quote_age_seconds=self.quote_age_seconds(q),quote_recheck=recheck['note'])
+            diagnostics.append(detail)
+            if why:
+                detail['reason']=why;failures.append(trial['contract']+': '+why);continue
+            if not self.entry_quote_fresh(q):
+                detail['reason']=f"quote age {detail['quote_age_seconds']}s; require -2 to 10s; {recheck['note']}"
+                failures.append(trial['contract']+': '+detail['reason']);continue
+            trial.update(bid=q['bid'],ask=q['ask'],spread=q['spread_pct'])
+            if q['spread_pct'] is None or not 0<=q['spread_pct']<=cfg['max_spread']:
+                detail['reason']='Refreshed spread exceeds limit';failures.append(trial['contract']+': '+detail['reason']);continue
+            try:trial.update(self.adaptive_entry_plan(trial,q,trial['lot'],trial['tick'],funds,remaining))
+            except ValueError as e:
+                detail['reason']=str(e);failures.append(trial['contract']+': '+str(e));continue
+            detail.update(trial['sizing_diagnostics']);detail['reason']=trial.get('size_reason') or 'Whole-lot sizing passed'
+            if trial['qty']>0:
+                trial.update(decision='READY',reason=f"{typ} ready: {trial['lots']} lot(s); premium ₹{trial['entry']*trial['qty']:,.0f}; stop risk + fees ₹{(trial['entry']-trial['stop'])*trial['qty']+trial['estimated_costs']:,.0f}")
+                self._apply_success_intelligence(trial)
+                if self.entry_quality_gate(trial):
+                    cost_fraction=trial['estimated_costs']/max(1.,trial['entry']*trial['qty'])
+                    depth_ratio=min(3.,trial['depth_qty']/max(1,trial['qty']))
+                    trial['contract_score']=round(100-25*trial['spread']/cfg['max_spread']-100*cost_fraction+3*depth_ratio-10*abs(abs(trial['option_delta'])-.5)+self.option_contract_bonus(trial),4)
+                    qualified.append(trial)
+                else:
+                    detail['reason']=trial['reason'];failures.append(trial['contract']+': '+trial['reason'])
+                continue
+            failures.append(trial['contract']+': '+trial['size_reason'])
+        if qualified:
+            best=max(qualified,key=lambda x:(x['contract_score'],-x['spread'],x['depth_qty']))
+            best['contracts_compared']=len(shortlisted);best['qualifying_contracts']=len(qualified);best['contract_diagnostics']=diagnostics
+            return best
+        s.update(decision='WAIT',reason='; '.join(failures[:3]),contract_failures=failures,contract_diagnostics=diagnostics)
+        return s
     def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
         sized=super().adaptive_entry_plan(s,q,lot,tick,funds,remaining)
+        sized['entry_quote']={k:q.get(k) for k in ('bid','ask','bid_qty','ask_qty','spread_pct','quote_ts','exchange_ts','source')}
         factor=float((s.get('market_regime') or {}).get('size_factor',1.))
         # Never squeeze stop distance to fit a daily allocation; reduce whole lots only.
         if sized.get('qty',0)>lot and factor<1:
             sized['qty']=max(lot,int(sized['qty']/lot*factor)*lot);sized['lots']=sized['qty']//lot
             self.fit_costed_size(sized,None,sized['risk_plan']['capital_allocation'],lot)
         sized['risk_plan'].update(regime=s.get('market_regime'),regime_size_factor=factor)
+        # The model never receives more capital because its uncalibrated score is
+        # high. Only a supported confidence band can reduce a multi-lot allocation.
+        band=str(min(9,max(0,int(float(s.get('confidence') or .5)*10))))
+        report=(self.learning_cache or {}).get('sizing_review',{}).get(self.config()['mode'],{})
+        support=report.get(band,{})
+        reviewed=_ai_ts_naive(support.get('updated'));upper=self.display_number(support.get('upper_mean_session_r'))
+        evidence_factor=.75 if reviewed and 0<=(now_ist()-reviewed).total_seconds()<=2*86400 and support.get('sessions',0)>=10 and support.get('trades',0)>=40 and upper is not None and upper<0 else 1.
+        before=int(sized.get('qty') or 0)
+        if before>lot and evidence_factor<1:
+            sized['qty']=max(lot,math.ceil(before/lot*evidence_factor)*lot);sized['lots']=sized['qty']//lot
+            self.fit_costed_size(sized,None,sized['risk_plan']['capital_allocation'],lot)
+        sized['risk_plan'].update(evidence_size_factor=evidence_factor,evidence_size_band=band,
+            evidence_size_samples=support.get('trades',0),quantity_before_evidence=before,
+            quantity_after_evidence=sized.get('qty'),evidence_size_note='At most 25% whole-lot reduction for a repeatedly loss-making confidence band; never tightens the stop or raises size.')
         return sized
     def settle_observations(self):
         # Scanner only signals the independent learner; no fitting/large writes here.
@@ -15420,7 +15714,7 @@ class StockRuntimeEngine(StockDeskEngine):
             if cached and not force and time.monotonic()-cached[0]<30:m=cached[1]
             else:
                 m=self.get(key);self.runtime_cache[key]=(time.monotonic(),m)
-        if m and m.get('quality_schema')!=3:
+        if m and m.get('quality_schema') not in (3,4):
             return dict(m,valid=False,status='REBUILD REQUIRED',note='Entry-time features and purged trade validation required; no entry block while learning.')
         if m and m.get('mode')!=mode:return dict(m,valid=False,status='MODE MISMATCH')
         return m
@@ -15429,7 +15723,7 @@ class StockRuntimeEngine(StockDeskEngine):
         hm=self.historical_success_model();lm=self.success_model();archive=self._history_archive_coverage()
         ht=_ai_ts_naive((hm or {}).get('updated'));lt=_ai_ts_naive((lm or {}).get('updated'))
         hv=bool(hm and hm.get('valid') and hm.get('w') and ht and archive.get('ready'))
-        lv=bool(lm and lm.get('valid') and lm.get('quality_schema')==3 and lm.get('w') and lm.get('payoff') and lt and 0<=(now_ist()-lt).total_seconds()<=7*86400)
+        lv=bool(lm and lm.get('valid') and lm.get('quality_schema') in (3,4) and lm.get('w') and lm.get('payoff') and lt and 0<=(now_ist()-lt).total_seconds()<=7*86400)
         s.update(historical_success_model_valid=hv,historical_success_model_trained=bool(hm and hm.get('valid')),
             historical_archive_coverage=float(archive.get('ratio') or 0),historical_archive_ready=bool(archive.get('ready')),
             historical_setup_probability=None,live_success_model_valid=lv,live_success_probability=None,
@@ -15440,12 +15734,15 @@ class StockRuntimeEngine(StockDeskEngine):
             raw=float(_stock_success_predict(hm,vector));shrink=min(.75,max(0.,float(hm.get('validation_samples') or 0)/600))
             s.update(historical_setup_probability_raw=raw,historical_setup_probability=.5+(raw-.5)*shrink)
         if lv:
-            raw=float(self.predict_batch(lm,[self._success_vector(s)])[0])
+            vector=self.option_policy_vector(s) if lm.get('quality_schema')==4 else self._success_vector(s)
+            raw=float(self.predict_batch(lm,[vector])[0])
             # Shrink towards the TRAINING base rate, not an assumed 50% win rate.
             weight=min(1.,float(lm.get('validation_samples') or 0)/100.)
             p=float(lm['train_win_rate'])+weight*(raw-float(lm['train_win_rate']))
             s.update(live_success_probability_raw=raw,live_success_probability=p,success_probability=p,
                 success_blend=dict(historical_weight=0.,live_weight=1.))
+            s['option_model_id']=lm.get('id');s['option_model_schema']=lm.get('quality_schema')
+            s['option_rank_weight']=min(10.,5.+5.*min(1.,lm.get('validation_samples',0)/200)*min(1.,lm.get('validation_sessions',0)/20)) if lm.get('quality_schema')==4 and lm.get('promotion',{}).get('promoted') else 5.
         s['option_outcome_mode']=self.config()['mode']
         s['selection_basis']='Direction + liquidity + costs; historical setup is a bounded tie-breaker. '+s['option_outcome_mode'].title()+' option outcomes are a separate estimate.'
         s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
@@ -15458,11 +15755,21 @@ class StockRuntimeEngine(StockDeskEngine):
             s.update(decision='WAIT',reason='Trade target does not cover estimated costs or price plan is invalid');return False
         s['trade_economics']=dict(net_at_target=round(gain,2),loss_at_stop=round(loss,2),net_reward_r=round(gain/loss,4),
             note='Full-quantity target/stop scenarios; partial exits, slippage and gaps change actual results.')
-        s['option_learning_snapshot']=dict(schema=1,features=StockDeskEngine._success_vector(self,s),
-            planned_risk=(entry-stop)*qty,recorded_at=now_ist().isoformat())
+        cfg=self.config()
+        s['entry_policy']=dict(schema=1,exit_policy='stock-confirmed-v2',max_hold=cfg['max_hold'],square_off=cfg['square_off'],
+            fee_per_order=cfg['fee_per_order'],slippage_bps=cfg['slippage_bps'],initial_stop=stop,target=target,
+            partial_take_r=(s.get('risk_plan') or {}).get('partial_take_r',cfg['partial_take_r']))
+        s['option_learning_snapshot']=dict(schema=1,feature_schema=2,features=StockDeskEngine._success_vector(self,s),
+            policy_features=self.option_policy_vector(s),policy=dict(s['entry_policy']),
+            planned_risk=(entry-stop)*qty,estimated_costs=costs,recorded_at=now_ist().isoformat())
         s['expected_r']=s.get('option_expected_r')
         s['rank_score']=self.rank_signal(s,self.config()['max_spread'])
         return True
+    def option_policy_vector(self,s):
+        cfg=self.config();policy=s.get('entry_policy') or cfg
+        holding=float(policy['max_hold']);now=now_ist();hour,minute=map(int,str(policy['square_off']).split(':'))
+        minutes=max(0.,(now.replace(hour=hour,minute=minute,second=0,microsecond=0)-now).total_seconds()/60)
+        return self._success_vector(s)+[min(360.,holding)/360.,min(390.,minutes)/390.]
     @staticmethod
     def _split_option_samples(samples):
         samples=sorted(samples,key=lambda r:(r['start'],r['id']))
@@ -15472,49 +15779,161 @@ class StockRuntimeEngine(StockDeskEngine):
         return ([r for r in samples if r['end']+gap<cut1],
                 [r for r in samples if r['start']>=cut1 and r['end']+gap<cut2],
                 [r for r in samples if r['start']>=cut2])
+    @staticmethod
+    def option_samples(rows):
+        samples=[]
+        for row in rows:
+            try:
+                setup=json.loads(row['setup']);snap=setup.get('option_learning_snapshot') or {}
+                start=_ai_ts_naive(row['ts']);end=_ai_ts_naive(row['exit_ts']);recorded=_ai_ts_naive(snap.get('recorded_at'))
+                x=snap.get('policy_features');risk=float(snap.get('planned_risk') or 0);pnl=float(row['pnl']);fees=float(row['fees'])
+                costs=float(snap.get('estimated_costs',setup.get('estimated_costs',0)))
+                if snap.get('schema')!=1 or snap.get('feature_schema')!=2 or not x or len(x)!=len(StockRuntimeEngine.OPTION_POLICY_FEATURES):continue
+                if not all(math.isfinite(float(v)) for v in x):continue
+                if not start or not end or not recorded or not start<=recorded<end<=now_ist():continue
+                if risk<=0 or fees<0 or costs<0 or not all(math.isfinite(v) for v in (risk,pnl,fees,costs)):continue
+                if (snap.get('policy') or {}).get('exit_policy')!='stock-confirmed-v2':continue
+                samples.append(dict(id=row['id'],start=recorded,end=end,x=x,y=int(pnl-fees>0),gross_r=pnl/risk,
+                    net_r=(pnl-fees)/risk,cost_r=costs/risk,confidence=float(snap['features'][0])))
+            except (ValueError,TypeError,KeyError,IndexError):continue
+        return sorted(samples,key=lambda r:(r['start'],r['id']))
+    @staticmethod
+    def net_evidence(samples):
+        daily={};total=peak=drawdown=0.
+        # Exit order is used for realized drawdown; entry order remains the ML split.
+        for r in sorted(samples,key=lambda r:(r['end'],r['id'])):
+            value=float(r['net_r']);day=r['start'].date().isoformat();daily.setdefault(day,[]).append(value)
+            total+=value;peak=max(peak,total);drawdown=max(drawdown,peak-total)
+        means=[sum(values)/len(values) for values in daily.values()];n=len(means)
+        mean=float(np.mean(means)) if n else None
+        margin=2*float(np.std(means,ddof=1))/math.sqrt(n) if n>=2 else None
+        return dict(trades=len(samples),sessions=n,net_r=round(total,6),average_net_r=total/len(samples) if samples else None,
+            max_drawdown_r=round(drawdown,6),lower_mean_session_r=mean-margin if margin is not None else None,
+            upper_mean_session_r=mean+margin if margin is not None else None,
+            note='Realized R on recorded trades; daily-block uncertainty is approximate, not a portfolio backtest or independent-trade guarantee.')
+    @classmethod
+    def option_model_evaluation(cls,model,samples):
+        if not samples:return dict(samples=0,economics=cls.net_evidence([]),windows=[])
+        X=[r['x'][:len(model['w'])] for r in samples]
+        raw=cls.predict_batch(model,X);weight=min(1.,float(model.get('validation_samples',0))/100.)
+        p=float(model['train_win_rate'])+weight*(raw-float(model['train_win_rate']))
+        y=np.asarray([r['y'] for r in samples]);base=float(model['train_win_rate']);payoff=model['payoff']
+        ev=p*float(payoff['win_gross_r'])+(1-p)*float(payoff['loss_gross_r'])-np.array([r['cost_r'] for r in samples])
+        chosen=[r for r,v in zip(samples,ev) if v>0]
+        days=sorted({r['start'].date() for r in samples});windows=[]
+        for window_days in np.array_split(np.asarray(days,dtype=object),3):
+            subset=[r for r in chosen if r['start'].date() in set(window_days)]
+            windows.append(cls.net_evidence(subset))
+        return dict(samples=len(samples),brier=float(np.mean((p-y)**2)),baseline_brier=float(np.mean((base-y)**2)),
+            auc=_stock_success_auc(y,p),economics=cls.net_evidence(chosen),baseline_economics=cls.net_evidence(samples),windows=windows,
+            note='Positive-EV selection evaluated on trades actually taken. Missing candidate outcomes are unavailable; this is not a replay of alternative contracts or capital allocation.')
+    @classmethod
+    def option_promotion_decision(cls,candidate,incumbent,val):
+        decision=dict(promoted=False,champion=(incumbent or {}).get('id'),challenger=candidate['id'],updated=now_ist().isoformat())
+        if not val:decision['reason']='Waiting for a new unseen trade window';return decision
+        first=min(r['start'] for r in val)
+        # Prior holdout data was used to choose the champion, so it is not unseen.
+        if incumbent and incumbent.get('valid'):
+            bounds=[_ai_ts_naive(incumbent.get(k)) for k in ('train_end','calibration_end','validation_end','evaluated_through')]
+            if not incumbent.get('validation_end'):bounds.append(_ai_ts_naive(incumbent.get('updated')))
+            cutoff=max(filter(None,bounds),default=None)
+            if not cutoff or first<=cutoff:
+                decision['reason']='Champion comparison needs trades after its last validation window';return decision
+        new=cls.option_model_evaluation(candidate,val);decision['challenger_report']=new
+        e=new['economics'];windows=new['windows']
+        eligible=bool(new['samples']>=60 and e['trades']>=30 and e['sessions']>=6 and
+            new['auc'] is not None and new['auc']>=.5 and new['brier']<new['baseline_brier'] and
+            e['lower_mean_session_r'] is not None and e['lower_mean_session_r']>0 and
+            all(w['trades']>=10 and w['sessions']>=2 and w['average_net_r']>0 for w in windows))
+        if incumbent and incumbent.get('valid'):
+            old=cls.option_model_evaluation(incumbent,val);decision['champion_report']=old
+            eligible=bool(eligible and new['brier']<=old['brier']-.0005 and
+                e['average_net_r']>=float(old['economics']['average_net_r'] or 0) and
+                e['net_r']>=old['economics']['net_r'] and e['max_drawdown_r']<=old['economics']['max_drawdown_r']+.05)
+        decision.update(promoted=eligible,reason='Later trade windows support probability and net-outcome improvement' if eligible else
+            'Candidate did not demonstrate stable later-period net results and probability improvement; '+('stored model retained' if incumbent and incumbent.get('valid') else 'optional outcome model remains in learning'),
+            evaluated_through=max(r['end'] for r in val).isoformat())
+        return decision
     @_serialized_training
     def train_success_model(self,force=False):
         if not self.success_lock.acquire(False):return self.success_model()
         try:
             mode=self.config()['mode'];key='trade_success_model' if mode=='paper' else 'stock_live_outcome_model'
-            rows=self.rows("SELECT id,ts,exit_ts,pnl,fees,setup FROM desk_positions WHERE status='CLOSED' AND mode=? ORDER BY exit_ts DESC,id DESC LIMIT 4000",(mode,))
-            stamp=(rows[0]['id']+':'+str(rows[0]['exit_ts'])) if rows else None;prior=self.success_model(mode=mode)
-            if not force and prior and prior.get('quality_schema')==3 and prior.get('last_sample')==stamp:return prior
-            samples=[]
-            for row in rows:
-                try:
-                    setup=json.loads(row['setup']);snap=setup.get('option_learning_snapshot') or {}
-                    start=_ai_ts_naive(row['ts']);end=_ai_ts_naive(row['exit_ts']);recorded=_ai_ts_naive(snap.get('recorded_at'))
-                    x=snap.get('features',[]);risk=float(snap.get('planned_risk') or 0);pnl=float(row['pnl']);fees=float(row['fees'])
-                    if snap.get('schema')!=1 or len(x)!=len(STOCK_SUCCESS_FEATURES) or not all(math.isfinite(float(v)) for v in x):continue
-                    if not start or not end or not recorded or not start<=recorded<end<=now_ist() or risk<=0 or fees<0 or not all(math.isfinite(v) for v in (risk,pnl,fees)):continue
-                    samples.append(dict(id=row['id'],start=recorded,end=end,x=x,y=int(pnl-fees>0),gross_r=pnl/risk))
-                except (ValueError,TypeError,KeyError):continue
-            train,cal,val=self._split_option_samples(samples)
+            review_key='stock_option_review:'+mode;prior=self.success_model(mode=mode);last_review=self.get(review_key,{})
+            rows=self.rows("SELECT id,ts,exit_ts,pnl,fees,setup FROM desk_positions WHERE status='CLOSED' AND mode=? ORDER BY exit_ts DESC LIMIT 4000",(mode,))
+            stamp=(rows[0]['id']+':'+str(rows[0]['exit_ts'])) if rows else None
+            if not force and last_review.get('last_sample')==stamp and last_review:return prior
+            samples=self.option_samples(rows);train,cal,val=self._split_option_samples(samples)
+            reviewed=_ai_ts_naive(last_review.get('evaluated_through'))
+            if prior and prior.get('valid'):
+                bounds=[_ai_ts_naive(prior.get(k)) for k in ('train_end','calibration_end','validation_end','evaluated_through')]
+                if not prior.get('validation_end'):bounds.append(_ai_ts_naive(prior.get('updated')))
+                reviewed=max(filter(None,bounds+[reviewed]),default=reviewed)
+            if reviewed:val=[r for r in val if r['start']>reviewed+timedelta(minutes=5)]
             sessions=len({r['start'].date() for r in val})
-            m=dict(quality_schema=3,mode=mode,status='LEARNING',valid=False,samples=len(samples),required=100,excluded_samples=len(rows)-len(samples),
+            report=dict(status='LEARNING',samples=len(samples),required=300,excluded_samples=len(rows)-len(samples),
                 train_samples=len(train),calibration_samples=len(cal),validation_samples=len(val),validation_sessions=sessions,
-                last_sample=stamp,last_exit_ts=rows[0]['exit_ts'] if rows else None,updated=now_ist().isoformat(),features=STOCK_SUCCESS_FEATURES,
-                note='Frozen entry features; 60/20/20 time split purged by actual exit + 5 minutes. '+mode.title()+' outcomes only; paper and live records are never mixed.')
-            if len(train)>=40 and len(cal)>=15 and len(val)>=20 and sessions>=3 and all(len({r['y'] for r in group})==2 for group in (train,cal,val)):
+                last_sample=stamp,updated=now_ist().isoformat(),evaluated_through=last_review.get('evaluated_through'),
+                reason='Collecting frozen policy-aware option outcomes; ordinary direction/liquidity entries continue')
+            if len(train)>=100 and len(cal)>=30 and len(val)>=60 and sessions>=6 and all(len({r['y'] for r in group})==2 for group in (train,cal,val)):
                 fitted=_stock_success_fit([r['x'] for r in train],[r['y'] for r in train])
                 fitted['calibration']=desk_fit_calibration(_stock_success_predict(fitted,[r['x'] for r in cal]),[r['y'] for r in cal])
-                y=np.asarray([r['y'] for r in val]);p=self.predict_batch(fitted,[r['x'] for r in val]);base=float(np.mean([r['y'] for r in train]))
-                brier=float(np.mean((p-y)**2));baseline_brier=float(np.mean((base-y)**2));auc=_stock_success_auc(y,p)
                 wins=[r['gross_r'] for r in train if r['y']];losses=[r['gross_r'] for r in train if not r['y']]
-                payoff=dict(win_gross_r=float(np.mean(wins)),loss_gross_r=float(np.mean(losses)),wins=len(wins),losses=len(losses)) if min(len(wins),len(losses))>=10 else None
-                valid=bool(payoff and auc is not None and auc>=.5 and brier<baseline_brier)
-                m.update(fitted,valid=valid,status='VALIDATED' if valid else 'LEARNING',payoff=payoff,train_win_rate=base,
-                    brier=brier,baseline_brier=baseline_brier,auc=auc,accuracy=float(np.mean((p>=.5)==y)*100),baseline=float(max(y.mean(),1-y.mean())*100),
-                    train_end=max(r['end'] for r in train).isoformat(),calibration_start=min(r['start'] for r in cal).isoformat(),
-                    calibration_end=max(r['end'] for r in cal).isoformat(),validation_start=min(r['start'] for r in val).isoformat(),
-                    validation_report=desk_validation_report(p,y))
-            self.put(key,m)
-            if mode=='paper':self.success_model_cache=m;self.success_model_cache_at=time.monotonic()
-            else:self.runtime_cache[key]=(time.monotonic(),m)
-            self.event('SUCCESS_MODEL',f"{mode} · {m['status']} · {m['samples']} frozen entry samples · {m['validation_samples']} purged holdout trades")
-            return m
+                if min(len(wins),len(losses))>=10:
+                    m=dict(fitted,**report,quality_schema=4,id=secrets.token_hex(8),mode=mode,valid=False,features=self.OPTION_POLICY_FEATURES,
+                        train_win_rate=float(np.mean([r['y'] for r in train])),payoff=dict(win_gross_r=float(np.mean(wins)),loss_gross_r=float(np.mean(losses))),
+                        train_end=max(r['end'] for r in train).isoformat(),calibration_end=max(r['end'] for r in cal).isoformat(),
+                        calibration_start=min(r['start'] for r in cal).isoformat(),
+                        validation_start=min(r['start'] for r in val).isoformat(),validation_end=max(r['end'] for r in val).isoformat(),
+                        label_definition='Actual option net P&L after estimated fees under recorded holding/exit policy; paper/live separate')
+                    decision=self.option_promotion_decision(m,prior,val);evaluation=decision.get('challenger_report',{})
+                    m.update(promotion=decision,valid=decision['promoted'],status='VALIDATED' if decision['promoted'] else 'CHALLENGER RETAINED FOR REVIEW',
+                        brier=evaluation.get('brier'),auc=evaluation.get('auc'),baseline_brier=evaluation.get('baseline_brier'),
+                        economics=evaluation.get('economics'),evaluated_through=decision.get('evaluated_through'))
+                    report.update(decision,status='PROMOTED' if decision['promoted'] else 'CHAMPION RETAINED' if prior and prior.get('valid') else 'LEARNING')
+                    with self.db() as c:c.execute('INSERT INTO stock_option_versions VALUES(?,?,?,?)',(m['id'],mode,m['updated'],json.dumps(m)))
+                    if decision['promoted']:
+                        if prior and prior.get('valid'):self.put('stock_option_previous:'+mode,prior)
+                        self.put(key,m)
+                        if mode=='paper':self.success_model_cache=m;self.success_model_cache_at=time.monotonic()
+                        else:self.runtime_cache[key]=(time.monotonic(),m)
+                        prior=m
+            self.put(review_key,report)
+            # A learning candidate does not overwrite the eligible champion.
+            if not prior or not prior.get('valid'):
+                prior=dict(report,quality_schema=4,mode=mode,valid=False,features=self.OPTION_POLICY_FEATURES)
+                self.put(key,prior)
+                if mode=='paper':self.success_model_cache=prior;self.success_model_cache_at=time.monotonic()
+                else:self.runtime_cache[key]=(time.monotonic(),prior)
+            self.event('OPTION_REVIEW',f"{mode} · {report['status']} · {len(samples)} policy-aware samples · {len(val)} new holdout trades")
+            return prior
         finally:self.success_lock.release()
+    def rollback_option_model(self,mode):
+        if not self.success_lock.acquire(False):raise ValueError('Option model review is running; retry rollback when it completes')
+        try:return self._rollback_option_model_locked(mode)
+        finally:self.success_lock.release()
+    def _rollback_option_model_locked(self,mode):
+        if mode!=self.config()['mode']:raise ValueError('Select the same execution mode before rollback')
+        if self.config()['armed'] or self.active():raise ValueError('Disarm and close/reconcile Stock positions before model rollback')
+        previous=self.get('stock_option_previous:'+mode)
+        updated=_ai_ts_naive((previous or {}).get('updated'))
+        if not previous or not previous.get('valid') or previous.get('mode')!=mode or not updated or not 0<=(now_ist()-updated).total_seconds()<=7*86400:
+            raise ValueError('No recent eligible previous option model is available')
+        key='trade_success_model' if mode=='paper' else 'stock_live_outcome_model';current=self.get(key)
+        review=self.get('stock_option_review:'+mode) or {}
+        cutoffs=[_ai_ts_naive(review.get('evaluated_through'))]
+        for model in (previous,current or {}):
+            cutoffs.extend(_ai_ts_naive(model.get(k)) for k in ('train_end','calibration_end','validation_end','evaluated_through'))
+            if not model.get('validation_end'):cutoffs.append(_ai_ts_naive(model.get('updated')))
+        cutoffs=[ts for ts in cutoffs if ts]
+        review=dict(review,status='ROLLED BACK',updated=now_ist().isoformat(),
+            evaluated_through=max(cutoffs).isoformat() if cutoffs else None,reason='Operator restored previous eligible option model')
+        with self.db() as c:
+            for meta_key,value in ((key,previous),('stock_option_previous:'+mode,current),('stock_option_review:'+mode,review)):
+                c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',(meta_key,json.dumps(value)))
+        self.success_model_cache=None;self.success_model_cache_at=0;self.runtime_cache.pop(key,None)
+        self.event('OPTION_ROLLBACK','Restored '+str(previous.get('id')),mode)
+        return dict(status='ROLLED BACK',model_id=previous.get('id'))
     def adaptive_position_update(self,p,q,cfg):
         if p['status']!='OPEN' or p['qty']<=0 or p['id'] in self.mismatches:return
         setup=json.loads(p.get('setup') or '{}');plan=setup.get('risk_plan') or {}
@@ -15595,6 +16014,101 @@ class StockRuntimeEngine(StockDeskEngine):
             paired=dict(samples=min(hp['samples'],fp['samples']),historical_brier=hp.get('brier'),forward_brier=fp.get('brier')),
             regimes={name:metrics([r for r in data[-600:] if r.get('regime')==name]) for name in sorted({str(r.get('regime')) for r in data[-600:] if r.get('regime')})},
             note='Forward-only diagnostics. Correlated observations are not independent trades; drift is a review/retraining signal, not proof of profitability.')
+    def replay_exit_candidates(self,position,orders,events):
+        """Two predeclared exit hypotheses, only over the observed path. Never live orders."""
+        policies={'NET_BREAKEVEN_1R':'Net breakeven after 1R','TRAIL_1_5R':'0.75R trail after 1.5R'}
+        result=dict(position_id=position['id'],mode=position['mode'],policies={},note='Sampled full-position simulation. No queue/fill guarantee, no prices after actual close. Censored paths are not losses or zero returns. Research only; exits are not automatically changed.')
+        def unavailable(reason):
+            result['policies']={name:dict(name=label,status='INCOMPLETE',reason=reason) for name,label in policies.items()};return result
+        try:
+            setup=json.loads(position.get('setup') or '{}');policy=setup.get('entry_policy') or {}
+            if policy.get('schema')!=1:return unavailable('Holding/exit policy was not recorded at entry')
+            buys=[o for o in orders if o['side']=='BUY' and o['filled']>0]
+            fills=[];samples=[];gap=False
+            for event in events:
+                payload=json.loads(event['payload']);ts=_ai_ts_naive(event['ts'])
+                if event['kind'] in ('DATA_GAP','RECORDER_GAP','RESTART_GAP'):gap=True
+                if event['kind']=='FILL' and payload.get('side')=='BUY' and payload.get('fill_delta',0)>0:fills.append(ts)
+                if event['kind']=='OBSERVATION' and payload.get('quote'):
+                    q=payload['quote'];qt=_ai_ts_naive(q.get('quote_ts'));bid=self.display_number(q.get('bid'))
+                    if ts and qt and bid and bid>0 and 0<=(ts-qt).total_seconds()<=10:samples.append((qt,bid,int(q.get('bid_qty') or 0)))
+                    else:gap=True
+            if gap or len(events)>3000:return unavailable('Recorder/data gap or path too long for bounded review')
+            if len(buys)!=1 or len(fills)!=1 or fills[0] is None:return unavailable('Need one confirmed entry fill; partial-entry paths excluded')
+            first=fills[0];end=_ai_ts_naive(position.get('exit_ts'));samples=sorted({q[0]:q for q in samples if end and first<=q[0]<=end}.values())
+            if not end or not samples or (samples[0][0]-first).total_seconds()>30 or (end-samples[-1][0]).total_seconds()>30:
+                return unavailable('Opening or closing quote coverage missing')
+            if any((b[0]-a[0]).total_seconds()>30 for a,b in zip(samples,samples[1:])):return unavailable('More than 30 seconds between sampled quotes')
+            qty=int(buys[0]['filled']);entry=float(buys[0]['notional'])/qty;initial=float(policy['initial_stop']);unit=entry-initial
+            if qty<=0 or unit<=0:return unavailable('Invalid filled quantity or initial stop')
+            brokerage=float(policy['fee_per_order']);slip=float(policy['slippage_bps']);tick=float(setup.get('tick') or .05)
+            fees_at_entry=self.order_charge('BUY',entry*qty,brokerage=brokerage)
+            be=entry+(fees_at_entry+self.order_charge('SELL',entry*qty,brokerage=brokerage))/qty
+            be=math.ceil((be-1e-9)/tick)*tick
+            for key,label in policies.items():
+                stop=initial;peak=entry;trial=dict(name=label,status='CENSORED',reason='No alternative exit observed before actual close')
+                for ts,bid,depth in samples:
+                    if bid<=stop:
+                        if depth<qty:trial.update(status='INCOMPLETE',reason='Displayed bid depth cannot support simulated full exit');break
+                        price=max(tick,math.floor(bid*(1-slip/10000)/tick)*tick)
+                        net=(price-entry)*qty-fees_at_entry-self.order_charge('SELL',price*qty,brokerage=brokerage)
+                        trial.update(status='TRIGGERED',reason='Hypothetical stop crossed at an observed bid',quote_ts=ts.isoformat(),price=price,
+                            net=round(net,2),net_r=net/(unit*qty),actual_net=round(position['pnl']-position['fees'],2));break
+                    peak=max(peak,bid)
+                    if key=='NET_BREAKEVEN_1R' and peak>=entry+unit and bid>=be+tick:stop=max(stop,be)
+                    if key=='TRAIL_1_5R' and peak>=entry+1.5*unit:stop=max(stop,math.floor((peak-.75*unit)/tick)*tick)
+                result['policies'][key]=trial
+            result.update(samples=len(samples),filled_qty=qty,entry=entry,observed_until=samples[-1][0].isoformat())
+            return result
+        except (ValueError,TypeError,KeyError,ZeroDivisionError,OverflowError):return unavailable('Malformed or incomplete saved evidence')
+    def _review_trade_evidence(self,closed):
+        # Small local batches; never starts quote/history calls or runs on HTTP.
+        reviewed=0
+        for p in closed[:50]:
+            key='stock_exit_replay:'+p['id']
+            if self.get(key) is not None:continue
+            events=self.rows('SELECT ts,kind,payload FROM desk_trade_events WHERE position_id=? ORDER BY id LIMIT 3001',(p['id'],))
+            orders=self.rows('SELECT * FROM desk_orders WHERE position_id=? ORDER BY ts,id',(p['id'],))
+            self.put(key,self.replay_exit_candidates(p,orders,events));reviewed+=1
+            if reviewed>=2:break
+        samples=self.option_samples(closed);sizing={}
+        modes={}
+        for mode in ('paper','live'):
+            ids={r['id'] for r in closed if r['mode']==mode};recent=[r for r in samples if r['id'] in ids and r['end']>=now_ist()-timedelta(days=30)]
+            sizing[mode]={}
+            for band in range(5,10):
+                bucket=[r for r in recent if min(9,int(r['confidence']*10))==band]
+                metrics=self.net_evidence(bucket);metrics['updated']=now_ist().isoformat();sizing[mode][str(band)]=metrics
+            mode_rows=[r for r in closed if r['mode']==mode][:30];keys=['stock_exit_replay:'+r['id'] for r in mode_rows]
+            replays=self.rows('SELECT value FROM desk_meta WHERE key IN ('+','.join('?' for _ in keys)+')',keys) if keys else []
+            groups={};excluded=0
+            for row in replays:
+                try:
+                    trials=json.loads(row['value'])['policies']
+                    if not isinstance(trials,dict):raise TypeError('Malformed replay')
+                except (ValueError,TypeError,KeyError):excluded+=1;continue
+                for key,trial in trials.items():
+                    if not isinstance(trial,dict) or trial.get('status') not in ('TRIGGERED','CENSORED','INCOMPLETE') or not trial.get('name'):
+                        excluded+=1;continue
+                    if trial['status']=='TRIGGERED' and any(self.display_number(trial.get(k)) is None for k in ('net','actual_net')):
+                        excluded+=1;continue
+                    g=groups.setdefault(key,dict(name=trial['name'],triggered=0,censored=0,incomplete=0,simulated_net=0.,actual_net_comparable=0.))
+                    state=trial['status'];g[{'TRIGGERED':'triggered','CENSORED':'censored','INCOMPLETE':'incomplete'}[state]]+=1
+                    if state=='TRIGGERED':g['simulated_net']+=float(trial['net']);g['actual_net_comparable']+=float(trial['actual_net'])
+            ids=[r['id'] for r in mode_rows]
+            raw_marks=self.rows('SELECT payload FROM stock_trade_metrics WHERE position_id IN ('+','.join('?' for _ in ids)+')',ids) if ids else []
+            marks=[];nets={r['id']:float(r['pnl'])-float(r['fees']) for r in mode_rows if all(self.display_number(r.get(k)) is not None for k in ('pnl','fees'))}
+            for row in raw_marks:
+                try:
+                    mark=json.loads(row['payload'])
+                    if not isinstance(mark,dict) or mark.get('position_id') not in ids:raise ValueError('Malformed path metrics')
+                    marks.append(mark)
+                except (ValueError,TypeError):excluded+=1
+            givebacks=[max(0.,self.display_number(m['peak_net'])-nets[m['position_id']]) for m in marks if self.display_number(m.get('peak_net')) is not None and m['position_id'] in nets]
+            modes[mode]=dict(reviewed=len(replays),path_records=len(marks),mean_giveback=round(float(np.mean(givebacks)),2) if givebacks else None,
+                paths_with_gaps=sum(bool(m.get('data_gap') or m.get('restart_gap')) for m in marks),excluded_records=excluded,policies=list(groups.values()))
+        return dict(updated=now_ist().isoformat(),modes=modes,note='Exit experiments are research only. Triggered paths are a selected subset; censored/incomplete paths prevent an overall profitability conclusion.'),sizing
+
     def _learn_once(self):
         self.learning_status=dict(status='SETTLING',updated=now_ist().isoformat())
         settled=self._settle_batch()
@@ -15606,9 +16120,11 @@ class StockRuntimeEngine(StockDeskEngine):
         if time.monotonic()>=getattr(self,'_trade_review_at',0.):
             self._trade_review_at=time.monotonic()+60
             # Bounded saved-ledger analysis on the learner, never the HTTP/entry path.
-            closed=self.rows("SELECT id,ts,exit_ts,mode,pnl,fees,setup,exit_reason FROM desk_positions WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 500")
+            closed=self.rows("SELECT * FROM desk_positions WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 500")
             report['trade_review']=self.trade_outcome_review(closed)
-        else:report['trade_review']=(self.learning_cache or {}).get('trade_review',{})
+            report['exit_research'],report['sizing_review']=self._review_trade_evidence(closed)
+        else:
+            for key in ('trade_review','exit_research','sizing_review'):report[key]=(self.learning_cache or {}).get(key,{})
         self.learning_cache=report;self.put('stock_learning_report',report)
         last=rows[-1]['id'] if rows else None
         if len(rows)>=300 and last!=self.get('stock_online_last') and time.monotonic()>=getattr(self,'_online_retry_at',0.):
@@ -15771,6 +16287,10 @@ class StockRuntimeEngine(StockDeskEngine):
                 if self.a.connected():self._worker_tick('learning',self._learn_once)
                 self.stop_event.wait(15)
         threading.Thread(target=learner,daemon=True,name='stock-learning').start()
+        def diagnostics():
+            while not self.stop_event.wait(2):self._worker_tick('diagnostics',self._flush_evidence)
+            self._flush_evidence()
+        threading.Thread(target=diagnostics,daemon=True,name='stock-evidence').start()
     def model_quality(self):
         result=super().model_quality()
         review=self.get('stock_model_promotion') or {};reviewed=_ai_ts_naive(review.get('updated'))
@@ -15866,9 +16386,11 @@ class StockRuntimeEngine(StockDeskEngine):
                 warnings.append(label+': saved display data is unavailable.');return None
         with self.a.dashboard_db() as c:
             keys=['config','halt','close_requested','stock_champion_id','stock_universe_info','online_model',
-                'stock_learning_report','trade_success_model','stock_live_outcome_model','historical_setup_success_model','stock_model_promotion']
+                'stock_learning_report','trade_success_model','stock_live_outcome_model','historical_setup_success_model','stock_model_promotion',
+                'stock_option_review:paper','stock_option_review:live','stock_option_previous:paper','stock_option_previous:live']
             meta={}
             objects={'config','stock_universe_info','online_model','stock_learning_report','trade_success_model','stock_live_outcome_model','historical_setup_success_model','stock_model_promotion'}
+            objects.update(k for k in keys if k.startswith(('stock_option_review:','stock_option_previous:')))
             control_types={'halt':str,'close_requested':bool,'stock_champion_id':str}
             for r in c.execute('SELECT key,value FROM desk_meta WHERE key IN ('+','.join('?' for _ in keys)+')',keys):
                 meta[r['key']]=read_json(r['value'],r['key'],dict if r['key'] in objects else control_types.get(r['key']),r['key']=='config',r['key'] in control_types)
@@ -15888,6 +16410,10 @@ class StockRuntimeEngine(StockDeskEngine):
             paper=[dict(r) for r in c.execute("SELECT ts,exit_ts,pnl,fees,risk FROM desk_positions WHERE status='CLOSED' AND mode='paper' ORDER BY exit_ts")]
             fill_keys=['execution_fill:'+o['id'] for o in orders]
             fills=[read_json(r[0],'Fill statistics',dict) for r in c.execute('SELECT value FROM desk_meta WHERE key IN ('+','.join('?' for _ in fill_keys)+')',fill_keys)] if fill_keys else []
+            traces=[read_json(r[0],'Execution trace',dict) for r in c.execute('SELECT payload FROM stock_execution_trace WHERE mode=? ORDER BY updated DESC LIMIT 12',(cfg['mode'],))]
+            valid_traces=[t for t in traces if t and isinstance(t.get('id'),str) and t.get('mode')==cfg['mode'] and isinstance(t.get('updated'),str) and isinstance(t.get('events'),list)]
+            if len(valid_traces)!=len(traces):warnings.append('Execution trace: some optional diagnostics are incomplete.')
+            traces=valid_traces
         self.display_read_phase='position display'
         for p in active:
             p.pop('setup',None);p.update(dict(self.health.get(p['id'],{})))
@@ -15917,6 +16443,12 @@ class StockRuntimeEngine(StockDeskEngine):
             qualified=sum(bool(s.get('setup_qualified')) for s in signals),
             fresh_universe=sum(s.get('bar_age') is not None and 0<=s['bar_age']<=STOCK_FULL_SCAN_BAR_MAX_AGE for s in signals))
         learning=copy.deepcopy(self.learning_cache or meta.get('stock_learning_report') or {})
+        if self.evidence_lock.acquire(False):
+            try:
+                combined={t['id']:t for t in traces if t}
+                combined.update({k:copy.deepcopy(t) for k,t in self.entry_traces.items() if t['mode']==mode})
+                traces=sorted(combined.values(),key=lambda t:t['updated'],reverse=True)[:12]
+            finally:self.evidence_lock.release()
         fills=[x for x in fills if x and x.get('mode')==mode]
         delays=[self.display_number(x.get('delay_seconds')) for x in fills];delays=[x for x in delays if x is not None and x>=0]
         slippage=[self.display_number(x.get('slippage_vs_limit_bps')) for x in fills];slippage=[x for x in slippage if x is not None]
@@ -15928,8 +16460,10 @@ class StockRuntimeEngine(StockDeskEngine):
                 hm.update(valid=False,status='REBUILD REQUIRED')
         if sm:
             updated=_ai_ts_naive(sm.get('updated'))
-            if sm.get('quality_schema')!=3 or sm.get('mode')!=mode or not updated or not 0<=(now_ist()-updated).total_seconds()<=7*86400:
+            if sm.get('quality_schema') not in (3,4) or sm.get('mode')!=mode or not updated or not 0<=(now_ist()-updated).total_seconds()<=7*86400:
                 sm.update(valid=False,status='REBUILD REQUIRED')
+        previous=meta.get('stock_option_previous:'+mode) or {};previous_time=_ai_ts_naive(previous.get('updated'))
+        rollback_available=bool(previous.get('valid') and previous.get('mode')==mode and previous_time and 0<=(now_ist()-previous_time).total_seconds()<=7*86400)
         return dict(version='stock-runtime-1',runtime_build=STOCK_RUNTIME_BUILD,build=STOCK_AI_BUILD,timestamp=timestamp,
             connected=connected,market_open=market,config=cfg,block=block,halt=meta.get('halt'),positions=active,trades=trades,orders=orders,
             pending_orders=pending,historical_unknown_orders=archived,events=events,legacy=[],recorder_error=self.recorder_error,
@@ -15937,6 +16471,8 @@ class StockRuntimeEngine(StockDeskEngine):
             observations=learning.get('observations',{}),training=dict(self.training),last_cycle=self.last_cycle,
             universe=meta.get('stock_universe_info') or {},scan=scan,watchlist=list(self.a.symbols),history_refresh=dict(self.history_refresh_status),
             ban_status=self.ban_error or 'Daily list checked',execution=dict(self.execution_status),
+            execution_traces=[t for t in traces if t],evidence_recorder=dict(self.evidence_status),
+            option_model_review=meta.get('stock_option_review:'+mode),option_rollback_available=rollback_available,
             success_model=sm,live_success_model=sm,historical_success_model=hm,historical_archive=archive,
             success_selector_status='DIRECTION + '+mode.upper()+' OPTION EVIDENCE' if sm and sm.get('valid') else 'DIRECTION + LIQUIDITY / LEARNING',
             history_backfill=dict(self.history_backfill_status),workers=copy.deepcopy(getattr(self,'worker_health',{})),

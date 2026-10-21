@@ -63,6 +63,24 @@ check('paper outcome breakdown includes costs and sample count',()=>{const t=win
 response.config.mode='live';await window.eval('refreshStockTradeAI()');
 check('live outcome panel never mixes paper results',()=>{const t=window.document.getElementById('skTradeOutcomes').textContent;assert.match(t,/Live trade outcomes/);assert.match(t,/50/);assert.doesNotMatch(t,/180/);assert.match(t,/1 incomplete records excluded/)});
 response.config.mode='paper';await window.eval('refreshStockTradeAI()');
+response.execution_traces=[
+ {id:'paper',mode:'paper',symbol:'<img src=x onerror=alert(1)>',contract:'TESTCE',stage:'FILLED',reason:'Paper simulation',qualified_at:'2026-10-21T10:00:00+05:30',updated:'2026-10-21T10:00:02+05:30',first_fill_at:'2026-10-21T10:00:02+05:30',events:[{stage:'FILLED',ts:'2026-10-21T10:00:02+05:30',details:{execution_measurement:{slippage_vs_ask_bps:1.2,confirmation_seconds:.5}}}]},
+ {id:'live',mode:'live',symbol:'LIVEONLY',stage:'UNKNOWN',reason:'No unique broker match',events:[]}
+];
+response.option_model_review={status:'CHAMPION RETAINED',reason:'More later outcomes required',samples:120,validation_samples:20,validation_sessions:3};
+response.option_rollback_available=true;
+response.forward_review.exit_research={modes:{paper:{path_records:2,mean_giveback:250,paths_with_gaps:1,policies:[{name:'Net breakeven after 1R',triggered:0,censored:1,incomplete:1}]}}};
+await window.eval('refreshStockTradeAI()');
+check('paper trace distinguishes a simulated fill and excludes live orders',()=>{const t=window.document.getElementById('skExecutionTrace').textContent;assert.match(t,/Paper filled/);assert.doesNotMatch(t,/LIVEONLY/);assert.match(t,/1.20 bps/)});
+check('execution trace escapes instrument text',()=>{const node=window.document.getElementById('skExecutionTrace');assert.equal(node.querySelectorAll('img').length,0);assert.match(node.textContent,/<img src=x/)});
+check('model-review panel shows new evidence counts and optional rollback',()=>{const n=window.document.getElementById('skOptionReview');assert.match(n.textContent,/CHAMPION RETAINED/);assert.match(n.textContent,/120/);assert.equal(window.document.getElementById('skOptionRollback').disabled,false)});
+check('exit research clearly separates censored paths from actual live exits',()=>{const t=window.document.getElementById('skExitResearch').textContent;assert.match(t,/Censored/);assert.match(t,/Incomplete/);assert.match(t,/live exits are unchanged/)});
+response.config.armed=true;await window.eval('refreshStockTradeAI()');
+check('model rollback is disabled while armed',()=>assert.equal(window.document.getElementById('skOptionRollback').disabled,true));
+response.config.armed=false;response.config.mode='live';await window.eval('refreshStockTradeAI()');
+check('uncertain live order is never displayed as a fill',()=>{const t=window.document.getElementById('skExecutionTrace').textContent;assert.match(t,/Awaiting broker evidence/);assert.doesNotMatch(t,/Paper filled|<img/)});
+response.config.mode='paper';await window.eval('refreshStockTradeAI()');
+check('rendering model evidence never sends a rollback or arm request',()=>assert.ok(requests.every(r=>r.options.method!=='POST')));
 window.eval("window.__savedStockRender=renderStockCandidates;renderStockCandidates=()=>{throw Error('Test render error')}");
 await window.eval('refreshStockTradeAI()');
 check('rendering exceptions are not mislabelled as network disconnects',()=>{assert.match(window.document.getElementById('skConnectionState').textContent,/Display rendering failed/);assert.match(window.document.getElementById('skNotice').textContent,/Test render error/)});

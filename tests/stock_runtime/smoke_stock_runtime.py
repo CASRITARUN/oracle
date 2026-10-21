@@ -66,6 +66,9 @@ with tempfile.TemporaryDirectory() as path:
         assert d['positions'][0]['qty']==100 and d['evidence']['net'] is None
         assert d['signals'][0]['rank_score']==55 and d['signals'][0]['qualified'] is False
         json.dumps(d,allow_nan=False)
+        research,sizing=app.STOCK_DESK._review_trade_evidence(app.STOCK_DESK.rows("SELECT * FROM desk_positions WHERE status='CLOSED'"))
+        assert research['modes']['paper']['mean_giveback'] is None
+        assert all(key in d for key in ('execution_traces','option_model_review','option_rollback_available','evidence_recorder'))
         # Exercise the real Stock risk manager/SQLite schema without broker I/O.
         app.STOCK_DESK.risk_display=dict(config=app.STOCK_RISK.config(),states={m:app.STOCK_RISK.snapshot(m) for m in ('live','paper')},timestamp=app.now_ist().isoformat(),broker=app.BROKER_GATE.status())
         assert client.get('/api/desk-risk/stock').status_code==200

@@ -17,7 +17,7 @@ import numpy as np
 import test_algo_upgrade as old
 ns=old.ns
 for node in old.tree.body:
-    if isinstance(node,old.ast.Assign) and any(isinstance(t,old.ast.Name) and t.id in ('STOCK_FULL_SCAN_BAR_MAX_AGE','STOCK_FULL_SCAN_DEEP_N','STOCK_FULL_REFRESH_BATCH','STOCK_HISTORY_PACE_SECONDS') for t in node.targets):
+    if isinstance(node,old.ast.Assign) and any(isinstance(t,old.ast.Name) and t.id in ('STOCK_FULL_SCAN_BAR_MAX_AGE','STOCK_FULL_SCAN_DEEP_N','STOCK_FULL_REFRESH_BATCH','STOCK_HISTORY_PACE_SECONDS','STOCK_SUCCESS_FEATURES') for t in node.targets):
         exec(compile(old.ast.Module(body=[node],type_ignores=[]),'<scan constants>','exec'),ns)
 ns.update(secrets=secrets,logger=logging.getLogger('stock-tests'),_AI_TRAINING_SLOT=threading.Semaphore(1),
     STOCK_RUNTIME_BUILD='test',STOCK_AI_BUILD='test',STOCK_HIST_MIN_ARCHIVE_COVERAGE=.7,
@@ -43,6 +43,7 @@ def model(identity='champ',n=15):
         auc=.54,brier=.249,accuracy=54.,baseline=53.,train_end=(now-timedelta(days=9)).isoformat(),validation_start=(now-timedelta(days=7)).isoformat())
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
+        old.clock.now=old.datetime.now(old.IST).replace(tzinfo=None)
         self.tmp=tempfile.TemporaryDirectory();ns['__file__']=self.tmp.name+'/backend.py'
         self.a=Broker(self.tmp.name+'/stock_options_ai.db')
         self.e=Runtime(self.a);self.e.desk_name='stock';self.e.a.symbols=('TEST',)

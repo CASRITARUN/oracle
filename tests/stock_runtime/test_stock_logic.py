@@ -15,7 +15,11 @@ Runtime=runtime.Runtime
 class LogicTests(unittest.TestCase):
     def setUp(self):
         execution.ExecutionTests.setUp(self)
-        old.clock.now=old.clock.now.replace(hour=14,minute=0,second=0,microsecond=0)
+        fixed=old.clock.now.replace(hour=14,minute=0,second=0,microsecond=0);shift=fixed-old.clock.now
+        old.clock.now=fixed;self.a.q['quote_ts']=fixed.isoformat()
+        for rows in self.a.history.values():
+            for row in rows:row['ts']=(old.datetime.fromisoformat(row['ts'])+shift).isoformat()
+        for key in ('ts','bar_ts'):self.seed[key]=(old.datetime.fromisoformat(self.seed[key])+shift).isoformat()
     def tearDown(self):execution.ExecutionTests.tearDown(self)
     def path(self,n=5):
         start=old.clock.now.replace(hour=11)
@@ -107,7 +111,7 @@ class LogicTests(unittest.TestCase):
         self.e.adaptive_position_update(p,{'bid':111.},self.e.config());self.assertEqual(p['stop'],101.3)
         self.e.adaptive_position_update(p,{'bid':95.},self.e.config());self.assertEqual(p['stop'],101.3)
     def samples(self,n=160):
-        start=(old.clock.now-timedelta(days=40)).replace(hour=10)
+        start=(old.clock.now-timedelta(days=(n+3)//4+1)).replace(hour=10)
         rows=[]
         for i in range(n):
             t=start+timedelta(days=i//4,minutes=(i%4)*10)
@@ -121,21 +125,21 @@ class LogicTests(unittest.TestCase):
         self.assertTrue(all(r['end']+timedelta(minutes=5)<min(v['start'] for v in cal) for r in train))
         self.assertTrue(all(r['end']+timedelta(minutes=5)<min(v['start'] for v in val) for r in cal))
     def test_real_option_training_uses_frozen_entry_features_and_disjoint_windows(self):
-        for sample in self.samples():
-            setup=dict(decision='READY',confidence=.99,features=[99.]*15,option_learning_snapshot=dict(schema=1,features=sample['x'],planned_risk=100.,recorded_at=sample['start'].isoformat()))
+        for sample in self.samples(400):
+            setup=dict(decision='READY',confidence=.99,features=[99.]*15,option_learning_snapshot=dict(schema=1,feature_schema=2,features=sample['x'],policy_features=sample['x']+[.25,.3],policy={'exit_policy':'stock-confirmed-v2'},planned_risk=100.,estimated_costs=10.,recorded_at=sample['start'].isoformat()))
             with self.e.db() as c:c.execute('INSERT INTO desk_positions(id,ts,exit_ts,symbol,mode,status,pnl,fees,setup) VALUES(?,?,?,?,?,?,?,?,?)',
                 (sample['id'],sample['start'].isoformat(),sample['end'].isoformat(),'TEST','paper','CLOSED',200. if sample['y'] else -100.,10.,json.dumps(setup)))
         m=self.e.train_success_model(True)
-        self.assertEqual(m['quality_schema'],3);self.assertEqual(m['samples'],160);self.assertEqual(m['excluded_samples'],0)
+        self.assertEqual(m['quality_schema'],4);self.assertEqual(m['samples'],400);self.assertEqual(m['excluded_samples'],0)
         self.assertLess(m['train_end'],m['calibration_start']);self.assertLess(m['calibration_end'],m['validation_start'])
-        self.assertEqual(len(m['mu']),20);self.assertLess(max(m['mu']),1.)
+        self.assertEqual(len(m['mu']),22);self.assertLess(max(m['mu']),1.)
         self.assertTrue(m['valid'],m);self.assertLess(m['brier'],m['baseline_brier'])
     def test_old_trade_features_are_excluded_without_fabricated_reconstruction(self):
         with self.e.db() as c:c.execute('INSERT INTO desk_positions(id,ts,exit_ts,mode,status,pnl,fees,setup) VALUES(?,?,?,?,?,?,?,?)',('old',(old.clock.now-timedelta(hours=1)).isoformat(),old.clock.now.isoformat(),'paper','CLOSED',100.,10.,json.dumps(self.seed)))
         m=self.e.train_success_model(True);self.assertEqual(m['samples'],0);self.assertEqual(m['excluded_samples'],1);self.assertFalse(m['valid'])
     def test_live_outcome_learning_never_uses_paper_trades(self):
         start=old.clock.now-timedelta(hours=1);end=old.clock.now-timedelta(minutes=1)
-        setup=dict(option_learning_snapshot=dict(schema=1,features=[0.]*20,planned_risk=100.,recorded_at=start.isoformat()))
+        setup=dict(option_learning_snapshot=dict(schema=1,feature_schema=2,features=[0.]*20,policy_features=[0.]*22,policy={'exit_policy':'stock-confirmed-v2'},planned_risk=100.,estimated_costs=10.,recorded_at=start.isoformat()))
         for mode,pnl in [('paper',200.),('live',-100.)]:
             with self.e.db() as c:c.execute('INSERT INTO desk_positions(id,ts,exit_ts,mode,status,pnl,fees,setup) VALUES(?,?,?,?,?,?,?,?)',
                 (mode,start.isoformat(),end.isoformat(),mode,'CLOSED',pnl,10.,json.dumps(setup)))
