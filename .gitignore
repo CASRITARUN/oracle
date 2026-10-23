@@ -1,0 +1,13 @@
+# Runtime authentication state includes private session signing material.
+website_auth.sqlite3
+website_auth.sqlite3-journal
+website_auth.sqlite3-wal
+website_auth.sqlite3-shm
+
+# Local runtime/test credentials and generated fixtures.
+.env
+.env.*
+__pycache__/
+.qa_python/
+.qa_node/
+tests/stock_runtime/smoke_state.json

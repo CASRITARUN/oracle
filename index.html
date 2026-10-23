@@ -29,7 +29,7 @@ async function websiteCheck(force=false){
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
   try{
     const response=await websiteFetch('/api/website-status',{cache:'no-store',signal:controller.signal});
-    if(response.status===401){websiteSignOut();return}
+    if(response.status===401&&(await response.clone().json().catch(()=>null))?.website_login_required===true){websiteSignOut();return}
     if(!response.ok)throw Error('Access check failed');
     const data=await response.json();
     if(data.authenticated!==true||!data.csrf)throw Error('Access check failed');
@@ -49,7 +49,7 @@ async function websiteLockAll(event){
   try{
     // Fetch a fresh CSRF token; a second tab may have renewed the shared cookie.
     const status=await websiteFetch('/api/website-status',{cache:'no-store',signal:controller.signal});
-    if(status.status===401){websiteSignOut();return}
+    if(status.status===401&&(await status.clone().json().catch(()=>null))?.website_login_required===true){websiteSignOut();return}
     if(!status.ok)throw Error('Cannot confirm access');
     websiteCsrf=(await status.json()).csrf;
     if(!websiteCsrf)throw Error('Missing access token');
@@ -1213,15 +1213,28 @@ document.getElementById("closeConfirmBtn").onclick = async () => {
 let priceChartInstance = null;
 let currentExecPositionId = null;
 
-async function checkSession() {
-  const r = await apiFetch("/api/session-status");
-  const d = await r.json();
+let kiteSessionCheck=null, kiteSessionRetry=null, kiteSessionFailures=0;
+function checkSession() {
+  if(kiteSessionCheck)return kiteSessionCheck;
+  clearTimeout(kiteSessionRetry);
+  kiteSessionCheck=refreshKiteSession().finally(()=>{kiteSessionCheck=null});
+  return kiteSessionCheck;
+}
+async function refreshKiteSession() {
   const el = document.getElementById("loginArea");
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
+  try {
+  const r = await apiFetch("/api/session-status",{cache:'no-store',signal:controller.signal});
+  if(!r.ok)throw Error('Session check unavailable');
+  const d = await r.json();
+  if(typeof d.logged_in!=='boolean')throw Error('Invalid session response');
+  kiteSessionFailures=0;document.getElementById('kiteSessionWarning')?.remove();
   if (d.logged_in) {
-    el.innerHTML = `<span class="pill ok">Connected to Kite</span> <button class="secondary small-btn" id="logoutBtn">Log out</button>`;
+    el.innerHTML = `<span class="pill ${d.warning?'':'ok'}">${d.warning?'Kite check delayed · retrying':'Connected to Kite'}</span> <button class="secondary small-btn" id="logoutBtn">Log out</button>`;
+    if(d.warning)kiteSessionRetry=setTimeout(checkSession,15000);
     document.getElementById("logoutBtn").onclick = async () => {
-      await apiFetch("/api/logout", {method: "POST"});
-      checkSession();
+      try{const reply=await apiFetch("/api/logout", {method: "POST"});if(!reply.ok)throw Error();checkSession()}
+      catch{alert('Kite logout was not confirmed. Check your connection and retry.')}
     };
   } else {
     el.innerHTML = `<button id="loginBtn">Connect Kite Account</button>`;
@@ -1235,6 +1248,15 @@ async function checkSession() {
     }
   }
   return d.logged_in;
+  } catch {
+    // A timeout/503/non-JSON response does not prove the broker logged out.
+    // Preserve the last controls and show the connection check as unverified.
+    let warning=document.getElementById('kiteSessionWarning');
+    if(!warning){warning=document.createElement('span');warning.id='kiteSessionWarning';warning.className='pill';warning.setAttribute('role','status');el.appendChild(warning)}
+    warning.textContent='Kite connection check delayed · retrying';
+    kiteSessionFailures++;kiteSessionRetry=setTimeout(checkSession,Math.min(30000,5000*2**Math.min(kiteSessionFailures-1,3)));
+    return false;
+  } finally {clearTimeout(timer)}
 }
 
 // Detects a 401/session_expired response from ANY API call and immediately flips the header
@@ -1245,7 +1267,7 @@ async function apiFetch(url, options) {
   if (res.status === 401) {
     let data = {};
     try { data = await res.clone().json(); } catch (e) {}
-    if (data.session_expired || data.error === "not_logged_in") {
+    if (url!=="/api/session-status"&&(data.session_expired || data.error === "not_logged_in")) {
       checkSession();
     }
   }
@@ -3720,14 +3742,14 @@ function renderStockEvidence(s){
 function renderStockRuntime(s){
  renderStockEvidence(s);
  const d=s.dashboard||{},workers=s.workers||{},cfg=s.config||{},risk=s.risk_display?.states?.[cfg.mode],riskAge=s.risk_age_seconds;
- const stale=!!d.stale,loading=d.status==='LOADING',readError=d.status==='ERROR',warnings=s.display_warnings||[];
+ const stale=!!d.stale,loading=d.status==='LOADING',readError=d.status==='ERROR',warnings=s.display_warnings||[],dbRetry=s.database?.status==='RETRYING';
  skText('skConnectionState',readError?'Dashboard read failed · retrying':loading?'Reading saved ledger':stale?'Dashboard refresh delayed':warnings.length?'Dashboard connected · partial statistics':'Dashboard connected');
  skEl('skConnectionState')?.classList.toggle('sr-stale',stale);
  skText('skDataAge',d.age_seconds==null?(d.failure?`${d.failure.code} · ${d.failure.phase}`:'Waiting for first read'):`Snapshot ${Math.round(d.age_seconds)}s old`);
  const warningBox=skEl('skDisplayWarnings');if(warningBox){warningBox.hidden=!warnings.length;warningBox.textContent=warnings.length?'Some statistics are unavailable: '+warnings.slice(0,3).join(' '):'';}
  const command=s.command||{};
- skText('skOperationalTitle',readError?'Retrying the dashboard read':loading?'Opening your Stock desk':s.halt?'Protection needs attention':s.connected===false?'Kite sign-in required':!s.market_open?'Ready for the next session':cfg.armed?'Watching for the next setup':'Learning with entries paused');
- skText('skOperationalDetail',!cfg.armed&&cfg.mode==='paper'?'Paper entries are paused. Select Arm entries to start simulated trades; no broker orders are sent.':command.status==='QUEUED'?`${command.action} is queued. Disarm cancels a queued arm request.`:s.execution?.reason||s.block||'Qualified setups receive final price, funds and portfolio checks before submission.');
+ skText('skOperationalTitle',readError?'Retrying the dashboard read':loading?'Opening your Stock desk':dbRetry?'Recovering Stock database':s.halt?'Protection needs attention':s.connected===false?'Kite sign-in required':!s.market_open?'Ready for the next session':cfg.armed?'Watching for the next setup':'Learning with entries paused');
+ skText('skOperationalDetail',dbRetry?s.database.message:!cfg.armed&&cfg.mode==='paper'?'Paper entries are paused. Select Arm entries to start simulated trades; no broker orders are sent.':command.status==='QUEUED'?`${command.action} is queued. Disarm cancels a queued arm request.`:s.execution?.reason||s.block||'Qualified setups receive final price, funds and portfolio checks before submission.');
  skHTML('skWorkerCards',[['scan','Scanner'],['risk','Protection'],['execution','Entries']].map(([key,label])=>{
   const w=workers[key]||{},seconds=w.updated?Math.max(0,(Date.now()-new Date(w.updated).getTime())/1000):null;
   const detail=key==='scan'?s.scan?.phase:key==='execution'?s.execution?.reason:null;

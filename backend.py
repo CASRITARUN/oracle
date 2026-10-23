@@ -475,16 +475,32 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 # Serve ALL dashboard paths through Flask (including / and /index.html).
 # WEBSITE_SECRET_KEY should be a long random value shared by all server workers.
 WEBSITE_PASSWORD = os.environ.get("WEBSITE_PASSWORD", "")
-app.secret_key = os.environ.get("WEBSITE_SECRET_KEY") or secrets.token_hex(32)
+# Keep this private, durable store across deployments. It holds the session
+# revocation generation and, when no environment key is supplied, the signing key.
+_SITE_AUTH_DB = os.environ.get('WEBSITE_AUTH_DB') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'website_auth.sqlite3')
+
+def _site_secret_key():
+    configured=os.environ.get('WEBSITE_SECRET_KEY')
+    if configured:return configured
+    from contextlib import closing
+    fd=os.open(_SITE_AUTH_DB,os.O_CREAT|os.O_RDWR,0o600)
+    os.close(fd);os.chmod(_SITE_AUTH_DB,0o600)
+    # INSERT OR IGNORE chooses one key atomically across concurrent starts.
+    # A failed read must fail startup, never silently rotate everyone's cookies.
+    with closing(sqlite3.connect(_SITE_AUTH_DB,timeout=10)) as connection:
+        with connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS website_signing_key (id INTEGER PRIMARY KEY CHECK(id=1), secret TEXT NOT NULL)')
+            connection.execute('INSERT OR IGNORE INTO website_signing_key VALUES(1,?)',(secrets.token_hex(32),))
+            return connection.execute('SELECT secret FROM website_signing_key WHERE id=1').fetchone()[0]
+
+app.secret_key = _site_secret_key()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("WEBSITE_COOKIE_SECURE", "0") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8), MAX_CONTENT_LENGTH=2 * 1024 * 1024)
 _SITE_FAILURES = {}
 _SITE_LOGIN_LOCK = threading.Lock()
 # A durable, shared session generation revokes signed cookies on every device.
-# Keep this file across deployments; it contains no password or trading data.
-_SITE_AUTH_DB = os.environ.get('WEBSITE_AUTH_DB') or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'website_auth.sqlite3')
 
 def _site_generation(revoke=False):
     from contextlib import closing
@@ -14992,15 +15008,49 @@ class StockDeskEngine(DeskEngine):
             return cfg
 
 # Stock-only runtime. Index keeps the existing StockDeskEngine base unchanged.
-STOCK_RUNTIME_BUILD='2026.10.21-stock-evidence.5'
+STOCK_RUNTIME_BUILD='2026.10.23-stock-connection.6'
 
 class StockRuntimeAdapter(StockDeskAdapter):
+    class _Connection(sqlite3.Connection):
+        # SQLite allows one writer. Queue this process's short ledger writes;
+        # reads (including nested config reads) never take this lock. The broker
+        # request happens outside the durable-intent transaction as before.
+        writer=threading.Lock()
+        _writer_owned=False
+        def _claim(self,sql):
+            command=str(sql).lstrip().upper()
+            if command.split(None,1)[:1] in (['SELECT'],['EXPLAIN']):return
+            if command.startswith('PRAGMA ') and '=' not in command:return
+            if not self._writer_owned:
+                if not self.writer.acquire(timeout=1.5):raise sqlite3.OperationalError('database is locked (Stock writer queue)')
+                self._writer_owned=True
+        def execute(self,sql,parameters=()):
+            self._claim(sql);return super().execute(sql,parameters)
+        def executemany(self,sql,parameters):
+            self._claim(sql);return super().executemany(sql,parameters)
+        def executescript(self,script):
+            self._claim('SCRIPT');return super().executescript(script)
+        def close(self):
+            try:super().close()
+            finally:
+                if self._writer_owned:self._writer_owned=False;self.writer.release()
+    @staticmethod
+    def database_busy(error):
+        if not isinstance(error,sqlite3.OperationalError):return False
+        code=getattr(error,'sqlite_errorcode',None)
+        return (code is not None and code & 255 in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED)) or any(
+            token in str(error).lower() for token in ('database is locked','database table is locked','database schema is locked'))
     @contextmanager
     def db(self):
-        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'stock_options_ai.db'),timeout=1.5)
+        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'stock_options_ai.db'),timeout=1.5,factory=StockRuntimeAdapter._Connection)
         c.row_factory=sqlite3.Row
         try:yield c;c.commit()
-        except Exception:c.rollback();raise
+        except Exception as exc:
+            c.rollback()
+            if StockRuntimeAdapter.database_busy(exc):
+                callback=getattr(self,'on_database_busy',None)
+                if callback:callback(exc)
+            raise
         finally:c.close()
     def __init__(self):
         super().__init__()
@@ -15026,6 +15076,9 @@ class StockRuntimeEngine(StockDeskEngine):
     """Stock-only display/learning isolation with recorded, prospective evidence."""
     OPTION_POLICY_FEATURES=STOCK_SUCCESS_FEATURES+['holding_minutes','minutes_to_square_off']
     def __init__(self,adapter):
+        self.database_recovery=threading.Event();self.database_status={'status':'OK'}
+        self.database_health_lock=threading.Lock();self.database_epoch=0
+        adapter.on_database_busy=self._database_busy
         self.evidence_lock=threading.RLock();self.entry_traces={};self.trace_positions={};self.trace_context={}
         self.trace_dirty=set();self.trade_marks={};self.mark_dirty=set();self.evidence_status={};self._trace_mode=None
         self.operator_pause=threading.Event();self.operator_lock=threading.RLock();self.command_lock=threading.Lock();self.command_epoch=0
@@ -15034,7 +15087,7 @@ class StockRuntimeEngine(StockDeskEngine):
         self.scan_event=threading.Event();self.history_event=threading.Event();self.history_queue_lock=threading.Lock()
         self.history_queue=[];self.history_current=None;self.history_refresh_status={};self.entry_retry={}
         super().__init__(adapter)
-        self.a.entry_paused=self.operator_pause.is_set
+        self.a.entry_paused=lambda:self.operator_pause.is_set() or self.database_recovery.is_set()
         with self.db() as c:
             columns={r[1] for r in c.execute('PRAGMA table_info(desk_observations)')}
             for name,definition in [('outcome_status',"TEXT NOT NULL DEFAULT 'PENDING'"),('historical_prob','REAL'),
@@ -15206,8 +15259,8 @@ class StockRuntimeEngine(StockDeskEngine):
     def _flush_evidence(self):
         # Independent diagnostics worker; no broker calls, training or trading locks.
         with self.evidence_lock:
-            traces={k:json.dumps(self.entry_traces[k]) for k in list(self.trace_dirty)[:128] if k in self.entry_traces}
-            marks={k:json.dumps(self.trade_marks[k]) for k in list(self.mark_dirty)[:128] if k in self.trade_marks}
+            traces={k:json.dumps(self.entry_traces[k]) for k in list(self.trace_dirty)[:32] if k in self.entry_traces}
+            marks={k:json.dumps(self.trade_marks[k]) for k in list(self.mark_dirty)[:32] if k in self.trade_marks}
         if not traces and not marks:return
         try:
             with self.db() as c:
@@ -15397,6 +15450,7 @@ class StockRuntimeEngine(StockDeskEngine):
         return model
     def block(self):
         if self.operator_pause.is_set():return 'Entries disarmed by operator'
+        if getattr(self,'database_recovery',None) and self.database_recovery.is_set():return 'Stock database busy · automatic order/position recovery pending'
         # Refresh training keeps using the frozen champion. Other entry checks still
         # run, including metadata/age checks at final order validation.
         if self.train_lock.locked() and self.model():
@@ -15418,9 +15472,115 @@ class StockRuntimeEngine(StockDeskEngine):
         return isinstance(error,BrokerDeferred) or getattr(error,'code',None)==429 or StockDeskEngine._supervision_transport_error(error)
     @staticmethod
     def _owned_connection_halt(message):
-        return StockDeskEngine._owned_connection_halt(message) or (str(message).startswith('Position supervision error:') and 'Broker request deferred locally' in str(message))
+        return StockDeskEngine._owned_connection_halt(message) or StockRuntimeEngine._owned_database_halt(message) or (str(message).startswith('Position supervision error:') and 'Broker request deferred locally' in str(message))
+    @staticmethod
+    def _owned_database_halt(message):
+        return str(message).startswith('Position supervision error:') and StockRuntimeAdapter.database_busy(sqlite3.OperationalError(str(message)))
+    def _database_busy(self,error):
+        # Memory only: the exception handler must not write to the locked DB.
+        if not hasattr(self,'database_recovery'):self.database_recovery=threading.Event()
+        with self.database_health_lock:
+            self.database_epoch+=1;self.database_recovery.set()
+            self.database_status=dict(status='RETRYING',updated=now_ist().isoformat(),message='Stock database busy; order/position checks will retry automatically.')
+        if hasattr(self,'risk_event'):self.risk_event.set()
+    def reconcile(self):
+        # Stock ledger failures are local/retryable, not broker mismatches.
+        pending=self.rows("SELECT * FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')")
+        if not pending:
+            self.clear_verified_order_halt();return
+        cfg=self.config();today=now_ist().date().isoformat()
+        if cfg.get('auto_start') and cfg.get('armed') and self.get('auto_start_paused_day')!=today and (self.get('halt') or '').startswith(('Broker reconciliation:','Order submission uncertain','Unresolved broker order')):
+            self.put('recovery_resume_day',today)
+        affected={tuple(x) for x in self.get('recovery_contracts',[])}
+        for o in pending:
+            p=self.rows('SELECT exchange,contract FROM desk_positions WHERE id=?',(o['position_id'],))[0]
+            affected.add((p['exchange'],p['contract']))
+        self.put('recovery_contracts',sorted(affected))
+        try:book=self.a.orders()
+        except Exception as e:
+            if type(e).__name__=='BrokerDeferred':return
+            # A book failure does not discard exact-ID history or saved terminal proof.
+            book=[]
+        for o in pending:
+            try:
+                if self.recover_confirmed_rejection(o):continue
+                r=self.broker_match(o,book)
+                if r.get('status') in ('COMPLETE','CANCELLED','REJECTED'):self.put('broker_terminal:'+o['id'],json.loads(json.dumps(r,default=str)))
+                self.apply_order(o['id'],r)
+                # Stock pending-limit supervision owns cancellation and TTL handling.
+            except Exception as e:
+                if StockRuntimeAdapter.database_busy(e):raise
+                if type(e).__name__=='BrokerDeferred':continue
+                if (str(e).startswith('Older unresolved order') or str(e).startswith('Kite order history unavailable')) and self.archive_flat_historical_intent(o):continue
+                if str(e).startswith('Awaiting Kite acknowledgement'):
+                    with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
+                    continue
+                message='Broker reconciliation: '+str(e)
+                prior=self.get('halt') or ''
+                if not prior or prior.startswith(('Broker reconciliation:','Order submission uncertain','Unresolved broker order')):self.put('halt',message)
+                cfg=self.config();today=now_ist().date().isoformat()
+                if cfg.get('auto_start') and cfg.get('armed') and self.get('auto_start_paused_day')!=today:
+                    self.put('recovery_resume_day',today)
+                cfg['armed']=False;self.put('config',cfg)
+                if not cfg.get('auto_start'):self.put('auto_start_paused_day',today)
+                with self.db() as c:c.execute('UPDATE desk_orders SET error=? WHERE id=?',(str(e),o['id']))
+        self.clear_verified_order_halt()
+
     def supervise(self):
-        super().supervise()
+        if time.monotonic()<max(getattr(self,'_supervision_retry_at',0.),getattr(self,'_supervision_next_at',0.)):return
+        if not self.risk_lock.acquire(False):return
+        self._supervision_next_at=time.monotonic()+1.
+        try:
+            with self.database_health_lock:database_epoch=self.database_epoch
+            # A short write-capability probe, committed BEFORE broker I/O. Never
+            # replay a transaction or a broker order after SQLITE_BUSY.
+            with self.db() as c:c.execute('BEGIN IMMEDIATE');c.execute('SELECT 1')
+            self.reconcile();self.verify_positions()
+            if getattr(self,'position_verification_deferred',False):
+                if self.a.market_open() and not self.mismatches:self.maintain_pending_limits()
+                return
+            prior=self.get('halt') or ''
+            pending=self.rows("SELECT id FROM desk_orders WHERE mode='live' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN') LIMIT 1")
+            recover=bool(self._owned_connection_halt(prior) and not self.mismatches and not pending)
+            if recover:
+                # Paper-only DB recovery needs no live holdings request. A live
+                # connection halt still needs fresh broker proof when locally flat.
+                if not any(p['mode']=='live' for p in self.active()) and (not self._owned_database_halt(prior) or self.config()['mode']=='live'):self.a.holdings()
+            if self.get('close_requested'):
+                for o in self.rows("SELECT * FROM desk_orders WHERE mode='live' AND side='BUY' AND status NOT IN ('COMPLETE','CANCELLED','REJECTED','HISTORICAL_UNKNOWN')"):
+                    if o.get('broker_id'):
+                        try:self.a.cancel(o['broker_id'])
+                        except Exception as exc:self.record_trade(o['position_id'],'CANCEL_DEFERRED',dict(reason=str(exc)))
+            if self.a.market_open():self.manage(close_all=bool(self.get('close_requested')))
+            if self.a.market_open() and not self.mismatches:self.maintain_pending_limits()
+            # Clear only the exact owned halt after the whole pass succeeds.
+            # Compare-and-set preserves a concurrent daily/operator/reconciliation halt.
+            if recover:
+                with self.db() as c:c.execute("UPDATE desk_meta SET value='null' WHERE key='halt' AND value=?",(json.dumps(prior),))
+            with self.database_health_lock:
+                was_busy=self.database_recovery.is_set()
+                if self.database_epoch==database_epoch:
+                    self.database_recovery.clear();self.database_status=dict(status='OK',updated=now_ist().isoformat())
+            self._supervision_failures=0;self._supervision_retry_at=0.
+            if recover or was_busy:self.execution_event.set()
+        except Exception as exc:
+            self._supervision_failures=min(4,getattr(self,'_supervision_failures',0)+1)
+            busy=StockRuntimeAdapter.database_busy(exc)
+            transient=busy or self._supervision_transport_error(exc)
+            delay=min(5,2**(self._supervision_failures-1)) if busy else min(30,5*2**(self._supervision_failures-1))
+            self._supervision_retry_at=time.monotonic()+delay
+            if busy:self._database_busy(exc)
+            else:
+                try:
+                    prior=self.get('halt') or ''
+                    if not prior or self._owned_connection_halt(prior):
+                        self.put('halt',('Position supervision temporarily unavailable: automatic retry in '+str(delay)+' seconds. ' if transient else 'Position supervision error: ')+str(exc))
+                    self.event('CONNECTION_RETRY' if transient else 'ERROR',str(exc))
+                except Exception as recording_error:
+                    if StockRuntimeAdapter.database_busy(recording_error):self._database_busy(recording_error)
+                    else:logger.exception('Stock supervision failure could not be recorded')
+            return
+        finally:self.risk_lock.release()
         # Display snapshots are produced by the worker, never by a browser read.
         manager=getattr(self,'shared_risk',None)
         if manager and time.monotonic()>=getattr(self,'_display_risk_at',0.) and manager.lock.acquire(False):
@@ -16437,6 +16597,7 @@ class StockRuntimeEngine(StockDeskEngine):
         elif risk_age is None or risk_age>15:block=block or 'Risk supervisor status is delayed; execution performs its own checks'
         if meta.get('close_requested'):block='Close requested · positions remain supervised'
         if self.operator_pause.is_set():block='Entries disarmed by operator'
+        if self.database_recovery.is_set():block=block or 'Stock database busy · automatic order/position recovery pending'
         self.display_signals(signals,cfg,active,block)
         scan=dict(self.scan_status)
         scan.update(ready=sum(s.get('decision')=='READY' for s in signals),
@@ -16471,7 +16632,7 @@ class StockRuntimeEngine(StockDeskEngine):
             observations=learning.get('observations',{}),training=dict(self.training),last_cycle=self.last_cycle,
             universe=meta.get('stock_universe_info') or {},scan=scan,watchlist=list(self.a.symbols),history_refresh=dict(self.history_refresh_status),
             ban_status=self.ban_error or 'Daily list checked',execution=dict(self.execution_status),
-            execution_traces=[t for t in traces if t],evidence_recorder=dict(self.evidence_status),
+            execution_traces=[t for t in traces if t],evidence_recorder=dict(self.evidence_status),database=dict(self.database_status),
             option_model_review=meta.get('stock_option_review:'+mode),option_rollback_available=rollback_available,
             success_model=sm,live_success_model=sm,historical_success_model=hm,historical_archive=archive,
             success_selector_status='DIRECTION + '+mode.upper()+' OPTION EVIDENCE' if sm and sm.get('valid') else 'DIRECTION + LIQUIDITY / LEARNING',
