@@ -76,6 +76,17 @@ with tempfile.TemporaryDirectory() as path:
         refreshed=client.get('/api/stock-ai/state').get_json()
         assert refreshed['dashboard']['stale'] or refreshed['config']['armed'] is False
         assert client.get('/api/system-health').status_code==200
+        # Active Index uses its independent ledger and the new trade-local policy.
+        app.INDEX_OPTIONS_DESK.a.market_open=lambda:False
+        index_state=app.INDEX_OPTIONS_DESK.state()
+        assert index_state['runtime_build']=='2026.10.24-index-independent.1'
+        assert index_state['sizing_policy']['basis']=='trade-independent-v2'
+        assert index_state['database']['status']=='OK'
+        assert index_state['config']['armed'] is False and index_state['config']['mode']=='paper'
+        assert app.INDEX_OPTIONS_DESK.shared_risk is app.INDEX_RISK
+        assert app.INDEX_RISK is not app.STOCK_RISK
+        json.dumps(index_state,allow_nan=False)
+        Path(__file__).with_name('index_smoke_state.json').write_text(json.dumps(index_state))
         csrf=auth.get_json()['csrf'];generation=app._site_generation()
         lock=client.post('/website-logout',headers={'X-Website-CSRF':csrf})
         assert lock.status_code==200 and lock.get_json()['locked']

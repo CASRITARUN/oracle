@@ -137,9 +137,13 @@ class ExecutionTests(unittest.TestCase):
         s=self.e.state();self.assertEqual(s['scan']['ready'],1);self.assertEqual(s['scan']['fresh_universe'],1)
         self.e.signals['TEST']['ts']=(old.clock.now-timedelta(minutes=2)).isoformat()
         s=self.e.state();self.assertEqual(s['scan']['ready'],0);self.assertEqual(s['signals'][0]['decision'],'WAIT')
-    def test_index_has_no_stock_history_filter(self):
+    def test_index_unsent_filter_uses_its_own_proof(self):
         index=old.engine(self.tmp.name+'/index.db','index')
-        self.assertFalse(hasattr(index,'entry_history'))
+        old.position(index,status='CANCELLED')
+        index.put('stock_unsent_plan:p',True)
+        self.assertEqual(len(index.entry_history('NIFTY')),1)
+        index.put('index_unsent_plan:p',True)
+        self.assertEqual(index.entry_history('NIFTY'),[])
     def test_auth_read_is_nonwriting_and_revocation_is_still_immediate(self):
         local=dict(sqlite3=sqlite3,secrets=secrets,_SITE_AUTH_DB=self.tmp.name+'/auth.db')
         node=next(n for n in old.tree.body if isinstance(n,ast.FunctionDef) and n.name=='_site_generation')

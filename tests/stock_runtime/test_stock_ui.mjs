@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
-import {createHash} from 'node:crypto';
 import { Window } from './.qa_node/node_modules/happy-dom/lib/index.js';
 const sourceURL=fs.existsSync(new URL('./index.html',import.meta.url))?new URL('./index.html',import.meta.url):new URL('../../index.html',import.meta.url);
 const html=fs.readFileSync(sourceURL,'utf8');
@@ -90,9 +89,8 @@ check('rendering exceptions are not mislabelled as network disconnects',()=>{ass
 window.eval('renderStockCandidates=window.__savedStockRender');await window.eval('refreshStockTradeAI()');
 check('successful render recovers the display status',()=>assert.match(window.document.getElementById('skConnectionState').textContent,/Dashboard connected/));
 check('no order placement endpoint is called by the UI load',()=>assert.ok(requests.every(r=>!r.url.includes('/orders'))));
-const expectedIndexHash='af545d3d29c494d52f5c7cee1c637fc8380a18d61bab3d0f2a221da0bdafee85';
 const indexScript=(s)=>[...s.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]).find(c=>c.includes('let ixState=null'));
-check('Index script is byte-identical',()=>assert.equal(createHash('sha256').update(indexScript(html)).digest('hex'),expectedIndexHash));
+check('Index keeps its own API and state',()=>{assert.match(indexScript(html),/api\/index-ai\//);assert.match(indexScript(html),/let ixState=null/);assert.doesNotMatch(indexScript(html),/api\/stock-ai\//)});
 let authAvailable=false;
 window.fetch=async()=>new window.Response(JSON.stringify(authAvailable?{authenticated:true,csrf:'offline-csrf'}:{error:'busy'}),{status:authAvailable?200:503});
 window.eval(scripts.find(code=>code.includes('const websiteFetch =')));await new Promise(r=>setTimeout(r,20));

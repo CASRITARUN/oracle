@@ -66,8 +66,8 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 # this process starts) — do NOT hardcode real keys/secrets directly in this file,
 # especially if this file is ever shared, committed to git, or pasted anywhere.
 # ---------------------------------------------------------------------------
-API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
-API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
+API_KEY = os.environ.get("KITE_API_KEY", '')
+API_SECRET = os.environ.get("KITE_API_SECRET", '')
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
 # If your network does TLS interception (common on office/government networks — you'll see
@@ -12774,15 +12774,21 @@ def _build_desk_engine_class():
                         return
                 active=self.active()
                 if len(active)>=cfg['max_positions'] or any(p['symbol']==s['symbol'] for p in active):return
-                recent=(self.entry_history(s['symbol'])[:1] if getattr(self,'desk_name','')=='stock' and hasattr(self,'entry_history') else
+                recent=(self.entry_history(s['symbol'])[:1] if (getattr(self,'desk_name','')=='stock' or getattr(self,'independent_trade_sizing',False)) and hasattr(self,'entry_history') else
                     self.rows('SELECT ts,exit_ts FROM desk_positions WHERE symbol=? ORDER BY ts DESC LIMIT 1',(s['symbol'],)))
                 if cfg['cooldown']>0 and recent and (datetime.now(IST)-dt(recent[0]['exit_ts'] or recent[0]['ts'])).total_seconds()<cfg['cooldown']*60:return
                 s=dict(s);s['risk_config_at_entry']={k:cfg.get(k) for k in ('risk','capital','daily_loss','max_positions','cooldown','lots','stop_pct','reward_r','max_hold','square_off','live_override','confidence')}
                 if (s.get('risk_plan') or {}).get('policy')=='adaptive-v1':
                     plan=s['risk_plan'];s['risk_config_at_entry'].update(adaptive_risk=True,risk=plan.get('admitted_risk_budget',plan['risk_budget']),stop_pct=plan['stop_pct'],reward_r=plan['reward_r'],lots=s['lots'])
                 pid=uuid.uuid4().hex;entry=s['entry'];qty=s['qty'];risk=(entry-s['stop'])*qty
-                with self.db() as c:c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
+                with self.db() as c:
+                    c.execute('INSERT INTO desk_positions(id,ts,symbol,mode,contract,exchange,lot,stop,target,risk,status,setup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (pid,stamp(),s['symbol'],cfg['mode'],s['contract'],s['exchange'],s['lot'],s['stop'],s['target'],risk,'ENTRY_PENDING',json.dumps(s)))
+                    if getattr(self,'independent_trade_sizing',False):
+                        # This version guarantees a committed desk_orders intent
+                        # before every broker submission. Recovery can identify an
+                        # interrupted local plan without guessing about old orders.
+                        c.execute('INSERT INTO desk_meta(key,value) VALUES(?,?)',('index_durable_intent_v1:'+pid,'true'))
                 if guard and guard.config()['one_trade_per_arm']:
                     if getattr(self,'desk_name','') in ('stock','index'):disarm_after_attempt=True
                     else:
@@ -13692,7 +13698,7 @@ class StockDeskEngine(DeskEngine):
         if not hasattr(self,'shared_risk'):raise ValueError('Daily risk supervisor unavailable')
         view=self.shared_risk.snapshot(cfg['mode'])
         if view['entry_block']:raise ValueError(view['entry_block'])
-        if getattr(self,'desk_name','')=='stock':return None  # Gate only; never a sizing input.
+        if getattr(self,'desk_name','')=='stock' or getattr(self,'independent_trade_sizing',False):return None  # Gate only; never a sizing input.
         remaining=min(float(view['remaining']),max(0.,cfg['daily_loss']+
             float(view['desk_totals'].get(self.desk_name,0))-float(view['desk_reserved'].get(self.desk_name,0))))
         return remaining
@@ -13888,15 +13894,23 @@ class StockDeskEngine(DeskEngine):
             ranges.append(max(high-low,abs(high-close),abs(low-close)))
         atr=sum(ranges)/len(ranges)
         entry=round(math.ceil((q['ask']*(1+cfg['slippage_bps']/10000)-1e-9)/tick)*tick,2)
-        independent=getattr(self,'desk_name','')=='stock'
+        independent=getattr(self,'desk_name','')=='stock' or getattr(self,'independent_trade_sizing',False)
         atr_multiple=1.25+.5*strength if independent else 1.5
         distance=max(abs(float(s['option_delta']))*atr*atr_multiple,entry*.05,3*(q['ask']-q['bid']),2*tick)
         if not math.isfinite(distance) or distance>entry*.30:raise ValueError('Volatility/liquidity requires a stop over 30% of premium; choose another contract')
         fees=2*cfg['fee_per_order'];one_lot=distance*lot+fees
-        # Stock trade stops and quantities do not consume a daily loss allocation.
-        # Index retains its own existing allocation policy.
+        # Independent trades have no daily-loss allocation. The daily supervisor
+        # remains an entry/exit circuit breaker, never a stop or quantity input.
         budget=None if independent else remaining*(.20+.20*strength)
-        if independent:
+        if getattr(self,'independent_trade_sizing',False):
+            # Index capital remains its own cash pool. Already deployed premium
+            # and actual live broker funds limit cash, not the daily-loss headroom.
+            committed=sum(max(0.,float(p['entry']))*int(p['qty']) for p in self.active() if p['mode']==cfg['mode'])
+            ceiling=max(0.,float(cfg['capital'])-committed)
+            if cfg['mode']=='live':
+                if funds is None or not math.isfinite(float(funds)) or funds<0:raise ValueError('Valid broker available funds required')
+                ceiling=min(ceiling,float(funds))
+        elif independent:
             if cfg['mode']=='live':
                 if funds is None or not math.isfinite(float(funds)) or funds<0:raise ValueError('Valid broker available funds required')
                 ceiling=float(funds)
@@ -13917,14 +13931,14 @@ class StockDeskEngine(DeskEngine):
             sized['size_reason']=f"Adaptive daily-risk allocation ₹{budget:,.0f}; one lot requires ₹{one_lot:,.0f}; daily risk remaining ₹{remaining:,.0f}"
         sized['risk_plan']=dict(policy='adaptive-v1',strength=round(strength,4),confidence=confidence,
             underlying_atr=atr,stop_distance=distance,stop_pct=100*distance/entry,reward_r=reward,
-            capital_fraction=capital_share,capital_allocation=allocation,remaining_daily_risk=remaining,
+            capital_fraction=capital_share,capital_allocation=allocation,remaining_daily_risk=None if independent else remaining,
             risk_budget=budget,planned_loss=distance*sized['qty']+fees if sized['qty'] else 0,
             initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=bool(independent and allocation>ceiling*capital_share),quality=quality,
             sizing_basis='trade-independent-v2' if independent else 'daily-allocation-v1',
             atr_multiple=atr_multiple,available_cash=ceiling,
             note='Trade-local planned loss including estimated costs; separate daily stops can request all exits' if independent else 'Estimated stop loss including fees; gaps and fills can exceed the plan')
         self.fit_costed_size(sized,budget,allocation,lot)
-        diagnostic=self.sizing_diagnostics(sized,lot,budget,allocation,remaining,funds)
+        diagnostic=self.sizing_diagnostics(sized,lot,budget,allocation,None if independent else remaining,funds)
         sized['sizing_diagnostics']=diagnostic
         sized['one_lot_premium']=diagnostic['one_lot_cash_required']
         sized['one_lot_risk']=diagnostic['one_lot_loss_with_costs']
@@ -14205,6 +14219,7 @@ class StockDeskEngine(DeskEngine):
         return refreshed,setup['qty'],setup['entry']
     def reprice_index_entry(self,p):
         if p['qty'] or p['status']!='ENTRY_PENDING' or self.rows('SELECT id FROM desk_orders WHERE position_id=?',(p['id'],)):return None
+        if getattr(self,'database_recovery',None) and self.database_recovery.is_set():raise ValueError('Index database recovery pending; order not sent')
         setup=json.loads(p.get('setup') or '{}');cfg=self.config();quality=self.model_quality()
         if cfg['mode']=='live' and not quality['live_ok']:raise ValueError('Model quality changed before entry')
         setup['model_quality']=quality;setup['underlying_check']=self.check_underlying(setup)
@@ -14215,9 +14230,11 @@ class StockDeskEngine(DeskEngine):
         if block and 'Unresolved entry/exit order' not in block and 'open-position limit reached' not in block:raise ValueError(block)
         if any(x['id']!=p['id'] and x['mode']==p['mode'] and x['status'] in ('ENTRY_PENDING','EXIT_PENDING') for x in self.active()):raise ValueError('Another order is unresolved')
         if self.mismatches or getattr(self,'position_verification_deferred',False):raise ValueError('Broker quantities need reconciliation')
-        # Exclude only this still-unsent intent's own reservation, not other exposure.
-        own_reserved=max(0,int(setup['qty']))*max(0,float(setup['entry'])-p['stop'])+self.trade_cost(setup['entry'],setup['target'],int(setup['qty']))
-        remaining=min(float(view['remaining'])+own_reserved,max(0.,cfg['daily_loss']+view['desk_totals']['index']-view['desk_reserved']['index']+own_reserved))
+        remaining=None
+        if not getattr(self,'independent_trade_sizing',False):
+            # Legacy allocation excludes only this still-unsent intent's reservation.
+            own_reserved=max(0,int(setup['qty']))*max(0,float(setup['entry'])-p['stop'])+self.trade_cost(setup['entry'],setup['target'],int(setup['qty']))
+            remaining=min(float(view['remaining'])+own_reserved,max(0.,cfg['daily_loss']+view['desk_totals']['index']-view['desk_reserved']['index']+own_reserved))
         q,err=self.a.quote_batch(p['exchange'],[p['contract']],bypass_cache=True).get(p['contract'],(None,'Missing final quote'))
         if err or not self.entry_quote_fresh(q or {}):raise ValueError(err or 'Fresh final option quote unavailable')
         if q.get('spread_pct') is None or not 0<=q['spread_pct']<=cfg['max_spread']:raise ValueError('Fresh spread exceeds configured limit')
@@ -14225,7 +14242,8 @@ class StockDeskEngine(DeskEngine):
         setup.update(spread=q['spread_pct'],bid=q['bid'],ask=q['ask']);self._apply_success_intelligence(setup)
         if setup['qty']<=0 or not self.entry_quality_gate(setup):raise ValueError(setup.get('size_reason') or setup.get('reason') or 'No executable lot')
         setup['execution_reprice']=dict(ask=q['ask'],quote_ts=q.get('quote_ts'),limit=setup['entry'],qty=setup['qty'],source=q.get('source','Fresh broker quote'))
-        setup['risk_config_at_entry']=dict(cfg,stop_pct=setup['risk_plan']['stop_pct'],reward_r=setup['risk_plan']['reward_r'],lots=setup['lots'])
+        setup['risk_config_at_entry']=dict(cfg,risk=None if getattr(self,'independent_trade_sizing',False) else setup['risk_plan']['risk_budget'],
+            capital=setup['risk_plan']['capital_allocation'],stop_pct=setup['risk_plan']['stop_pct'],reward_r=setup['risk_plan']['reward_r'],lots=setup['lots'])
         if not self.a.market_open() or now_ist().strftime('%H:%M')>=cfg['square_off']:raise ValueError('Entry window closed during refresh')
         if view['positions']>cfg['max_positions'] or not self.entry_quote_fresh(q):raise ValueError('Entry limit or quote changed during checks')
         with self.db() as c:
@@ -14241,7 +14259,10 @@ class StockDeskEngine(DeskEngine):
                 if repriced is None:return
                 p,qty,price=repriced
             except Exception as exc:
-                with self.db() as c:c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0 AND status='ENTRY_PENDING' AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=?)",(str(exc),p['id'],p['id']))
+                with self.db() as c:
+                    changed=c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=? AND qty=0 AND status='ENTRY_PENDING' AND NOT EXISTS (SELECT 1 FROM desk_orders WHERE position_id=?)",(str(exc),p['id'],p['id'])).rowcount
+                    if changed and getattr(self,'independent_trade_sizing',False):
+                        c.execute('INSERT OR REPLACE INTO desk_meta(key,value) VALUES(?,?)',('index_unsent_plan:'+p['id'],'true'))
                 self.signals[p['symbol']]=dict(self.signals.get(p['symbol'],{}),decision='WAIT',reason=str(exc))
                 self.event('WAIT',str(exc),p['symbol']);return
             return super().submit(p,side,qty,price,reason)
@@ -15016,13 +15037,14 @@ class StockRuntimeAdapter(StockDeskAdapter):
         # reads (including nested config reads) never take this lock. The broker
         # request happens outside the durable-intent transaction as before.
         writer=threading.Lock()
+        ledger_name='Stock'
         _writer_owned=False
         def _claim(self,sql):
             command=str(sql).lstrip().upper()
             if command.split(None,1)[:1] in (['SELECT'],['EXPLAIN']):return
             if command.startswith('PRAGMA ') and '=' not in command:return
             if not self._writer_owned:
-                if not self.writer.acquire(timeout=1.5):raise sqlite3.OperationalError('database is locked (Stock writer queue)')
+                if not self.writer.acquire(timeout=1.5):raise sqlite3.OperationalError('database is locked ('+self.ledger_name+' writer queue)')
                 self._writer_owned=True
         def execute(self,sql,parameters=()):
             self._claim(sql);return super().execute(sql,parameters)
@@ -15481,7 +15503,8 @@ class StockRuntimeEngine(StockDeskEngine):
         if not hasattr(self,'database_recovery'):self.database_recovery=threading.Event()
         with self.database_health_lock:
             self.database_epoch+=1;self.database_recovery.set()
-            self.database_status=dict(status='RETRYING',updated=now_ist().isoformat(),message='Stock database busy; order/position checks will retry automatically.')
+            desk=getattr(self,'desk_name','stock').title()
+            self.database_status=dict(status='RETRYING',updated=now_ist().isoformat(),message=desk+' database busy; order/position checks will retry automatically.')
         if hasattr(self,'risk_event'):self.risk_event.set()
     def reconcile(self):
         # Stock ledger failures are local/retryable, not broker mismatches.
@@ -15578,7 +15601,7 @@ class StockRuntimeEngine(StockDeskEngine):
                     self.event('CONNECTION_RETRY' if transient else 'ERROR',str(exc))
                 except Exception as recording_error:
                     if StockRuntimeAdapter.database_busy(recording_error):self._database_busy(recording_error)
-                    else:logger.exception('Stock supervision failure could not be recorded')
+                    else:logger.exception('%s supervision failure could not be recorded',getattr(self,'desk_name','stock'))
             return
         finally:self.risk_lock.release()
         # Display snapshots are produced by the worker, never by a browser read.
@@ -15587,7 +15610,7 @@ class StockRuntimeEngine(StockDeskEngine):
             try:
                 self._display_risk_at=time.monotonic()+3
                 display=dict(config=manager.config(),states={mode:manager.snapshot(mode) for mode in ('paper','live')},
-                    timestamp=now_ist().isoformat(),scope='Stock only',broker=BROKER_GATE.status())
+                    timestamp=now_ist().isoformat(),scope=getattr(self,'desk_name','stock').title()+' only',broker=BROKER_GATE.status())
                 for view in display['states'].values():view.pop('closed',None)
                 self.risk_display=display  # Publish only after construction; readers see one complete object.
             finally:manager.lock.release()
@@ -16963,14 +16986,29 @@ def stock_ai_control(action):
 # New Index Options desk. Reuses Stock AI's execution primitives, not the retired
 # IndexAdvancedDeskEngine. Its DB owns all configuration, models, orders and risk.
 class IndexOptionsAdapter(StockDeskAdapter):
+    class _Connection(StockRuntimeAdapter._Connection):
+        # Separate queue and file: a Stock writer cannot block the Index writer.
+        writer=threading.Lock()
+        ledger_name='Index'
+    def __init__(self):
+        super().__init__()
+        with self.db() as c:c.execute('PRAGMA journal_mode=WAL')
     @contextmanager
     def db(self):
-        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'index_options_ai_v1.db'),timeout=30)
+        c=sqlite3.connect(os.path.join(os.path.dirname(__file__),'index_options_ai_v1.db'),timeout=1.5,factory=self._Connection)
         c.row_factory=sqlite3.Row
-        try:
-            c.execute('PRAGMA journal_mode=WAL');yield c;c.commit()
-        except Exception:c.rollback();raise
+        try:yield c;c.commit()
+        except Exception as exc:
+            c.rollback()
+            if StockRuntimeAdapter.database_busy(exc):
+                callback=getattr(self,'on_database_busy',None)
+                if callback:callback(exc)
+            raise
         finally:c.close()
+    def place(self,exchange,contract,side,qty,price,tag):
+        if side=='BUY' and getattr(self,'entry_paused',lambda:False)():
+            raise BrokerDeferred('Index entry paused locally before broker submission; no request was sent.')
+        return super().place(exchange,contract,side,qty,price,tag)
     def spot_key(self,symbol):return INDEX_SYMBOLS[symbol]
     def chain(self,symbol):
         exchange,opts=get_option_instruments_for_symbol(symbol)
@@ -16986,10 +17024,121 @@ class IndexOptionsAdapter(StockDeskAdapter):
 
 class IndexOptionsEngine(StockDeskEngine):
     UNIVERSE=('NIFTY','BANKNIFTY','FINNIFTY','SENSEX')
+    independent_trade_sizing=True
     def __init__(self,adapter):
+        self.desk_name='index';self.database_recovery=threading.Event()
+        self.database_status={'status':'OK'};self.database_health_lock=threading.Lock();self.database_epoch=0
+        self.entry_retry={};adapter.on_database_busy=self._database_busy
         super().__init__(adapter)
+        self.a.entry_paused=self.database_recovery.is_set
         self.a.symbols=self.UNIVERSE
         self.scan_status.update(total=len(self.UNIVERSE))
+    def config(self):
+        # All new Index entries use trade-local stops; persisted legacy fixed-risk
+        # settings cannot silently select the old daily-allocation branch.
+        return dict(super().config(),adaptive_risk=True,lots=0)
+    def block(self):
+        if getattr(self,'database_recovery',None) and self.database_recovery.is_set():return 'Index database busy · automatic order/position recovery pending'
+        return super().block()
+    # Reuse only proven transport/ledger recovery, never Stock models, risk
+    # settings, portfolio limits, data files or worker schedules.
+    @staticmethod
+    def _supervision_transport_error(error):return StockRuntimeEngine._supervision_transport_error(error)
+    @staticmethod
+    def _owned_connection_halt(message):return StockRuntimeEngine._owned_connection_halt(message)
+    @staticmethod
+    def _owned_database_halt(message):return StockRuntimeEngine._owned_database_halt(message)
+    def _database_busy(self,error):return StockRuntimeEngine._database_busy(self,error)
+    def reconcile(self):
+        self._recover_unsent_plans()
+        return StockRuntimeEngine.reconcile(self)
+    def supervise(self):return StockRuntimeEngine.supervise(self)
+    def _recover_unsent_plans(self):
+        # Never race an entry worker or touch a legacy/acknowledged/uncertain
+        # order. Only our versioned local plan with NO durable order can qualify.
+        if not self.entry_lock.acquire(False):return
+        try:
+            with self.db() as c:
+                c.execute('BEGIN IMMEDIATE')
+                rows=c.execute("""SELECT p.id,p.symbol FROM desk_positions p
+                    WHERE p.status='ENTRY_PENDING' AND p.qty=0 AND p.pnl=0 AND p.fees=0
+                    AND EXISTS(SELECT 1 FROM desk_meta m WHERE m.key='index_durable_intent_v1:'||p.id AND m.value='true')
+                    AND NOT EXISTS(SELECT 1 FROM desk_orders o WHERE o.position_id=p.id)""").fetchall()
+                for p in rows:
+                    c.execute("UPDATE desk_positions SET status='CANCELLED',exit_reason=? WHERE id=?",('Local plan interrupted before order submission; fresh checks queued',p['id']))
+                    c.execute('INSERT OR REPLACE INTO desk_meta(key,value) VALUES(?,?)',('index_unsent_plan:'+p['id'],'true'))
+            if rows:self.execution_event.set()
+        finally:self.entry_lock.release()
+    def entry_history(self,symbol,day=None):
+        # A cancelled *unsent* plan is not a trade. Preserve the audit row, while
+        # still counting any order intent, fill, rejection or uncertain submission.
+        sql="""SELECT p.* FROM desk_positions p WHERE p.symbol=? AND p.mode=?
+            AND NOT (p.status='CANCELLED' AND COALESCE(p.qty,-1)=0 AND COALESCE(p.pnl,-1)=0 AND COALESCE(p.fees,-1)=0
+                AND EXISTS(SELECT 1 FROM desk_meta m WHERE m.key='index_unsent_plan:'||p.id AND m.value='true')
+                AND NOT EXISTS(SELECT 1 FROM desk_orders o WHERE o.position_id=p.id))"""
+        args=[symbol,self.config()['mode']]
+        if day:sql+=' AND p.ts LIKE ?';args.append(day+'%')
+        return self.rows(sql+' ORDER BY p.ts DESC',args)
+
+    def enter(self,s):
+        cfg=self.config();recent=self.entry_history(s['symbol'])[:1]
+        stamp=_ai_ts_naive(recent[0].get('exit_ts') or recent[0]['ts']) if recent else None
+        if cfg['cooldown']>0 and stamp and (now_ist()-stamp).total_seconds()<cfg['cooldown']*60:
+            self.signals[s['symbol']]=dict(s,decision='WAIT',reason='Re-entry cooldown active; waiting for the configured interval');return
+        return super().enter(s)
+    def execute_candidates(self):
+        if not self.entry_lock.acquire(False):return
+        try:
+            with self.candidate_lock:candidates=[dict(s) for s in self.execution_candidates];generation=self.execution_generation
+            candidates.sort(key=lambda s:float(s.get('rank_score') or 0),reverse=True)
+            status=dict(generation=generation,count=len(candidates),updated=now_ist().isoformat(),mode=self.config()['mode'])
+            names={c['symbol'] for c in candidates}
+            self.entry_retry={k:v for k,v in self.entry_retry.items() if k in names}
+            blocker=self.block()
+            if blocker or self.get('close_requested'):
+                for retry in self.entry_retry.values():retry['at']=max(retry.get('at',0),time.monotonic()+5.)
+                self.execution_status=dict(status,status='PAUSED',reason=blocker or 'Close requested');return
+            if not candidates:
+                self.execution_status=dict(status,status='NO READY CANDIDATE',reason='Waiting for a fresh qualifying setup');return
+            outcomes=[]
+            for seed in candidates:
+                symbol=seed['symbol']
+                if symbol not in self.a.symbols:continue
+                active=self.active();cfg=self.config()
+                if any(p['symbol']==symbol for p in active):self.entry_retry.pop(symbol,None);continue
+                if len(active)>=cfg['max_positions']:
+                    outcomes.append(dict(symbol=symbol,status='WAIT',reason='Maximum active positions reached'));break
+                blocker=self.block()
+                if blocker:
+                    outcomes.append(dict(symbol=symbol,status='WAIT',reason=blocker));break
+                key=(cfg['mode'],seed.get('bar_ts'),seed.get('model_id'),seed.get('direction'))
+                retry=self.entry_retry.get(symbol,{})
+                if retry.get('key')==key and time.monotonic()<retry.get('at',0):
+                    outcomes.append(dict(symbol=symbol,status='WAIT',reason=retry['reason']));continue
+                self.execution_status=dict(status,status='CHECKING ENTRY',best=symbol,reason='Rechecking current price and entry controls')
+                try:self.enter(seed)
+                except Exception as exc:
+                    self.signals[symbol]=dict(seed,decision='WAIT',reason='Entry check: '+str(exc))
+                    self.event('ERROR','Index execution: '+str(exc),symbol)
+                position=next((p for p in self.active() if p['symbol']==symbol),None)
+                if position:
+                    self.entry_retry.pop(symbol,None)
+                    outcome=dict(symbol=symbol,status=position['status'],reason='Paper entry recorded' if position['mode']=='paper' and position['qty']>0 else 'Order recorded; awaiting broker confirmation' if position['status']=='ENTRY_PENDING' else 'Position is open')
+                else:
+                    reason=self.block() or self.signals.get(symbol,{}).get('reason') or 'Entry deferred; fresh checks will retry'
+                    if self.signals.get(symbol,{}).get('decision')=='READY' and not self.block():reason='Entry deferred by position, cooldown or order checks; retrying'
+                    # Never retransmit a recorded order. The existing entry checks
+                    # and reconciliation own any order intent, including UNKNOWN.
+                    attempts=int(retry.get('attempts',0))+1 if retry.get('key')==key else 1
+                    delay=min(10.,2.*attempts)
+                    self.entry_retry[symbol]=dict(key=key,at=time.monotonic()+delay,attempts=attempts,reason=reason)
+                    outcome=dict(symbol=symbol,status='WAIT',reason=reason,retry_seconds=delay)
+                outcomes.append(outcome)
+            self.entry_retry={k:dict(v,at=max(v.get('at',0),time.monotonic()+1.)) for k,v in self.entry_retry.items() if k in names}
+            last=outcomes[-1] if outcomes else dict(status='POSITION ACTIVE',reason='Candidates already have active positions')
+            self.execution_status=dict(status,status=last['status'],reason=last['reason'],outcomes=outcomes)
+        finally:self.entry_lock.release()
+
     def _install_stock_automation(self):
         if self.get('index_options_engine_v1'):return
         cfg=self.config()
@@ -17067,11 +17216,18 @@ class IndexOptionsEngine(StockDeskEngine):
             while not self.stop_event.is_set():
                 self.execution_event.wait(1)
                 if self.stop_event.is_set():break
-                if self.execution_event.is_set():self.execution_event.clear();self._worker_tick('execution',self.execute_candidates)
+                due=any(time.monotonic()>=r.get('at',float('inf')) for r in list(self.entry_retry.values()))
+                if self.execution_event.is_set() or due:
+                    self.execution_event.clear();self._worker_tick('execution',self.execute_candidates)
         for target,name in ((scan_loop,'scan'),(risk_loop,'risk'),(execution_loop,'execution')):
             threading.Thread(target=target,daemon=True,name='independent-index-'+name).start()
     def state(self):
         s=super().state();quality=self.model_quality()
+        s['signals']=StockRuntimeEngine.display_signals(self,s.get('signals',[]),s['config'],s.get('positions',[]),s.get('block'))
+        s['database']=dict(self.database_status)
+        s['sizing_policy']=dict(basis='trade-independent-v2',daily_loss_role='Desk circuit breaker only; does not set stop, target or quantity',
+            cash_role='Index cash budget less deployed premium, bounded by broker available funds in live mode',
+            stop_basis='Completed-candle ATR, option delta, confidence and bid/ask spread',target_basis='Trade stop distance and confidence')
         reasons={}
         for signal in s.get('signals',[]):
             if signal.get('decision')!='READY':
@@ -17080,7 +17236,7 @@ class IndexOptionsEngine(StockDeskEngine):
         s['entry_diagnostics']=dict(block=s.get('block'),close_requested=bool(self.get('close_requested')),
             armed=bool(self.config()['armed']),model_available=bool(s.get('model')),candidate_reasons=reasons,workers=workers,
             note='Paper also requires arming and a trained model. Live additionally requires model validation and paper evidence or its explicit override.')
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.10.12-execution-quality.11',
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.10.24-index-independent.1',
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
@@ -18440,6 +18596,12 @@ class SharedAIRisk:
             total=0.;reserved=0.;active=[];closed=[];attempts=0;missing=[];long_quote_gap=[];pending=[];desk_totals={};desk_reserved={}
             for name,e in self.engines.items():
                 rows=e.rows("SELECT * FROM desk_positions WHERE mode=? AND (ts LIKE ? OR exit_ts LIKE ? OR status IN ('OPEN','ENTRY_PENDING','EXIT_PENDING'))",(mode,today+'%',today+'%'))
+                if getattr(e,'independent_trade_sizing',False):
+                    unsent={p['id'] for p in e.rows("""SELECT p.id FROM desk_positions p
+                        WHERE p.mode=? AND p.ts LIKE ? AND p.status='CANCELLED' AND p.qty=0 AND p.pnl=0 AND p.fees=0
+                        AND EXISTS(SELECT 1 FROM desk_meta m WHERE m.key='index_unsent_plan:'||p.id AND m.value='true')
+                        AND NOT EXISTS(SELECT 1 FROM desk_orders o WHERE o.position_id=p.id)""",(mode,today+'%'))}
+                    rows=[p for p in rows if p['id'] not in unsent]
                 subtotal=0.;reserved_before=reserved
                 for p in rows:
                     if p['ts'].startswith(today):attempts+=1
@@ -18547,12 +18709,15 @@ class SharedAIRisk:
             if not blocker and globals().get('BROKER_GATE') and BROKER_GATE.status()['cooldown_seconds']>0:blocker='Broker rate-limit cooldown; new entries paused'
             floor=max(-cfg['daily_loss'],peak-cfg['profit_giveback']) if cfg['profit_protection_enabled'] and peak>=cfg['profit_activation'] else -cfg['daily_loss']
             if stock_only and profit_floor is not None and cfg['profit_protection_enabled']:floor=max(-cfg['daily_loss'],profit_floor)
+            remaining=max(0.,total-reserved-floor)
+            if stock_only:remaining=max(0.,cfg['daily_loss']+total)
+            elif len(self.engines)==1 and getattr(self.owner,'independent_trade_sizing',False):remaining=max(0.,total-floor)
             return dict(profit_floor=round(profit_floor,2) if profit_floor is not None else None,
                 allowed_giveback=round(allowed_giveback,2) if allowed_giveback is not None else None,profit_triggered=profit_triggered,
                 profit_stage=profit_stage,required_confidence=required_confidence,
                 liquidation_pending=[p['contract'] for _,p in active] if liquidate else [],
                 mode=mode,date=today,net=round(total,2),peak=round(peak,2),reserved=round(reserved,2),
-                remaining=round(max(0.,cfg['daily_loss']+total) if len(self.engines)==1 and 'stock' in self.engines else max(0.,total-reserved-floor),2),reason=reason,entry_block=blocker,liquidate=liquidate,
+                remaining=round(remaining,2),reason=reason,entry_block=blocker,liquidate=liquidate,
                 attempts=attempts,loss_streak=streak,positions=len(active),missing_quotes=missing,closed=closed,config=cfg,desk_reserved=desk_reserved,desk_totals=desk_totals)
     def confidence_block(self,s,view=None):
         if self.owner.desk_name!='stock':return None
@@ -18581,7 +18746,7 @@ class SharedAIRisk:
         if limits['same_signal_lock']:
             if signal is None:return 'Signal timestamp missing; cannot establish fresh entry'
             for other in self.engines.values():
-                history=(other.entry_history(s['symbol'],view['date']) if other.desk_name=='stock' and hasattr(other,'entry_history') else
+                history=(other.entry_history(s['symbol'],view['date']) if (other.desk_name=='stock' or getattr(other,'independent_trade_sizing',False)) and hasattr(other,'entry_history') else
                     other.rows('SELECT setup FROM desk_positions WHERE mode=? AND symbol=? AND ts LIKE ?',(cfg['mode'],s['symbol'],view['date']+'%')))
                 for row in history:
                     prior=json.loads(row['setup'] or '{}')
@@ -18592,14 +18757,15 @@ class SharedAIRisk:
         if cfg.get('adaptive_risk'):
             plan=s.get('risk_plan') or {}
             if plan.get('policy')!='adaptive-v1':return 'Missing adaptive entry risk plan'
-            if e.desk_name=='stock':
+            if e.desk_name=='stock' or getattr(e,'independent_trade_sizing',False):
                 if plan.get('sizing_basis')!='trade-independent-v2':return 'Refresh candidate for independent trade sizing'
                 lot=int(s['lot']);allocation=float(plan['capital_allocation'])
                 if lot<=0 or not math.isfinite(allocation) or allocation<=0:return 'Invalid trade cash allocation'
                 e.fit_costed_size(s,None,allocation,lot)
                 if s['qty']<=0:return 'Available trade cash cannot cover one lot including charges'
-                try:e.portfolio_guard.apply(s,s.get('portfolio_check') or {})
-                except (ValueError,KeyError,TypeError) as exc:return 'Portfolio: '+str(exc)
+                if e.desk_name=='stock':
+                    try:e.portfolio_guard.apply(s,s.get('portfolio_check') or {})
+                    except (ValueError,KeyError,TypeError) as exc:return 'Portfolio: '+str(exc)
                 if not e.entry_quality_gate(s):return s['reason']
                 planned=(float(s['entry'])-float(s['stop']))*s['qty']+s['estimated_costs']
                 plan.update(admitted_daily_risk=None,admitted_risk_budget=None,planned_loss=planned)

@@ -203,13 +203,14 @@ class RuntimeTests(unittest.TestCase):
         result=box.response(e)
         self.assertFalse(result['dashboard']['stale']);self.assertIsNone(result['metric']);self.assertIsNone(result['pnl']['live'])
         json.dumps(result,allow_nan=False)
-    def test_index_and_risk_classes_and_defaults_are_unchanged(self):
+    def test_retired_engines_stock_portfolio_and_independent_risk_settings_unchanged(self):
         import ast,hashlib
         expected={'_build_desk_engine_class': 'b4ede5ea937b7d8be6461cdbd82302ffd99f3719f23f0ebe8adfa91d73750ca7', 'StockDeskEngine': '3e21895184d92f691621dbe3b7f9cbf0ba5e0b6f5753d065db992eea7e815649', 'IndexOptionsAdapter': '31a3c0e6e98c5773749144a55c53abf7acf4a1790972e76b465add0066b6e3ee', 'IndexOptionsEngine': 'e13ffcf3698421cfd456a9bc7b965457311ffb1fe8aa8259cb22c974a6657691', 'index_options_state': '51356965a1820d81471adff7c927be2cc69d5f71fa88a27bead557771d34c5c8', 'index_options_control': 'e51e39402a0bb35038276648b29801cb24533504cdd8ab21a6eb0e23c6246de6', 'IndexAdvancedDeskEngine': '8ae1e387ec1c0a03b5796ab97845e862d25349cf5d0a1f401c0930703c59b297', 'StockPortfolioGuard': 'ee1831f1b6a145c35bbdb83856f1f153acf8304ab5bf8b25360456b8e2aef127', 'SharedAIRisk': 'ff846e19914b09d97304540ab781e547f95b38623d38b3083d1a48c45320e080', 'IndependentDeskRisk': 'beb6ae505afb117c6eb4a435f4e52f547a7e670599a652e09aab9900875adcb9'}
         after=old.SOURCE.read_text();lines=after.splitlines(True)
-        # These two shared definitions gained Stock-only entry_history hooks.
-        # Their legacy branches are exercised in test_stock_execution instead.
-        expected.pop('_build_desk_engine_class');expected.pop('SharedAIRisk')
+        # Index independence intentionally changes the active Index classes and
+        # shared opt-in entry branches; regression tests exercise both desks.
+        for name in ('_build_desk_engine_class','SharedAIRisk','StockDeskEngine','IndexOptionsAdapter','IndexOptionsEngine'):
+            expected.pop(name)
         actual={n.name:hashlib.sha256(''.join(lines[n.lineno-1:n.end_lineno]).encode()).hexdigest() for n in ast.parse(after).body if isinstance(n,(ast.ClassDef,ast.FunctionDef)) and n.name in expected}
         self.assertEqual(actual,expected)
 if __name__=='__main__':unittest.main()
