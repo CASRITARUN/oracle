@@ -16985,6 +16985,17 @@ def stock_ai_control(action):
 
 # New Index Options desk. Reuses Stock AI's execution primitives, not the retired
 # IndexAdvancedDeskEngine. Its DB owns all configuration, models, orders and risk.
+# ---------------------------------------------------------------------------
+# Index Options AI hardening constants (2026-10-25).  Only the Index desk reads
+# these; Stock/CAS/legacy desks are untouched.  All are env-overridable.
+# ---------------------------------------------------------------------------
+INDEX_MIN_DTE=max(1,int(os.environ.get('INDEX_MIN_DTE','2')))                       # skip 1-day-to-expiry contracts (theta/gamma cliff)
+INDEX_LIVE_MIN_DIRECTION_AUC=float(os.environ.get('INDEX_LIVE_MIN_DIRECTION_AUC','0.52'))  # live-mode edge floor; paper keeps learning
+INDEX_MAX_TRADE_LOSS_FRACTION=max(0.05,min(1.,float(os.environ.get('INDEX_MAX_TRADE_LOSS_FRACTION','0.40'))))  # planned loss per trade <= this x daily_loss
+INDEX_STOP_ATR_SCALE=max(1.,min(2.5,float(os.environ.get('INDEX_STOP_ATR_SCALE','1.40'))))  # widen 5m-ATR stop toward the 15m prediction horizon
+INDEX_ONE_LOT_MAX_CAPITAL_FRACTION=max(.2,min(1.,float(os.environ.get('INDEX_ONE_LOT_MAX_CAPITAL_FRACTION','0.60'))))  # one-lot exception may not exceed this share of cash pool
+INDEX_LIVE_FALLBACK_MIN_CONFIDENCE=max(.55,min(.90,float(os.environ.get('INDEX_LIVE_FALLBACK_MIN_CONFIDENCE','0.62'))))  # live entries before a validated option-outcome model exists
+
 class IndexOptionsAdapter(StockDeskAdapter):
     class _Connection(StockRuntimeAdapter._Connection):
         # Separate queue and file: a Stock writer cannot block the Index writer.
@@ -17014,11 +17025,11 @@ class IndexOptionsAdapter(StockDeskAdapter):
         exchange,opts=get_option_instruments_for_symbol(symbol)
         today=now_ist().date()
         # Derive expiry/lot/tick from current instruments; avoid expiry-day entries.
-        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=1})
-        if not expiries:return None,'No index option expiry at least one calendar day away'
+        expiries=sorted({o['expiry'] for o in opts if (o['expiry']-today).days>=INDEX_MIN_DTE})
+        if not expiries:return None,f'No index option expiry at least {INDEX_MIN_DTE} calendar days away'
         data,err=get_chain_for_symbol(symbol,str(expiries[0]))
         if err:return None,err
-        data=dict(data);data['unfiltered_contracts']=len(data['chain'])
+        data=dict(data);data['unfiltered_contracts']=len(data['chain']);data['selected_dte']=(expiries[0]-today).days
         data['chain']=[o for o in data['chain'] if float(o.get('volume') or 0)>=max(1,int(o.get('lot_size') or 1))*10 and float(o.get('oi') or 0)>=max(1,int(o.get('lot_size') or 1))*20]
         return data,None
 
@@ -17037,6 +17048,93 @@ class IndexOptionsEngine(StockDeskEngine):
         # All new Index entries use trade-local stops; persisted legacy fixed-risk
         # settings cannot silently select the old daily-allocation branch.
         return dict(super().config(),adaptive_risk=True,lots=0)
+    def _trade_loss_cap(self,cfg=None):
+        """Hard per-trade planned-loss ceiling (stop distance x qty + costs)."""
+        cfg=cfg or self.config()
+        try:daily=float(cfg.get('daily_loss') or 0)
+        except (TypeError,ValueError):daily=0.
+        return round(daily*INDEX_MAX_TRADE_LOSS_FRACTION,2) if math.isfinite(daily) and daily>0 else None
+    def model_quality(self):
+        # Parent checks sample count, freshness, calibration metadata and
+        # accuracy-vs-baseline.  Index adds an explicit edge floor for LIVE mode:
+        # a zero-skill model (AUC ~0.50) must never be sized.  Paper mode is
+        # unaffected (live_ok is only enforced when mode=='live'), so forward
+        # learning continues; its sizing weight just drops to zero below the floor.
+        q=dict(super().model_quality());m=self.model() or {};issues=list(q.get('issues') or [])
+        try:auc=float(m.get('auc'))
+        except (TypeError,ValueError):auc=None
+        if auc is not None and not math.isfinite(auc):auc=None
+        if auc is None or auc<INDEX_LIVE_MIN_DIRECTION_AUC:
+            issues.append('direction AUC '+('unavailable' if auc is None else f'{auc:.3f}')+f' below live minimum {INDEX_LIVE_MIN_DIRECTION_AUC:.2f}')
+            q['risk_weight']=0.
+        q.update(issues=issues,live_ok=not issues,live_min_auc=INDEX_LIVE_MIN_DIRECTION_AUC)
+        return q
+    def entry_quality_gate(self,s):
+        if not super().entry_quality_gate(s):return False
+        cfg=self.config()
+        cap=self._trade_loss_cap(cfg);planned=float((s.get('risk_plan') or {}).get('planned_loss') or 0)
+        if cap is not None and planned>cap+1e-7:
+            s.update(decision='WAIT',reason=f'Per-trade loss cap: planned loss incl. costs Rs{planned:,.0f} exceeds Rs{cap:,.0f} ({INDEX_MAX_TRADE_LOSS_FRACTION*100:.0f}% of daily loss limit)');return False
+        # Before any option-outcome model is validated the only economic evidence is
+        # direction confidence, so live entries need a higher bar than paper.
+        if cfg.get('mode')=='live' and not s.get('live_success_model_valid') and float(s.get('confidence') or 0)<INDEX_LIVE_FALLBACK_MIN_CONFIDENCE:
+            s.update(decision='WAIT',reason=f'Live entry needs confidence >= {INDEX_LIVE_FALLBACK_MIN_CONFIDENCE*100:.0f}% until a validated option-outcome model exists');return False
+        return True
+    def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
+        """Index version of the adaptive plan: same ATR/delta stop, with (a) the stop
+        scaled toward the 15-minute prediction horizon, (b) a hard per-trade loss
+        cap passed into sizing, and (c) a bounded one-lot exception."""
+        cfg=self.config();confidence=float(s.get('confidence') or .5)
+        quality=s.get('model_quality') or self.model_quality()
+        if cfg['mode']=='live' and not quality['live_ok']:raise ValueError('Model quality: '+'; '.join(quality['issues']))
+        strength=max(0.,min(1.,(confidence-.5)/.30))*quality['risk_weight']
+        bars=self.a.bars(s['symbol'],20);completed=[]
+        for row in bars:
+            ts=_ai_ts_naive(row.get('ts'))
+            if ts is not None and ts+timedelta(minutes=5)<=now_ist():completed.append(row)
+        if len(completed)<15:raise ValueError('Need 15 completed candles for adaptive volatility stop')
+        ranges=[]
+        for prev,row in zip(completed[-15:-1],completed[-14:]):
+            high=float(row['high']);low=float(row['low']);close=float(prev['close'])
+            if not all(math.isfinite(x) and x>0 for x in (high,low,close)) or high<low:raise ValueError('Invalid volatility candles')
+            ranges.append(max(high-low,abs(high-close),abs(low-close)))
+        atr=sum(ranges)/len(ranges)
+        entry=round(math.ceil((q['ask']*(1+cfg['slippage_bps']/10000)-1e-9)/tick)*tick,2)
+        atr_multiple=(1.25+.5*strength)*INDEX_STOP_ATR_SCALE
+        distance=max(abs(float(s['option_delta']))*atr*atr_multiple,entry*.05,3*(q['ask']-q['bid']),2*tick)
+        if not math.isfinite(distance) or distance>entry*.30:raise ValueError('Volatility/liquidity requires a stop over 30% of premium; choose another contract')
+        fees=2*cfg['fee_per_order'];one_lot=distance*lot+fees
+        loss_cap=self._trade_loss_cap(cfg)
+        committed=sum(max(0.,float(p['entry']))*int(p['qty']) for p in self.active() if p['mode']==cfg['mode'])
+        ceiling=max(0.,float(cfg['capital'])-committed)
+        if cfg['mode']=='live':
+            if funds is None or not math.isfinite(float(funds)) or funds<0:raise ValueError('Valid broker available funds required')
+            ceiling=min(ceiling,float(funds))
+        capital_share=.15+.25*strength;reward=1.5+strength
+        allocation=ceiling*capital_share
+        one_lot_cash=entry*lot+self.trade_cost(entry,entry+distance*reward,lot)
+        one_lot_exception=False
+        if one_lot_cash>allocation and one_lot_cash<=ceiling*INDEX_ONE_LOT_MAX_CAPITAL_FRACTION:
+            allocation=one_lot_cash;one_lot_exception=True
+        effective=dict(cfg,capital=allocation,risk=loss_cap,stop_pct=100*distance/entry,reward_r=reward,lots=0)
+        sized=self.size_contract(q,lot,tick,effective,funds)
+        sized['risk_plan']=dict(policy='adaptive-v1',strength=round(strength,4),confidence=confidence,
+            underlying_atr=atr,stop_distance=distance,stop_pct=100*distance/entry,reward_r=reward,
+            capital_fraction=capital_share,capital_allocation=allocation,remaining_daily_risk=None,
+            risk_budget=loss_cap,planned_loss=distance*sized['qty']+fees if sized['qty'] else 0,
+            initial_stop=sized['stop'],partial_take_r=1.0,one_lot_exception=one_lot_exception,quality=quality,
+            sizing_basis='trade-independent-v3-index',atr_multiple=atr_multiple,atr_scale=INDEX_STOP_ATR_SCALE,
+            per_trade_loss_cap=loss_cap,available_cash=ceiling,
+            note='Trade-local planned loss including estimated costs, hard-capped per trade; separate daily stops can request all exits')
+        self.fit_costed_size(sized,loss_cap,allocation,lot)
+        diagnostic=self.sizing_diagnostics(sized,lot,loss_cap,allocation,float(cfg.get('daily_loss') or 0) if loss_cap is not None else None,funds)
+        diagnostic['failures']=[f.replace('daily remaining','desk daily-loss limit') for f in diagnostic['failures']]
+        sized['sizing_diagnostics']=diagnostic
+        sized['one_lot_premium']=diagnostic['one_lot_cash_required']
+        sized['one_lot_risk']=diagnostic['one_lot_loss_with_costs']
+        if not sized['qty']:
+            sized['size_reason']='; '.join(diagnostic['failures']) or 'No whole lot fits the computed limits; see one-lot diagnostics'
+        return sized
     def block(self):
         if getattr(self,'database_recovery',None) and self.database_recovery.is_set():return 'Index database busy · automatic order/position recovery pending'
         return super().block()
@@ -17152,6 +17250,54 @@ class IndexOptionsEngine(StockDeskEngine):
         cfg=self.config();cfg.update(adaptive_risk=True,lots=0)
         self.put('config',cfg);self.put('index_adaptive_risk_v1',True)
         self.event('SYSTEM','Adaptive ATR/delta stops, cost-aware whole-lot sizing and tightening-only trails enabled.')
+    # Index-only regime policy. The current execution engine supports directional
+    # long-option entries; it does not yet implement a validated multi-leg range
+    # strategy. Therefore range/volatile/unknown regimes are NO_TRADE in paper mode
+    # rather than pretending an Iron Condor or breakout policy is executable.
+    REGIME_POLICY_BUILD='index-regime-policy-v1'
+    @staticmethod
+    def _regime_strategy_policy(signal,mode='paper'):
+        regime=signal.get('market_regime') or {}
+        name=str(regime.get('name') or 'UNKNOWN').upper()
+        direction=str(signal.get('direction') or '').upper()
+        if name=='TREND_UP' and direction=='UP':
+            strategy='LONG_CALL';eligible=True;reason='Uptrend and model direction agree; evaluate a long-call candidate.'
+        elif name=='TREND_DOWN' and direction=='DOWN':
+            strategy='LONG_PUT';eligible=True;reason='Downtrend and model direction agree; evaluate a long-put candidate.'
+        elif name in ('TREND_UP','TREND_DOWN'):
+            strategy='NO_TRADE';eligible=False;reason='Model direction conflicts with the detected trend.'
+        elif name=='RANGE':
+            strategy='NO_TRADE';eligible=False;reason='Range regime: directional option buying is disabled until a range strategy is independently validated.'
+        elif name=='VOLATILE':
+            strategy='NO_TRADE';eligible=False;reason='Volatility expansion: wait for a separately validated breakout policy; do not chase a directional option.'
+        else:
+            strategy='NO_TRADE';eligible=False;reason='Market regime unavailable or invalid; no adaptive strategy can be selected safely.'
+        paper_enforced=str(mode or 'paper').lower()=='paper'
+        return dict(build=IndexOptionsEngine.REGIME_POLICY_BUILD,regime=name,direction=direction or None,
+            selected_strategy=strategy,eligible=eligible,reason=reason,
+            enforcement='PAPER_ENFORCED' if paper_enforced else 'LIVE_SHADOW_ONLY',
+            enforced=paper_enforced,note='Initial conservative policy; it is not a profitability claim and has not been promoted for live use.')
+    def direction_snapshot(self,symbol,refresh=True,record_observation=True,max_bar_age=15):
+        # Parent builds the existing prediction and completed-candle regime. This
+        # policy is intentionally enforced only in paper mode for prospective tests.
+        s=super().direction_snapshot(symbol,refresh,record_observation,max_bar_age)
+        if not isinstance(s,dict):return s
+        # FIX: this class inherits StockDeskEngine/DeskEngine, which never set
+        # `market_regime` (only StockRuntimeEngine does).  Without it the policy
+        # below always saw UNKNOWN -> NO_TRADE and blocked every paper entry.
+        # Reuse the Stock regime classifier read-only (static, no shared state).
+        if s.get('p_up') is not None and not s.get('market_regime'):
+            try:
+                completed=[r for r in self.a.bars(symbol,61) if _ai_ts_naive(r.get('ts')) and _ai_ts_naive(r['ts'])+timedelta(minutes=5)<=now_ist()]
+                s['market_regime']=StockRuntimeEngine.market_regime(completed)
+            except Exception as exc:
+                s['market_regime']=dict(name='UNKNOWN',note='Regime calculation failed: '+str(exc),size_factor=1.)
+        policy=self._regime_strategy_policy(s,self.config().get('mode','paper'))
+        s['strategy_policy']=policy
+        if policy['enforced'] and s.get('decision')=='CANDIDATE' and not policy['eligible']:
+            s.update(decision='WAIT',reason='Regime policy: '+policy['reason'],
+                strategy_rejection_reason=policy['reason'])
+        return s
     def _full_mode(self):return False
     def inspect(self,symbol):
         if symbol not in self.UNIVERSE:raise ValueError('Index outside this desk universe')
@@ -17225,9 +17371,9 @@ class IndexOptionsEngine(StockDeskEngine):
         s=super().state();quality=self.model_quality()
         s['signals']=StockRuntimeEngine.display_signals(self,s.get('signals',[]),s['config'],s.get('positions',[]),s.get('block'))
         s['database']=dict(self.database_status)
-        s['sizing_policy']=dict(basis='trade-independent-v2',daily_loss_role='Desk circuit breaker only; does not set stop, target or quantity',
+        s['sizing_policy']=dict(basis='trade-independent-v2',daily_loss_role='Desk circuit breaker; also sets the per-trade planned-loss cap (fraction x daily loss) that bounds quantity',
             cash_role='Index cash budget less deployed premium, bounded by broker available funds in live mode',
-            stop_basis='Completed-candle ATR, option delta, confidence and bid/ask spread',target_basis='Trade stop distance and confidence')
+            stop_basis='Completed-candle ATR x horizon scale, option delta, confidence and bid/ask spread; planned loss hard-capped per trade',target_basis='Trade stop distance and confidence')
         reasons={}
         for signal in s.get('signals',[]):
             if signal.get('decision')!='READY':
@@ -17236,10 +17382,21 @@ class IndexOptionsEngine(StockDeskEngine):
         s['entry_diagnostics']=dict(block=s.get('block'),close_requested=bool(self.get('close_requested')),
             armed=bool(self.config()['armed']),model_available=bool(s.get('model')),candidate_reasons=reasons,workers=workers,
             note='Paper also requires arming and a trained model. Live additionally requires model validation and paper evidence or its explicit override.')
-        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.10.24-index-independent.1',
+        policy_counts={}
+        for signal in s.get('signals',[]):
+            policy=signal.get('strategy_policy') or {}
+            key=policy.get('selected_strategy','NOT_EVALUATED')
+            policy_counts[key]=policy_counts.get(key,0)+1
+        s.update(build='index-options-stock-workflow-v1',runtime_build='2026.10.25-index-hardened.1+index-regime-policy-v1',
+            index_policy=dict(live_min_direction_auc=INDEX_LIVE_MIN_DIRECTION_AUC,max_trade_loss_fraction=INDEX_MAX_TRADE_LOSS_FRACTION,trade_loss_cap_rupees=self._trade_loss_cap(),min_dte=INDEX_MIN_DTE,stop_atr_scale=INDEX_STOP_ATR_SCALE,live_fallback_min_confidence=INDEX_LIVE_FALLBACK_MIN_CONFIDENCE,one_lot_max_capital_fraction=INDEX_ONE_LOT_MAX_CAPITAL_FRACTION),
             universe=dict(mode='Independent index universe',selected=len(self.UNIVERSE)),
             watchlist=list(self.UNIVERSE),ban_status='Not applicable to index options',
             model_quality=quality,live_model_validation_reason='; '.join(quality['issues']) or 'PASS',
+            strategy_policy=dict(build=self.REGIME_POLICY_BUILD,mode=self.config().get('mode','paper'),
+                enforcement='PAPER_ENFORCED' if self.config().get('mode','paper')=='paper' else 'LIVE_SHADOW_ONLY',
+                selected_counts=policy_counts,available_strategies=['LONG_CALL','LONG_PUT','NO_TRADE'],
+                not_implemented=['Iron Condor','multi-leg spreads','short-premium strategies'],
+                note='The active execution path currently supports directional long-option entries only. Range, volatile and unknown regimes are rejected in paper mode; live mode is unchanged and displays shadow diagnostics only.'),
             risk_scope='Index desk only; independent of Stock AI')
         return s
 
