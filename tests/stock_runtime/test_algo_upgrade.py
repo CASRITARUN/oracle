@@ -28,6 +28,19 @@ ns=dict(np=np,json=json,math=math,os=os,sqlite3=sqlite3,threading=threading,time
     IST=IST,requests=requests,now_ist=lambda:clock.now,SESSION={'access_token':'FAKE'},
     API_KEY='FAKE',AI_SYMBOLS=['NIFTY'],INDEX_OPTION_EXCHANGE={},STOCK_HISTORY_BACKFILL_DAYS=365,
     _serialized_training=lambda fn:fn,BrokerDeferred=type('BrokerDeferred',(RuntimeError,),{}))
+# Module-level STOCK_*/INDEX_* tuning constants are env-overridable expressions rather
+# than literals, so the literal-only seeding below never picks them up. Without them in
+# this namespace every production method that reads one raises NameError when exec'd.
+# Only names not already seeded are added, so explicit seeds keep precedence.
+for _node in tree.body:
+    if not isinstance(_node,ast.Assign):continue
+    _names=[t.id for t in _node.targets if isinstance(t,ast.Name)]
+    if not _names or not any(n.startswith(('STOCK_','INDEX_')) for n in _names):continue
+    if any(n in ns for n in _names):continue
+    try:_value=eval(compile(ast.Expression(_node.value),'production constants','eval'),ns)
+    except Exception:continue
+    for _n in _names:ns[_n]=_value
+
 def load(name):
     node=next(n for n in tree.body if isinstance(n,(ast.ClassDef,ast.FunctionDef)) and n.name==name)
     exec(compile(ast.Module(body=[node],type_ignores=[]),'<production '+name+'>','exec'),ns)

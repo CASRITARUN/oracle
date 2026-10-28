@@ -13456,6 +13456,16 @@ DESK_MARKET_FEED=DeskMarketFeed()
 STOCK_FULL_SCAN_BAR_MAX_AGE = 15
 STOCK_SUCCESS_MIN_SAMPLES = 40
 STOCK_SUCCESS_MIN_AUC = 0.52
+# Live-mode direction-model edge floor for Stock AI (mirrors INDEX_LIVE_MIN_DIRECTION_AUC).
+# Used for SIZING only -- an AUC level is deliberately not an entry cutoff on this desk.
+STOCK_LIVE_MIN_DIRECTION_AUC = max(0.50, min(0.70, float(os.environ.get('STOCK_LIVE_MIN_DIRECTION_AUC', '0.52'))))
+# Minimum expected value in R for a LIVE Stock AI entry once all-in costs are counted
+# (regulatory charges + round-trip spread + slippage). Paper mode is unaffected so it
+# keeps accumulating forward evidence.
+STOCK_LIVE_MIN_EDGE_R = max(0.0, min(1.0, float(os.environ.get('STOCK_LIVE_MIN_EDGE_R', '0.15'))))
+# Live-entry confidence floor while no validated option-outcome model exists.
+# Mirrors INDEX_LIVE_FALLBACK_MIN_CONFIDENCE on the index desk.
+STOCK_LIVE_FALLBACK_MIN_CONFIDENCE = max(.55, min(.90, float(os.environ.get('STOCK_LIVE_FALLBACK_MIN_CONFIDENCE', '0.62'))))
 STOCK_HIST_SUCCESS_MIN_SAMPLES = 300
 STOCK_HIST_SUCCESS_MIN_AUC = 0.52
 STOCK_HIST_SUCCESS_MAX_SAMPLES = 24000
@@ -13838,7 +13848,9 @@ class StockDeskEngine(DeskEngine):
         if age is None:problems.append('model training timestamp unavailable; automatic retraining required')
         elif age<0:problems.append('model training timestamp is in the future; check server clock')
         elif age>7:problems.append(f'model trained {age:.1f} days ago (maximum 7); automatic retraining pending — see Learning lab')
-        weight=0. if problems else min(1.,max(.25,(auc-.5)/.15))*min(1.,samples/300.)
+        # An AUC level scales SIZING, it is not an entry cutoff (see model_quality docs).
+        # The 0.25 floor is removed so a zero-skill model sizes to zero, not a quarter.
+        weight=0. if problems else min(1.,max(0.,(auc-.5)/.15))*min(1.,samples/300.)
         return dict(live_ok=not problems,risk_weight=weight,issues=problems,age_days=age,
                     note='Validation-quality proxy; confidence is not a calibrated win probability')
     @staticmethod
@@ -13861,19 +13873,47 @@ class StockDeskEngine(DeskEngine):
         if getattr(self,'desk_name','')=='stock' and hasattr(self,'shared_risk'):
             blocked=self.shared_risk.confidence_block(s)
             if blocked:s.update(decision='WAIT',reason=blocked);return False
+        cfg=self.config()
+        # estimated_costs stays regulatory/brokerage-only: that is the schema the
+        # option-outcome models are trained and validated against, and trade_economics
+        # is derived from it. The economic veto below must additionally pay for what a
+        # round trip really costs -- this desk may cross max_spread on BOTH legs plus
+        # slippage, which on a volatility-scaled stop is a large fraction of 1R.
+        entry=float(s.get('entry') or 0);stop=float(s.get('stop') or 0);qty=int(s.get('qty') or 0)
+        slip=float(cfg.get('slippage_bps') or 5.)/10000.
+        spread=max(0.,float(s.get('spread') or 0))/100.
+        friction=(spread+slip)*entry*qty+(spread+slip)*max(entry,float(s.get('target') or entry))*qty
+        all_in=float(s.get('estimated_costs') or 0.)+friction
+        risk=max(.01,(entry-stop)*qty)
+        s['friction_costs']=round(friction,2);s['all_in_costs']=round(all_in,2)
+        live=cfg.get('mode')=='live'
+        edge_floor=STOCK_LIVE_MIN_EDGE_R if live else 0.
         # Historical underlying barriers are not option-profit evidence. Use only
         # a current validated option-outcome model for this economic veto.
         if s.get('live_success_model_valid') and s.get('live_success_probability') is not None:
-            probability=float(s['live_success_probability']);risk=max(.01,(s['entry']-s['stop'])*s['qty'])
+            probability=float(s['live_success_probability'])
             payoff=s.get('option_payoff')
             if not payoff:
                 s.update(decision='WAIT',reason='Validated option model lacks sufficient win/loss payoff evidence');return False
-            ev=probability*float(payoff['win_gross_r'])+(1-probability)*float(payoff['loss_gross_r'])-s['estimated_costs']/risk
-            s['option_expected_r_basis']='Training-sample average gross winning/losing R weighted by validated option-outcome probability, less current estimated costs; proxy only'
+            ev=probability*float(payoff['win_gross_r'])+(1-probability)*float(payoff['loss_gross_r'])-all_in/risk
+            s['option_expected_r_basis']='Validated option-outcome probability weighted by training payoff, less all-in costs including round-trip spread and slippage; proxy only'
             s['option_expected_r']=round(ev,4)
             if not math.isfinite(ev) or ev<=0:
-                s.update(decision='WAIT',reason='Validated option-outcome estimate is non-positive after estimated charges');return False
-        else:s['option_expected_r']=None
+                s.update(decision='WAIT',reason='Validated option-outcome estimate is non-positive after all-in costs');return False
+        else:
+            # No validated option-outcome model. Report what the directional probability
+            # implies once friction is counted, and in LIVE mode hold it to the same
+            # positive-expectation floor. Paper deliberately stays unvetoed here so it
+            # keeps accumulating the forward evidence the live gate depends on.
+            raw=s.get('p_up')
+            p=float(raw) if s.get('direction')=='UP' else (1-float(raw)) if raw is not None else float(s.get('confidence') or .5)
+            p=.5+(max(0.,min(1.,p))-.5)*.6
+            reward=float((s.get('risk_plan') or {}).get('reward_r') or cfg.get('reward_r') or 1.8)
+            ev=p*reward-(1-p)-all_in/risk
+            s['option_expected_r']=round(ev,4) if math.isfinite(ev) else None
+            s['option_expected_r_basis']='Directional probability shrunk 40% toward 50%, times rewardR, less one unit, less all-in costs in R; diagnostic in paper, entry floor in live'
+            if live and (not math.isfinite(ev) or ev<edge_floor):
+                s.update(decision='WAIT',reason='Expected value %.2fR below the %.2fR live floor after all-in costs'%(ev,edge_floor) if math.isfinite(ev) else 'Expected value could not be computed after all-in costs');return False
         return True
     def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
         cfg=self.config();confidence=float(s.get('confidence') or .5)
@@ -15932,6 +15972,12 @@ class StockRuntimeEngine(StockDeskEngine):
         return s
     def entry_quality_gate(self,s):
         if not super().entry_quality_gate(s):return False
+        # Before any option-outcome model is validated the only economic evidence for
+        # Stock AI is direction confidence, so LIVE entries need a higher bar than paper.
+        # Mirrors INDEX_LIVE_FALLBACK_MIN_CONFIDENCE on the index desk.
+        gate_cfg=self.config()
+        if gate_cfg.get('mode')=='live' and not s.get('live_success_model_valid') and float(s.get('confidence') or 0)<STOCK_LIVE_FALLBACK_MIN_CONFIDENCE:
+            s.update(decision='WAIT',reason='Live entry needs confidence >= %d%% until a validated option-outcome model exists'%(int(round(STOCK_LIVE_FALLBACK_MIN_CONFIDENCE*100))));return False
         entry=float(s['entry']);stop=float(s['stop']);target=float(s['target']);qty=int(s['qty'])
         costs=float(s['estimated_costs']);loss=(entry-stop)*qty+costs;gain=(target-entry)*qty-costs
         if not all(math.isfinite(v) for v in (entry,stop,target,costs,loss,gain)) or not 0<stop<entry<target or qty<=0 or costs<0 or gain<=0:
@@ -16484,7 +16530,7 @@ class StockRuntimeEngine(StockDeskEngine):
             result['issues']=[x for x in result['issues'] if not x.startswith('model trained ')]
             result['live_ok']=not result['issues'];result['revalidated_at']=review['updated']
             if result['live_ok']:
-                result['risk_weight']=min(1.,max(.25,(float(review.get('champion_auc') or .5)-.5)/.15))*min(1.,float(review['samples'])/300.)
+                result['risk_weight']=min(1.,max(0.,(float(review.get('champion_auc') or .5)-.5)/.15))*min(1.,float(review['samples'])/300.)
         return result
     def _risk_tick(self):
         # Yesterday's manual pause must not silently prevent the already-authorized
