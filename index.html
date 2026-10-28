@@ -457,6 +457,7 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <button class="top-tab-btn" id="tabBtnStockTradeAI" onclick="switchTopTab('stockTradeAI')">📊 Stock Options AI</button>
 <button class="top-tab-btn active" id="tabBtnCondor" onclick="switchTopTab('condor')">Option Selling — Condor / Strangle</button>
 <button class="top-tab-btn" id="tabBtnMove" onclick="switchTopTab('move')">📈 Long Straddle / Strangle (Breakout)</button>
+<button class="top-tab-btn" id="tabBtnIat" onclick="switchTopTab('iat')">🤖 Index Autotrader — independent</button>
 </div>
 
 
@@ -1005,6 +1006,113 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <section data-ix-pane="journal" class="sk-view" hidden><div class="sk-section-intro"><div><p class="sk-eyebrow">TRADE JOURNAL</p><h2>Confirmed fills and retained evidence.</h2><p>This new index engine has its own trade history. Paper trades are simulated; live fills come from Kite. Retired engine records are not imported.</p></div></div><section class="sk-panel"><h2>Recent trades</h2><div id="ixTrades" class="sk-table-wrap"></div></section><section class="sk-panel"><h2>Broker orders</h2><div id="ixOrders" class="sk-table-wrap"></div></section><section class="sk-panel"><h2>Order reconciliation</h2><div id="ixRecovery"></div></section><section class="sk-panel"><h2>Detailed review &amp; exports</h2><div id="ixReviewControls"></div><div id="ixReviewOutput"></div></section></section>
 <section data-ix-pane="risk" class="sk-view" hidden><div class="sk-section-intro"><div><p class="sk-eyebrow">RISK &amp; CONTROLS</p><h2>Set the index desk limits.</h2><p>Disarm and close/reconcile index positions before changing settings. Index risk limits apply only to this desk; Stock AI uses its own limits.</p></div></div><form id="ixSettings" class="sk-panel"><div id="ixFields" class="sk-settings"></div><button class="sk-primary" id="ixSave" type="submit">Save index settings</button><p class="sk-footnote">Stops and whole-lot size adapt to ATR, option delta, entry strength, available daily risk, premium budget and displayed depth. Pending limits can be repriced within configured bounds; unknown submissions require broker confirmation. Stops only tighten after entry. Planned loss includes estimated costs; gaps and fills can exceed it. Brokerage reserve excludes percentage charges, which are estimated separately.</p></form><section class="sk-panel"><h2>Execution protection</h2><p id="ixHalt">—</p><button id="ixClear">Clear resolved halt</button><p class="sk-footnote">Cannot clear unresolved live orders or mismatched quantities. Live mode requires explicit confirmation. Each restart disarms entries.</p></section><section class="sk-panel"><h2>Entry &amp; exit logic</h2><p>Direction selects CE or PE. Contract selection checks delta, spread, a valid lot size and executable bid/ask. This new engine uses the Stock AI workflow: historical and forward direction, historical setup ranking and completed paper-option evidence. Its own models train only on this index universe. It rechecks each candidate before submission. Stops, partial profit-taking, targets, reversal, maximum holding time and intraday square-off supervise filled quantities.</p><p class="sk-footnote">AUC has no hard minimum for entry. Brier is diagnostic; sample count, model age and baseline checks still apply; AUC continues to influence size. This desk starts in paper mode; it does not inherit Stock AI’s automatic 09:15 arming. Only one backend process should run.</p></section></section>
 <footer class="sk-footer"><span>INDEX OPTIONS AI</span><span>Independent risk · IST timestamps</span><small id="ixBuild">Connecting…</small></footer></div></div>
+
+<div class="tab-page" id="tabPageIat">
+<style>
+  .iat-wrap{padding:18px 22px;display:grid;gap:16px}
+  .iat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .iat-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px}
+  .iat-card h3{margin:0 0 10px;font-size:13px;letter-spacing:.06em;color:#667085;text-transform:uppercase}
+  .iat-kpi{display:flex;gap:22px;flex-wrap:wrap}
+  .iat-kpi div span{display:block;font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em}
+  .iat-kpi div b{font-size:22px;font-weight:600}
+  .iat-pos{color:#0a7d54}.iat-neg{color:#c02626}.iat-flat{color:#667085}
+  .iat-fbar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
+  .iat-fbar label{width:96px;color:#667085}
+  .iat-fbar .track{flex:1;height:8px;background:#f1f2f4;border-radius:4px;position:relative;overflow:hidden}
+  .iat-fbar .zero{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#d0d5dd}
+  .iat-fbar .fill{position:absolute;top:0;bottom:0;border-radius:4px}
+  .iat-fbar .val{width:52px;text-align:right;font-variant-numeric:tabular-nums}
+  .iat-table{width:100%;border-collapse:collapse;font-size:12px}
+  .iat-table th,.iat-table td{padding:6px 8px;text-align:left;border-bottom:1px solid #eef0f2;white-space:nowrap}
+  .iat-table th{color:#667085;font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.05em}
+  .iat-chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
+  .iat-chip.up{background:#e6f6ee;color:#0a7d54}.iat-chip.down{background:#fdeaea;color:#c02626}
+  .iat-chip.n{background:#f2f4f7;color:#475467}
+  .iat-note{font-size:12px;color:#667085;margin-top:8px;line-height:1.5}
+  .iat-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .iat-actions button{padding:8px 14px;border-radius:8px;border:1px solid #d0d5dd;background:#fff;cursor:pointer;font-weight:600}
+  .iat-actions button.go{background:#ff6338;border-color:#ff6338;color:#fff}
+  .iat-actions button.stop{background:#fff;border-color:#c02626;color:#c02626}
+  .iat-settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+  .iat-settings label{display:block;font-size:11px;color:#667085;margin-bottom:3px}
+  .iat-settings input,.iat-settings select{width:100%;padding:6px 8px;border:1px solid #d0d5dd;border-radius:6px}
+</style>
+
+<div class="iat-wrap">
+  <div class="iat-card">
+    <div class="iat-kpi">
+      <div><span>Autotrader</span><b id="iatArmed">—</b></div>
+      <div><span>Execution</span><b id="iatMode">—</b></div>
+      <div><span>Today</span><b id="iatDayR">—</b></div>
+      <div><span>Trades today</span><b id="iatTrades">—</b></div>
+      <div><span>Loss streak</span><b id="iatStreak">—</b></div>
+      <div><span>Last scan</span><b id="iatScan">—</b></div>
+    </div>
+    <p class="iat-note" id="iatBlock">—</p>
+    <div class="iat-actions" style="margin-top:12px">
+      <select id="iatExecMode"><option value="track">Track (simulated)</option><option value="live">Live (real orders)</option></select>
+      <button class="go" id="iatArm">Arm</button>
+      <button class="stop" id="iatDisarm">Disarm</button>
+      <button id="iatCloseAll">Close all positions</button>
+      <button id="iatRefresh">Refresh ↻</button>
+    </div>
+    <p class="iat-note"><strong>This engine is independent.</strong> It runs its own seven-factor signal model over its own candles and decides for itself — it does not read Stock AI or Index AI. Every live order is MIS, so the broker's own end-of-day square-off is a second safety net behind the hard stop, target, trailing stop, max-hold, square-off, daily-R limit, trade cap and loss-streak breaker. Nothing is sent to the broker in track mode.</p>
+  </div>
+
+  <div class="iat-grid">
+    <div class="iat-card">
+      <h3>Live signal</h3>
+      <div class="iat-kpi" style="margin-bottom:12px">
+        <div><span>Composite</span><b id="iatScore">—</b></div>
+        <div><span>Direction</span><b id="iatDir">—</b></div>
+        <div><span>Agreement</span><b id="iatAgree">—</b></div>
+        <div><span>Regime</span><b id="iatRegime">—</b></div>
+        <div><span>Spot</span><b id="iatSpot">—</b></div>
+        <div><span>Vol pctile</span><b id="iatVol">—</b></div>
+      </div>
+      <div id="iatFactors"></div>
+      <p class="iat-note" id="iatSignalNote"></p>
+    </div>
+
+    <div class="iat-card">
+      <h3>Performance</h3>
+      <div class="iat-kpi">
+        <div><span>Net R</span><b id="iatNetR">—</b></div>
+        <div><span>Trailing expectancy</span><b id="iatExp">—</b></div>
+        <div><span>Win rate</span><b id="iatWin">—</b></div>
+        <div><span>Profit factor</span><b id="iatPf">—</b></div>
+      </div>
+      <p class="iat-note">Trailing window is the last 24 closed trades. Expectancy is measured in R, so it is comparable across different position sizes.</p>
+    </div>
+  </div>
+
+  <div class="iat-card">
+    <h3>Open positions</h3>
+    <div style="overflow-x:auto"><table class="iat-table" id="iatOpen"><thead><tr>
+      <th>Symbol</th><th>Type</th><th>Contract</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Strength</th><th>Mode</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="iat-card">
+    <h3>Recent trades</h3>
+    <div style="overflow-x:auto"><table class="iat-table" id="iatRecent"><thead><tr>
+      <th>Closed</th><th>Symbol</th><th>Type</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>Reason</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="iat-card">
+    <h3>Strategy settings</h3>
+    <div class="iat-settings" id="iatSettings"></div>
+    <div class="iat-actions" style="margin-top:14px">
+      <button class="go" id="iatSave">Save settings</button>
+      <span class="iat-note" id="iatSaveMsg"></span>
+    </div>
+    <p class="iat-note">Saving settings does not arm the engine. Signal thresholds, risk, time and book-quality limits are all adjustable; halts must be cleared explicitly.</p>
+  </div>
+</div>
+</div>
+
 <div class="tab-page" id="tabPageStockTradeAI"><!-- STOCK_AI_V1_START -->
 <style>
 /* AI Desk v2: restrained midnight/ivory workspace, electric chart accents. */
@@ -2464,16 +2572,145 @@ document.getElementById("refreshEventsBtn").onclick = loadEvents;
 // Remaining top tabs + Continuous Index Breakout Monitor
 // ============================================================================
 function switchTopTab(which) {
-  if(!['condor','move','stockTradeAI','indexTradeAI'].includes(which))which='stockTradeAI';
-  for(const [key,suffix] of [['condor','Condor'],['move','Move'],['stockTradeAI','StockTradeAI'],['indexTradeAI','IndexTradeAI']]){
+  if(!['condor','move','stockTradeAI','indexTradeAI','iat'].includes(which))which='stockTradeAI';
+  for(const [key,suffix] of [['condor','Condor'],['move','Move'],['stockTradeAI','StockTradeAI'],['indexTradeAI','IndexTradeAI'],['iat','Iat']]){
     document.getElementById('tabPage'+suffix).classList.toggle('active',which===key);
     document.getElementById('tabBtn'+suffix).classList.toggle('active',which===key);
   }
   document.body.classList.toggle('ai-evolution-mode',['stockTradeAI','indexTradeAI'].includes(which));
+  if(which==='iat')iatInitIatUI();
   if(which==='stockTradeAI')initStockTradeAIUI();
   if(which==='indexTradeAI')initIndexTradeAIUI();
 }
 
+
+
+// ---------------- Index Autotrader (independent engine) ----------------
+const IAT_FIELDS = [
+  ['entry_threshold','Entry threshold',0.05],['min_agreement','Min factor agreement',1],
+  ['max_vol_percentile','Max vol percentile',0.01],['reversal_threshold','Reversal threshold',0.05],
+  ['risk_per_trade_pct','Risk per trade (% of capital)',0.1],['stop_pct_of_premium','Stop % of premium',0.1],
+  ['reward_r','Reward : risk',0.1],['capital_per_trade','Capital per trade',1000],
+  ['max_daily_loss_r','Daily loss cap (R)',0.5],['max_trades_per_day','Max trades / day',1],
+  ['max_concurrent','Max concurrent',1],['max_loss_streak','Loss-streak breaker',1],
+  ['session_start','Session start',0],['square_off','Square-off',0],
+  ['protected_minutes','Protected minutes',1],['max_hold_minutes','Max hold (min)',1],
+  ['min_dte','Min days to expiry',1],['max_spread_pct','Max spread %',0.05],
+  ['min_delta','Min delta',0.01],['max_delta','Max delta',0.01],
+  ['trailing_activate_r','Trail activates at (R)',0.05],['trailing_giveback_r','Trail giveback (R)',0.05],
+  ['breakeven_after_r','Breakeven after (R)',0.05],['poll_seconds','Poll seconds',1],
+];
+let IAT_DATA = null;
+
+function iatNum(v){ return (v===null||v===undefined||v==='') ? '—' : Number(v).toFixed(2); }
+function iatR(v){ const n=Number(v); if(!isFinite(n)) return '—'; return (n>0?'+':'')+n.toFixed(2)+'R'; }
+function iatCls(v){ return v>0?'iat-pos':v<0?'iat-neg':'iat-flat'; }
+
+async function iatFetch(){
+  try{
+    const r = await fetch('/api/index-autotrader/state',{credentials:'same-origin'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    IAT_DATA = await r.json();
+    iatRender();
+  }catch(e){ const el=document.getElementById('iatBlock'); if(el) el.textContent='Autotrader status unavailable: '+e.message; }
+}
+
+function iatRender(){
+  const d=IAT_DATA; if(!d) return;
+  const s=d.state||{}, st=d.stats||{};
+  const armed=document.getElementById('iatArmed');
+  armed.textContent = s.armed ? 'ARMED' : 'DISARMED';
+  armed.className = s.armed ? 'iat-pos' : 'iat-neg';
+  document.getElementById('iatMode').textContent = (s.execution_mode||'track').toUpperCase();
+  const dayR=document.getElementById('iatDayR');
+  dayR.textContent = iatR(s.realized_r_today); dayR.className = iatCls(s.realized_r_today);
+  document.getElementById('iatTrades').textContent = s.trades_today ?? 0;
+  document.getElementById('iatStreak').textContent = s.loss_streak ?? 0;
+  document.getElementById('iatScan').textContent = s.last_scan_at ? new Date(s.last_scan_at).toLocaleTimeString() : '—';
+  const blk = d.block_reason || 'No blockers.';
+  document.getElementById('iatBlock').textContent = (s.halt_reason ? 'HALTED — '+s.halt_reason+'. ' : '') + blk + (s.last_error ? ' · '+s.last_error : '');
+  document.getElementById('iatExecMode').value = s.execution_mode || 'track';
+
+  const sig=s.last_signal||null;
+  const put=(id,v)=>{const e=document.getElementById(id); if(e) e.textContent=v;};
+  put('iatScore', sig && sig.ready ? iatNum(sig.score) : '—');
+  const dir=document.getElementById('iatDir');
+  dir.textContent = sig && sig.ready ? sig.direction : '—';
+  dir.className = sig && sig.ready ? (sig.direction==='CE'?'iat-pos chip up':'iat-neg') : '';
+  put('iatAgree', sig && sig.ready ? sig.agreement+' / 7' : '—');
+  put('iatRegime', (sig&&sig.regime)||'—');
+  put('iatSpot', sig && sig.spot ? '₹'+Number(sig.spot).toLocaleString('en-IN') : '—');
+  put('iatVol', sig ? Math.round((sig.vol_percentile||0)*100)+'th' : '—');
+  const note=document.getElementById('iatSignalNote');
+  if(note) note.textContent = sig ? ((sig.ready?'Composite '+sig.score+'. ':'')+(sig.reason||'')) : 'No signal scanned yet.';
+  const fac=document.getElementById('iatFactors');
+  fac.innerHTML = (sig&&sig.factors) ? Object.entries(sig.factors).map(([k,v])=>{
+    const pct=Math.abs(v)*50, left=v>=0?50:50-pct, col=v>=0?'#0a7d54':'#c02626';
+    return '<div class="iat-fbar"><label>'+k.replace('_',' ')+'</label><div class="track"><div class="zero"></div>'+
+      '<div class="fill" style="left:'+left+'%;width:'+pct+'%;background:'+col+'"></div></div>'+
+      '<div class="val '+iatCls(v)+'">'+(v>0?'+':'')+v.toFixed(2)+'</div></div>';
+  }).join('') : '<p class="iat-note">No factor breakdown yet.</p>';
+
+  const net=document.getElementById('iatNetR'); net.textContent=iatR(st.net_r); net.className=iatCls(st.net_r);
+  const exp=document.getElementById('iatExp'); exp.textContent=iatR(st.trailing_expectancy_r); exp.className=iatCls(st.trailing_expectancy_r);
+  put('iatWin', st.win_rate!=null ? st.win_rate+'%' : '—');
+  put('iatPf', st.profit_factor==null ? '—' : st.profit_factor);
+
+  document.querySelector('#iatOpen tbody').innerHTML = (d.open||[]).map(t=>
+    '<tr><td>'+t.symbol+'</td><td><span class="iat-chip '+(t.direction==='CE'?'up':'down')+'">'+t.direction+'</span></td>'+
+    '<td>'+(t.tradingsymbol||'')+'</td><td>'+t.quantity+'</td><td>'+iatNum(t.entry_price)+'</td>'+
+    '<td>'+iatNum(t.sl_price)+'</td><td>'+iatNum(t.target_price)+'</td><td>'+iatNum(t.strength)+'</td>'+
+    '<td>'+(t.execution_mode||'')+'</td></tr>').join('') || '<tr><td colspan="9" class="iat-note">No open positions.</td></tr>';
+
+  document.querySelector('#iatRecent tbody').innerHTML = (d.recent||[]).map(t=>
+    '<tr><td>'+(t.closed_at?new Date(t.closed_at).toLocaleTimeString():'—')+'</td><td>'+t.symbol+'</td>'+
+    '<td><span class="iat-chip '+(t.direction==='CE'?'up':'down')+'">'+t.direction+'</span></td>'+
+    '<td>'+iatNum(t.entry_price)+'</td><td>'+iatNum(t.exit_price)+'</td>'+
+    '<td class="'+iatCls(t.realized_pnl)+'">'+(t.realized_pnl==null?'—':Number(t.realized_pnl).toFixed(0))+'</td>'+
+    '<td class="'+iatCls(t.realized_r)+'">'+iatR(t.realized_r)+'</td><td>'+(t.exit_reason||'')+'</td></tr>'
+  ).join('') || '<tr><td colspan="8" class="iat-note">No closed trades yet.</td></tr>';
+
+  if(!document.getElementById('iatSettings').dataset.built && d.defaults){
+    document.getElementById('iatSettings').dataset.built='1';
+    document.getElementById('iatSettings').innerHTML = IAT_FIELDS.map(([k,label])=>
+      '<div><label>'+label+'</label><input data-iat="'+k+'" value="'+(d.defaults[k]??'')+'"></div>').join('')+
+      '<div><label>Index symbols</label><input data-iat="symbols" value="'+((s.symbols||['NIFTY']).join(','))+'"></div>';
+  }
+}
+
+function iatPost(url,body){
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body||{})})
+    .then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{ if(!ok) throw new Error(j.error||'failed'); iatFetch(); return j; })
+    .catch(e=>{ const m=document.getElementById('iatBlock'); if(m) m.textContent=e.message; });
+}
+
+function iatInitIatUI(){
+  const on=(id,fn)=>{const el=document.getElementById(id); if(el&&!el.dataset.b){el.dataset.b='1';el.addEventListener('click',fn);}};
+  on('iatArm',async()=>{
+    const mode=document.getElementById('iatExecMode').value;
+    if(mode==='live' && !confirm('LIVE mode places real, unattended MIS orders with real money. Confirm.')) return;
+    await iatPost('/api/index-autotrader/config',{execution_mode:mode});
+    await iatPost('/api/index-autotrader/arm',{ack:mode==='live'});
+  });
+  on('iatDisarm',()=>iatPost('/api/index-autotrader/disarm',{}));
+  on('iatCloseAll',()=>{ if(confirm('Close every open index autotrader position and disarm?')) iatPost('/api/index-autotrader/close-all',{}); });
+  on('iatRefresh',()=>iatFetch());
+  on('iatSave',()=>{
+    const body={};
+    document.querySelectorAll('#iatSettings [data-iat]').forEach(el=>{
+      const k=el.dataset.iat, raw=el.value.trim();
+      if(k==='symbols'){ body.symbols=raw.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean); return; }
+      const num=Number(raw); if(raw!=='' && isFinite(num)) body[k]=num;
+    });
+    iatPost('/api/index-autotrader/config',body).then(()=>{ const m=document.getElementById('iatSaveMsg'); if(m) m.textContent='Saved '+new Date().toLocaleTimeString(); });
+  });
+  if(!iatInitIatUI._t){ iatInitIatUI._t=setInterval(iatFetch,20000); }
+  iatFetch();
+}
+
+function iatClearHalt(){
+  iatPost('/api/index-autotrader/config',{clear_halt:true});
+}
 
 function fmtMoney(v) { return v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", {maximumFractionDigits:2}); }
 function fmtTime(v) { return v ? new Date(v).toLocaleTimeString() : "—"; }

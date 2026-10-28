@@ -19290,6 +19290,8 @@ def start_application_workers():
     threading.Thread(target=legacy_manage,daemon=True,name='legacy-risk-monitor').start()
     threading.Thread(target=_autotrade_loop,daemon=True).start()
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
+    # Independent index autotrader.  Own ledger, own signal model; idles while disarmed.
+    threading.Thread(target=iat_loop,daemon=True,name='index-autotrader').start()
     def market_feed_loop():
         while not STOCK_DESK.stop_event.is_set():
             try:DESK_MARKET_FEED.ensure()
@@ -19301,6 +19303,849 @@ def start_application_workers():
     STOCK_DESK.start()
     INDEX_OPTIONS_DESK.start()
     threading.Thread(target=retired_ai_supervisor,daemon=True,name='retired-ai-exits').start()
+
+# ===========================================================================
+# INDEX AUTOTRADER (IAT) -- an independent index-options trading engine
+# ---------------------------------------------------------------------------
+# This engine decides for itself.  It reads none of Stock AI, Index AI, the
+# condor desk or the move desk: it runs its own signal model over its own
+# candles, sizes its own risk, and opens and closes its own positions.  It
+# shares only infrastructure that must remain governed -- the broker request
+# gate (via place_basket_orders) and the quote cache -- plus its own state
+# file, trade ledger, limits and UI tab.
+#
+# Safety rails, all defaulting to the safe position:
+#   * execution_mode starts as "track": nothing is sent to the broker, fills are
+#     simulated against live quotes.
+#   * every live order is MIS, so the broker's own end-of-day square-off is an
+#     independent second net behind our exits.
+#   * hard stop, target, max-hold, square-off, daily R limit, daily trade cap,
+#     loss-streak breaker and concurrent-position cap are evaluated on every tick.
+#   * nothing runs until an operator arms it, and a halt latches until cleared.
+# ===========================================================================
+IAT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_autotrader_state.json")
+IAT_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_autotrader_trades.json")
+IAT_LOCK = threading.Lock()
+
+IAT_DEFAULTS = {
+    "armed": False,
+    "execution_mode": "track",       # "track" simulates on live quotes; "live" sends orders
+    "symbols": ["NIFTY"],
+    # --- signal model ---
+    "entry_threshold": 0.45,         # |composite| required to qualify
+    "min_agreement": 4,              # factors sharing the composite sign (of 7)
+    "max_vol_percentile": 0.90,      # refuse to chase a blow-off candle
+    "reversal_threshold": 0.35,      # composite flip strength that forces an exit
+    # --- risk ---
+    "risk_per_trade_pct": 5.0,       # % of capital_per_trade risked, scaled by strength
+    "stop_pct_of_premium": 12.0,
+    "reward_r": 1.8,
+    "capital_per_trade": 25000.0,
+    "max_daily_loss_r": 4.0,
+    "max_trades_per_day": 4,
+    "max_concurrent": 1,
+    "max_loss_streak": 3,
+    # --- time ---
+    "session_start": "09:20",
+    "square_off": "15:12",
+    "protected_minutes": 15,
+    "max_hold_minutes": 90,
+    "poll_seconds": 20,
+    # --- book quality ---
+    "min_dte": 2,
+    "max_spread_pct": 0.8,
+    "min_delta": 0.40,
+    "max_delta": 0.65,
+    "min_contract_premium": 20.0,
+    # --- trailing / breakeven ---
+    "trailing_activate_r": 0.75,
+    "trailing_giveback_r": 0.65,
+    "breakeven_after_r": 1.0,
+    # --- runtime ---
+    "day": None,
+    "trades_today": 0,
+    "realized_r_today": 0.0,
+    "loss_streak": 0,
+    "peak_r_today": 0.0,
+    "last_signal": None,
+    "last_error": None,
+    "last_scan_at": None,
+    "halt_reason": None,
+    "auto_start": False,
+}
+
+# Seven independent factors, each normalised to [-1, +1].  +1 is bullish for the
+# underlying, so a positive composite buys a CALL and a negative one a PUT.
+IAT_FACTOR_WEIGHTS = {
+    "ema_structure": 0.22, "rsi": 0.12, "macd_slope": 0.16,
+    "donchian": 0.18, "volume": 0.10, "vwap": 0.12, "roc": 0.10,
+}
+IAT_FACTOR_NAMES = tuple(IAT_FACTOR_WEIGHTS)
+
+
+# ----------------------------------------------------------------- primitives
+def iat_ts(v):
+    x = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    return x.replace(tzinfo=IST) if x.tzinfo is None else x.astimezone(IST)
+
+
+def iat_finite(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def iat_clamp(v, lo, hi):
+    v = iat_finite(v)
+    if v is None:
+        return lo
+    return max(lo, min(hi, v))
+
+
+def iat_today():
+    return now_ist().date().isoformat()
+
+
+def iat_ema(series, length):
+    if not series:
+        return None
+    k = 2.0 / (length + 1.0)
+    val = float(series[0])
+    for price in series[1:]:
+        val = float(price) * k + val * (1.0 - k)
+    return val
+
+
+def iat_rsi(closes, length=14):
+    if len(closes) < length + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(-length, 0):
+        change = float(closes[i]) - float(closes[i - 1])
+        gains += max(change, 0.0)
+        losses += max(-change, 0.0)
+    if losses == 0:
+        return 100.0
+    rs = (gains / length) / (losses / length)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def iat_atr(highs, lows, closes, length=14):
+    if len(closes) < length + 1:
+        return None
+    trs = [max(float(highs[i]) - float(lows[i]),
+               abs(float(highs[i]) - float(closes[i - 1])),
+               abs(float(lows[i]) - float(closes[i - 1])))
+           for i in range(-length, 0)]
+    return sum(trs) / len(trs)
+
+
+def iat_vwap(rows):
+    num = den = 0.0
+    for r in rows:
+        high, low, close = iat_finite(r.get("high")), iat_finite(r.get("low")), iat_finite(r.get("close"))
+        vol = iat_finite(r.get("volume")) or 0.0
+        if None in (high, low, close) or vol <= 0:
+            continue
+        num += ((high + low + close) / 3.0) * vol
+        den += vol
+    return (num / den) if den > 0 else None
+
+
+# --------------------------------------------------------------- signal engine
+def iat_signal(candles, symbol=None, cfg=None):
+    """Independent 7-factor directional signal for one index.
+
+    The composite is a weighted mean of factors scored into [-1, +1], but an
+    entry additionally requires SIGN AGREEMENT: a large score manufactured by
+    one loud factor is precisely the coincidence this engine exists to ignore.
+    """
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    out = dict(symbol=symbol, score=0.0, strength=0.0, direction=None, agreement=0,
+               factors={}, regime="UNKNOWN", vol_percentile=0.0, atr=None, spot=None,
+               bar_ts=None, ready=False, reason="insufficient data")
+    try:
+        rows = [r for r in (candles or []) if r and iat_finite(r.get("close")) is not None]
+        if len(rows) < 60:
+            out["reason"] = "need at least 60 completed candles"
+            return out
+        closes = [iat_finite(r["close"]) for r in rows]
+        highs = [iat_finite(r.get("high") or r["close"]) for r in rows]
+        lows = [iat_finite(r.get("low") or r["close"]) for r in rows]
+        vols = [iat_finite(r.get("volume")) or 0.0 for r in rows]
+        spot = closes[-1]
+        if not spot or spot <= 0:
+            out["reason"] = "invalid last close"
+            return out
+
+        # 1. EMA structure (9/21/50) -- the trend context everything else sits in.
+        e9, e21, e50 = iat_ema(closes[-90:], 9), iat_ema(closes[-90:], 21), iat_ema(closes[-90:], 50)
+        gap = ((e9 - e50) / spot) if None not in (e9, e50) else 0.0
+        ema_score = iat_clamp(gap / 0.006, -1.0, 1.0)
+
+        # 2. RSI -- overbought/oversold is scored AGAINST continuation, mid-range
+        # is damped so a 55 reading never passes for a signal on its own.
+        rsi = iat_rsi(closes, 14)
+        if rsi is None:
+            rsi_score = 0.0
+        elif rsi >= 70:
+            rsi_score = -iat_clamp((rsi - 70.0) / 20.0, 0.0, 1.0)
+        elif rsi <= 30:
+            rsi_score = iat_clamp((30.0 - rsi) / 20.0, 0.0, 1.0)
+        else:
+            rsi_score = iat_clamp((rsi - 50.0) / 15.0, -1.0, 1.0) * 0.5
+
+        # 3. MACD histogram slope -- is momentum accelerating?
+        ema12, ema26 = iat_ema(closes[-90:], 12), iat_ema(closes[-90:], 26)
+        hist_now = (ema12 - ema26) if None not in (ema12, ema26) else 0.0
+        ema12_p, ema26_p = iat_ema(closes[-90:-1], 12), iat_ema(closes[-90:-1], 26)
+        hist_prev = (ema12_p - ema26_p) if None not in (ema12_p, ema26_p) else hist_now
+        accel = ((hist_now - hist_prev) / spot * 1000.0) if spot else 0.0
+        macd_score = iat_clamp(accel / 0.35, -1.0, 1.0)
+
+        # 4. Donchian position inside the 20-bar range.
+        win = 20
+        hi20, lo20 = max(highs[-win:]), min(lows[-win:])
+        span = hi20 - lo20
+        donchian_score = iat_clamp(((spot - lo20) / span * 2.0 - 1.0) if span > 0 else 0.0, -1.0, 1.0)
+
+        # 5. Volume -- reinforces the Donchian direction, never creates it.
+        vol_now, vol_base = vols[-1], (sum(vols[-21:-1]) / 20.0 if len(vols) >= 21 else 0.0)
+        vol_ratio = (vol_now / vol_base) if vol_base > 0 else 1.0
+        magnitude = iat_clamp((vol_ratio - 1.0) / 0.8, 0.0, 1.0)
+        volume_score = magnitude if donchian_score >= 0 else -magnitude
+
+        # 6. VWAP deviation -- the institutional reference price.
+        vwap = iat_vwap(rows[-60:])
+        vwap_score = iat_clamp(((spot - vwap) / vwap * 100.0) if vwap else 0.0 / 0.35, -1.0, 1.0) \
+            if vwap else 0.0
+
+        # 7. Five-bar rate of change.
+        roc = ((spot / closes[-6] - 1.0) * 100.0) if len(closes) >= 6 and closes[-6] else 0.0
+        roc_score = iat_clamp(roc / 0.30, -1.0, 1.0)
+
+        factors = {"ema_structure": iat_clamp(ema_score, -1, 1), "rsi": iat_clamp(rsi_score, -1, 1),
+                   "macd_slope": iat_clamp(macd_score, -1, 1), "donchian": donchian_score,
+                   "volume": iat_clamp(volume_score, -1, 1), "vwap": vwap_score,
+                   "roc": roc_score}
+        weights = dict(IAT_FACTOR_WEIGHTS)
+        total_w = sum(weights.values()) or 1.0
+        composite = sum(factors[k] * weights[k] for k in IAT_FACTOR_NAMES) / total_w
+
+        # Volatility percentile gates entries only -- it never carries direction.
+        atr = iat_atr(highs, lows, closes, 14)
+        atr_pct = (atr / spot) if atr else 0.0
+        series = []
+        for i in range(20, len(closes)):
+            a = iat_atr(highs[i - 13:i + 1], lows[i - 13:i + 1], closes[i - 13:i + 1], 14)
+            if a and closes[i]:
+                series.append(a / closes[i])
+        pctile = (1.0 * sum(1 for s in series if s <= atr_pct) / len(series)) if series else 0.5
+
+        if pctile >= 0.85:
+            regime = "HIGH_VOL"
+        elif abs(composite) >= 0.45:
+            regime = "TREND_UP" if composite > 0 else "TREND_DOWN"
+        elif abs(composite) < 0.20:
+            regime = "RANGE"
+        else:
+            regime = "CHOP"
+
+        agree = sum(1 for k in IAT_FACTOR_NAMES
+                    if factors[k] != 0 and (factors[k] > 0) == (composite > 0))
+        out.update(score=round(composite, 4), strength=round(abs(composite), 4),
+                   direction=("CE" if composite > 0 else "PE"), agreement=agree,
+                   factors={k: round(v, 4) for k, v in factors.items()}, regime=regime,
+                   vol_percentile=round(pctile, 4), atr=round(atr, 4) if atr else None,
+                   atr_pct=round(atr_pct, 6), spot=spot,
+                   vwap=round(vwap, 4) if vwap else None,
+                   rsi=round(rsi, 2) if rsi is not None else None,
+                   bar_ts=str(rows[-1]["ts"]) if rows[-1].get("ts") is not None else None,
+                   ready=True, reason=None)
+    except Exception as exc:
+        out["reason"] = "signal error: " + str(exc)
+    return out
+
+
+def iat_entry_allowed(report, cfg, open_symbols):
+    """Every gate that must pass before a signal may become an order."""
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    if not report.get("ready"):
+        return False, report.get("reason") or "signal not ready"
+    if report.get("strength", 0.0) < float(cfg["entry_threshold"]):
+        return False, "strength %.2f below threshold %.2f" % (report.get("strength", 0.0),
+                                                              cfg["entry_threshold"])
+    if report.get("agreement", 0) < int(cfg["min_agreement"]):
+        return False, "only %d of 7 factors agree (need %d)" % (report.get("agreement", 0),
+                                                                cfg["min_agreement"])
+    if report.get("vol_percentile", 0.0) > float(cfg["max_vol_percentile"]):
+        return False, "volatility at the %dth percentile; refusing to chase" % int(
+            report.get("vol_percentile", 0.0) * 100)
+    if report.get("symbol") in (open_symbols or set()):
+        return False, "position already open on %s" % report.get("symbol")
+    base = now_ist().replace(tzinfo=None)
+    if base.strftime("%H:%M") < cfg["session_start"] or base.strftime("%H:%M") >= cfg["square_off"]:
+        return False, "outside the session window (%s-%s)" % (cfg["session_start"], cfg["square_off"])
+    # Parse onto TODAY.  strptime("09:20") alone yields 1900-01-01, which would make
+    # the distance to square-off span decades and block every entry.
+    try:
+        def _at(hm):
+            hh, mm = (int(x) for x in hm.split(":"))
+            return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        into = int((base - _at(cfg["session_start"])).total_seconds() // 60)
+        until = int((_at(cfg["square_off"]) - base).total_seconds() // 60)
+    except Exception:
+        into = until = 10 ** 6
+    if into < int(cfg["protected_minutes"]) or until < int(cfg["protected_minutes"]):
+        return False, "inside the protected %d-minute buffer" % cfg["protected_minutes"]
+    return True, None
+
+
+# ---------------------------------------------------------------------- exits
+def iat_exit_reason(trade, bid, composite, cfg):
+    """Priority-ordered exit decision.  Protective rules outrank profit rules and
+    the hard stop is evaluated before the target, so a bar spanning both resolves
+    conservatively.  May mutate the trade's stop for trailing / breakeven."""
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    if bid is None or not math.isfinite(bid) or bid <= 0:
+        return "Position quote unavailable"
+    entry = float(trade.get("entry_price") or 0)
+    qty = int(trade.get("quantity") or 0)
+    if entry <= 0 or qty <= 0:
+        return "Trade record incomplete"
+    stop = float(trade.get("sl_price") or 0)
+    target = float(trade.get("target_price") or 0)
+    fees = float(trade.get("fees") or 0.0)
+    risk_unit = max(0.01, entry - float(trade.get("sl_entry") or stop))
+    held = 0.0
+    try:
+        # now_ist() is naive IST; iat_ts() returns tz-aware IST.  Strip the zone so
+        # the subtraction cannot raise -- a swallowed TypeError here would silently
+        # disable the max-hold exit.
+        opened = iat_ts(trade["opened_at"]).replace(tzinfo=None)
+        held = (now_ist().replace(tzinfo=None) - opened).total_seconds() / 60.0
+    except Exception:
+        held = 0.0
+    peak = max(float(trade.get("peak_bid") or entry), bid)
+
+    if bid <= stop:
+        return "Stop reached"
+    if bid >= target:
+        return "Target reached"
+    if now_ist().strftime("%H:%M") >= cfg["square_off"]:
+        return "Intraday square-off"
+    if held >= float(cfg["max_hold_minutes"]):
+        return "Maximum holding time"
+    score = trade.get("signal_score")
+    if score is not None and composite is not None:
+        if ((float(score) > 0) != (composite > 0)) and abs(composite) >= float(cfg["reversal_threshold"]):
+            return "Signal reversed"
+    # Trailing stop only once the trade has earned it.
+    if peak >= entry + float(cfg["trailing_activate_r"]) * risk_unit:
+        trail = peak - float(cfg["trailing_giveback_r"]) * risk_unit
+        if trail > stop:
+            trade["sl_price"] = round(trail, 2)
+            trade["trail_active"] = True
+    # Breakeven once the position has covered its own round-trip costs.
+    if not trade.get("breakeven_hit"):
+        r_now = (bid - entry) / risk_unit
+        if r_now >= float(cfg["breakeven_after_r"]):
+            be = entry + (fees / qty if qty else 0.0)
+            if be > float(trade.get("sl_price") or 0):
+                trade["sl_price"] = round(be, 2)
+            trade["breakeven_hit"] = True
+    return None
+
+
+# --------------------------------------------------------------------- sizing
+def iat_size(premium, lot_size, cfg, strength, depth_qty=None):
+    """Whole lots only.  Planned loss is stop distance x quantity plus costs, sized
+    so it fits the per-trade R budget; stake scales with signal strength."""
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    if not premium or premium <= 0 or not lot_size or lot_size <= 0:
+        return dict(lots=0, quantity=0, reason="invalid premium or lot size")
+    if premium < float(cfg["min_contract_premium"]):
+        return dict(lots=0, quantity=0, reason="premium below the minimum contract price")
+    stop_distance = premium * float(cfg["stop_pct_of_premium"]) / 100.0
+    per_lot_risk = stop_distance * lot_size
+    if per_lot_risk <= 0:
+        return dict(lots=0, quantity=0, reason="non-positive per-lot risk")
+    capital = float(cfg["capital_per_trade"])
+    lots_by_capital = int(capital // (premium * lot_size))
+    # Stake is a percentage of the trade's own capital, not an R figure: R is a
+    # measurement unit for outcomes, whereas rupees are what sizes an order.
+    budget = capital * (float(cfg["risk_per_trade_pct"]) / 100.0) * iat_clamp(0.5 + strength, 0.5, 1.5)
+    lots_by_risk = int(budget // per_lot_risk)
+    lots = max(0, min(lots_by_capital, lots_by_risk))
+    if depth_qty is not None:
+        try:
+            lots = min(lots, max(0, int(depth_qty) // lot_size))
+        except (TypeError, ValueError):
+            pass
+    if lots <= 0:
+        return dict(lots=0, quantity=0,
+                    reason="one lot needs Rs%.0f risk against a Rs%.0f budget"
+                           % (per_lot_risk, budget))
+    return dict(lots=lots, quantity=lots * lot_size, stop_distance=round(stop_distance, 2),
+                planned_risk=round(per_lot_risk * lots, 2), reason=None)
+
+
+# -------------------------------------------------------------------- ledger
+def iat_load_state():
+    state = dict(IAT_DEFAULTS)
+    if os.path.exists(IAT_STATE_FILE):
+        try:
+            with open(IAT_STATE_FILE, "r") as fh:
+                stored = json.load(fh)
+            if isinstance(stored, dict):
+                state.update({k: stored[k] for k in state if k in stored})
+        except Exception:
+            pass
+    if state.get("day") != iat_today():
+        state.update(day=iat_today(), halt_reason=None, last_error=None, trades_today=0,
+                     realized_r_today=0.0, loss_streak=0, peak_r_today=0.0)
+    return state
+
+
+def iat_save_state(state):
+    with IAT_LOCK:
+        with open(IAT_STATE_FILE, "w") as fh:
+            json.dump(state, fh, indent=2, default=str)
+
+
+def iat_load_trades():
+    if not os.path.exists(IAT_TRADES_FILE):
+        return []
+    try:
+        with open(IAT_TRADES_FILE, "r") as fh:
+            rows = json.load(fh)
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def iat_save_trades(trades):
+    with IAT_LOCK:
+        with open(IAT_TRADES_FILE, "w") as fh:
+            json.dump(trades[-400:], fh, indent=2, default=str)
+
+
+def iat_block_reason(state, trades, cfg):
+    """The single source of truth for 'may a new position be opened right now'."""
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    if state.get("halt_reason"):
+        return "Halted: " + str(state["halt_reason"])
+    if not state.get("armed"):
+        return "Autotrader disarmed"
+    if state.get("trades_today", 0) >= int(cfg["max_trades_per_day"]):
+        return "Daily trade cap reached (%d)" % cfg["max_trades_per_day"]
+    if state.get("realized_r_today", 0.0) <= -float(cfg["max_daily_loss_r"]):
+        return "Daily loss limit reached (%.2fR)" % state.get("realized_r_today", 0.0)
+    if state.get("loss_streak", 0) >= int(cfg["max_loss_streak"]):
+        return "Loss streak breaker (%d in a row)" % state.get("loss_streak", 0)
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    if len(open_trades) >= int(cfg["max_concurrent"]):
+        return "Concurrent position cap reached (%d)" % len(open_trades)
+    return None
+
+
+# ---------------------------------------------------------------- contract
+def iat_pick_contract(symbol, direction, cfg):
+    """Select the option to trade: nearest ATM in the signal direction, filtered
+    for a real bid/ask, a tight spread, a delta in the tradeable band and enough
+    days left that theta is not the dominant force."""
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    data, err = get_chain_for_symbol(symbol)
+    if err:
+        return None, None, (err.get("error") if isinstance(err, dict) else str(err))
+    chain = data.get("chain") or []
+    spot = iat_finite(data.get("spot")) or 0.0
+    lot_size = int(data.get("lot_size") or 0)
+    today = now_ist().date()
+    best = None
+    for opt in chain:
+        if opt.get("instrument_type") != direction:
+            continue
+        bid, ask = iat_finite(opt.get("bid")), iat_finite(opt.get("ask"))
+        if not bid or not ask or bid <= 0 or ask <= 0 or bid > ask:
+            continue
+        mid = (bid + ask) / 2.0
+        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 99.0
+        if spread_pct > float(cfg["max_spread_pct"]):
+            continue
+        delta = iat_finite(opt.get("delta"))
+        if delta is None or not float(cfg["min_delta"]) <= abs(delta) <= float(cfg["max_delta"]):
+            continue
+        expiry = opt.get("expiry")
+        dte = None
+        try:
+            if hasattr(expiry, "year"):
+                dte = (expiry - today).days
+            else:
+                dte = (datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).date() - today).days
+        except Exception:
+            dte = None
+        if dte is None or dte < int(cfg["min_dte"]):
+            continue
+        premium = iat_finite(opt.get("ltp")) or mid
+        if not premium or premium < float(cfg["min_contract_premium"]):
+            continue
+        entry = (spread_pct, premium, opt)
+        if best is None or entry[0] < best[0]:
+            best = entry
+    if best is None:
+        return None, None, "no %s contract passed the spread, delta, DTE and premium filters" % direction
+    return best[2], dict(spot=spot, lot_size=lot_size, spread_pct=round(best[0], 4),
+                         premium=round(best[1], 4)), None
+
+
+# ----------------------------------------------------------------- execution
+def iat_send(trade, side):
+    """MIS market order through the governed basket path.  Track mode sends
+    nothing at all -- the fill is simulated on the same live quote a live order
+    would have taken."""
+    if trade.get("execution_mode") != "live":
+        return "TRACK-%d" % int(time.time() * 1000), None
+    leg = {"leg": "iat_" + side, "tradingsymbol": trade["tradingsymbol"],
+           "exchange": trade.get("exchange", "NFO"),
+           "transaction_type": "BUY" if side == "entry" else "SELL",
+           "quantity": int(trade["quantity"])}
+    try:
+        results = place_basket_orders([leg], product="MIS", order_type="MARKET",
+                                      sequence_for_margin=False)
+    except Exception as exc:
+        return None, str(exc)
+    result = results[0] if results else {"status": "failed", "error": "no result returned"}
+    if result.get("status") != "placed":
+        return None, result.get("error") or "order failed"
+    return result.get("order_id"), None
+
+
+def iat_open(symbol, report, state, cfg):
+    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
+    option, meta, err = iat_pick_contract(symbol, report["direction"], cfg)
+    if err:
+        return None, "contract: " + str(err)
+    lot_size = int(meta["lot_size"] or 0)
+    if lot_size <= 0:
+        return None, "lot size unavailable for " + str(symbol)
+    premium = meta["premium"]
+    sized = iat_size(premium, lot_size, cfg, report.get("strength") or 0.0, option.get("depth_qty"))
+    if sized["lots"] <= 0:
+        return None, sized["reason"]
+    stop_distance = premium * float(cfg["stop_pct_of_premium"]) / 100.0
+    trade = {
+        "id": "IAT%d" % int(time.time() * 1000), "symbol": symbol,
+        "direction": report["direction"], "tradingsymbol": option["tradingsymbol"],
+        "exchange": option.get("exchange", "NFO"), "strike": option.get("strike"),
+        "expiry": str(option.get("expiry")), "quantity": sized["quantity"],
+        "lot_size": lot_size, "lots": sized["lots"], "entry_price": premium,
+        "sl_price": round(premium - stop_distance, 2),
+        "sl_entry": round(premium - stop_distance, 2),
+        "target_price": round(premium + stop_distance * float(cfg["reward_r"]), 2),
+        "signal_score": report.get("score"), "strength": report.get("strength"),
+        "agreement": report.get("agreement"), "factors": report.get("factors"),
+        "regime": report.get("regime"), "vol_percentile": report.get("vol_percentile"),
+        "spread_pct": meta["spread_pct"], "spot_at_entry": meta["spot"],
+        "execution_mode": state.get("execution_mode", "track"), "status": "open",
+        "fees": 0.0, "peak_bid": premium, "breakeven_hit": False, "trail_active": False,
+        "opened_at": now_ist().isoformat(), "closed_at": None, "exit_reason": None,
+        "exit_price": None, "realized_pnl": None, "realized_r": None,
+    }
+    order_id, err = iat_send(trade, "entry")
+    if err:
+        return None, "entry order: " + str(err)
+    trade["order_id"] = order_id
+    return trade, None
+
+
+def iat_close(trade, reason, bid, state):
+    trade = dict(trade)
+    trade["status"] = "closed"
+    trade["exit_reason"] = reason
+    trade["closed_at"] = now_ist().isoformat()
+    if bid and math.isfinite(bid) and bid > 0:
+        trade["exit_price"] = round(float(bid), 2)
+    order_id, err = iat_send(trade, "exit")
+    if err:
+        trade["exit_order_error"] = str(err)
+    else:
+        trade["exit_order_id"] = order_id
+    entry = float(trade.get("entry_price") or 0)
+    qty = int(trade.get("quantity") or 0)
+    if trade.get("exit_price") and entry > 0 and qty > 0:
+        pnl = (float(trade["exit_price"]) - entry) * qty
+        risk_unit = max(0.01, entry - float(trade.get("sl_entry") or trade.get("sl_price") or entry))
+        trade["realized_pnl"] = round(pnl, 2)
+        trade["realized_r"] = round((pnl - float(trade.get("fees") or 0.0)) / (risk_unit * qty), 4)
+    state["trades_today"] = int(state.get("trades_today", 0)) + 1
+    realized = float(trade.get("realized_r") or 0.0)
+    state["realized_r_today"] = round(float(state.get("realized_r_today", 0.0)) + realized, 4)
+    state["peak_r_today"] = max(float(state.get("peak_r_today", 0.0)),
+                                float(state.get("realized_r_today", 0.0)))
+    state["loss_streak"] = int(state.get("loss_streak", 0)) + 1 if realized < 0 else 0
+    return trade
+
+
+def iat_option_quote(trade):
+    key = "%s:%s" % (trade.get("exchange", "NFO"), trade.get("tradingsymbol"))
+    try:
+        q = kite_quote_bulk([key]).get(key) or {}
+    except Exception:
+        return None
+    bid = iat_finite(q.get("last_price"))
+    if bid and bid > 0:
+        return bid
+    return None
+
+
+# ------------------------------------------------------------------ the tick
+def iat_tick():
+    """One full cycle: supervise open positions first, then look for an entry."""
+    state = iat_load_state()
+    trades = iat_load_trades()
+    cfg = state
+    if not state.get("armed"):
+        return state, trades, "disarmed"
+    open_trades = [t for t in trades if t.get("status") == "open"]
+
+    # 1. Supervision always runs before any new entry is considered.
+    latest_composite = {}
+    for symbol in state.get("symbols") or ["NIFTY"]:
+        try:
+            candles = INDEX_OPTIONS_DESK.a.bars(symbol, 120)
+            latest_composite[symbol] = iat_signal(candles, symbol, cfg).get("score")
+        except Exception:
+            latest_composite[symbol] = None
+    for trade in list(open_trades):
+        bid = iat_option_quote(trade)
+        if bid is None:
+            # A missing quote is not a reason to liquidate; it is a reason to keep
+            # the existing stop and try again next tick.
+            continue
+        trade["peak_bid"] = max(float(trade.get("peak_bid") or trade["entry_price"]), bid)
+        reason = iat_exit_reason(trade, bid, latest_composite.get(trade["symbol"]), cfg)
+        if reason:
+            closed = iat_close(trade, reason, bid, state)
+            trades[trades.index(trade)] = closed
+            open_trades.remove(trade)
+
+    # 2. Daily loss limit closes everything, it does not merely block new entries.
+    if state.get("realized_r_today", 0.0) <= -float(cfg["max_daily_loss_r"]):
+        for trade in list(open_trades):
+            bid = iat_option_quote(trade)
+            if bid:
+                closed = iat_close(trade, "Daily loss limit", bid, state)
+                trades[trades.index(trade)] = closed
+                open_trades.remove(trade)
+        state["halt_reason"] = "daily loss limit reached at %.2fR" % state["realized_r_today"]
+
+    # 3. New entry, if every gate allows it.
+    blocked = iat_block_reason(state, trades, cfg)
+    if not blocked:
+        open_symbols = {t["symbol"] for t in open_trades}
+        for symbol in state.get("symbols") or ["NIFTY"]:
+            try:
+                candles = INDEX_OPTIONS_DESK.a.bars(symbol, 120)
+            except Exception as exc:
+                state["last_error"] = "candles: %s" % exc
+                continue
+            report = iat_signal(candles, symbol, cfg)
+            report["symbol"] = symbol
+            state["last_signal"] = report
+            ok, why = iat_entry_allowed(report, cfg, open_symbols)
+            if not ok:
+                state["last_error"] = why
+                continue
+            trade, err = iat_open(symbol, report, state, cfg)
+            if err:
+                state["last_error"] = err
+                continue
+            trades.append(trade)
+            state["last_error"] = None
+            break
+
+    state["last_scan_at"] = now_ist().isoformat()
+    iat_save_state(state)
+    iat_save_trades(trades)
+    return state, trades, None
+
+
+IAT_STOP = threading.Event()
+
+
+def iat_loop():
+    while not IAT_STOP.is_set():
+        try:
+            if now_ist().strftime("%H:%M") < "09:15":
+                IAT_STOP.wait(60)
+                continue
+            state = iat_load_state()
+            if state.get("armed"):
+                iat_tick()
+            IAT_STOP.wait(max(5, int(state.get("poll_seconds") or 20)))
+        except Exception as exc:
+            try:
+                stale = iat_load_state()
+                stale["last_error"] = "loop: %s" % exc
+                iat_save_state(stale)
+            except Exception:
+                pass
+            IAT_STOP.wait(20)
+
+
+# -------------------------------------------------------------------- routes
+def _iat_gate():
+    if not require_session():
+        return jsonify({"error": "not_logged_in"}), 401
+    return None
+
+
+@app.route("/api/index-autotrader/state")
+def iat_state_route():
+    err = _iat_gate()
+    if err:
+        return err
+    state = iat_load_state()
+    trades = iat_load_trades()
+    closed = [t for t in trades if t.get("status") == "closed" and t.get("realized_r") is not None]
+    window = [float(t["realized_r"]) for t in closed[-24:]]
+    equity, running = [], 0.0
+    for t in closed[-100:]:
+        running += float(t.get("realized_r") or 0.0)
+        equity.append(dict(ts=t.get("closed_at"), r=round(running, 4)))
+    return jsonify({
+        "state": {k: state.get(k) for k in
+                  ("armed", "execution_mode", "symbols", "day", "halt_reason", "trades_today",
+                   "realized_r_today", "loss_streak", "peak_r_today", "last_scan_at",
+                   "last_error", "last_signal")},
+        "defaults": IAT_DEFAULTS,
+        "factor_weights": IAT_FACTOR_WEIGHTS,
+        "block_reason": iat_block_reason(state, trades, state),
+        "open": [t for t in trades if t.get("status") == "open"],
+        "recent": list(reversed(closed[-25:])),
+        "stats": {
+            "trades": len(closed),
+            "trailing_expectancy_r": round(sum(window) / len(window), 4) if window else 0.0,
+            "win_rate": round(100.0 * sum(1 for r in window if r > 0) / len(window), 1) if window else 0.0,
+            "net_r": round(sum(window), 4),
+            "profit_factor": (round(sum(r for r in window if r > 0) / abs(sum(r for r in window if r < 0)), 2)
+                              if sum(r for r in window if r < 0) else None),
+        },
+        "equity": equity,
+    })
+
+
+@app.route("/api/index-autotrader/config", methods=["POST"])
+def iat_config_route():
+    err = _iat_gate()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    state = iat_load_state()
+    bounds = {
+        "entry_threshold": (0.05, 1.0), "min_agreement": (1, 7),
+        "max_vol_percentile": (0.1, 1.0), "reversal_threshold": (0.05, 1.0),
+        "risk_per_trade_pct": (0.1, 100), "stop_pct_of_premium": (2, 50),
+        "reward_r": (0.5, 6), "capital_per_trade": (1000, 10000000),
+        "max_daily_loss_r": (0.5, 100), "max_trades_per_day": (0, 50),
+        "max_concurrent": (1, 5), "max_loss_streak": (1, 20),
+        "protected_minutes": (0, 120), "max_hold_minutes": (5, 400),
+        "poll_seconds": (5, 300), "min_dte": (0, 60),
+        "max_spread_pct": (0.05, 10), "min_delta": (0.05, 0.95),
+        "max_delta": (0.05, 0.99), "min_contract_premium": (0.1, 10000),
+        "trailing_activate_r": (0, 10), "trailing_giveback_r": (0, 10),
+        "breakeven_after_r": (0, 10),
+    }
+    for key, value in body.items():
+        if key == "symbols":
+            if not isinstance(value, list) or not value:
+                return jsonify({"error": "symbols must be a non-empty list"}), 400
+            state["symbols"] = [str(s).upper() for s in value][:5]
+        elif key in ("session_start", "square_off"):
+            if not isinstance(value, str) or len(value) != 5:
+                return jsonify({"error": key + " must be HH:MM"}), 400
+            datetime.strptime(value, "%H:%M")
+            state[key] = value
+        elif key in ("armed", "auto_start"):
+            if not isinstance(value, bool):
+                return jsonify({"error": key + " must be true or false"}), 400
+            state[key] = value
+        elif key == "execution_mode":
+            if value not in ("track", "live"):
+                return jsonify({"error": "execution_mode must be track or live"}), 400
+            state[key] = value
+        elif key == "clear_halt" and value:
+            state["halt_reason"] = None
+            state["loss_streak"] = 0
+        elif key in bounds:
+            value = float(value)
+            lo, hi = bounds[key]
+            if not math.isfinite(value) or not lo <= value <= hi:
+                return jsonify({"error": "%s: expected %s to %s" % (key, lo, hi)}), 400
+            state[key] = int(value) if key in ("min_agreement", "max_trades_per_day",
+                                               "max_concurrent", "max_loss_streak",
+                                               "protected_minutes", "max_hold_minutes",
+                                               "poll_seconds", "min_dte") else value
+        else:
+            return jsonify({"error": "Unsupported setting: " + key}), 400
+    if state["square_off"] <= state["session_start"]:
+        return jsonify({"error": "square_off must be later than session_start"}), 400
+    state.setdefault("day", iat_today())
+    iat_save_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/index-autotrader/arm", methods=["POST"])
+def iat_arm_route():
+    err = _iat_gate()
+    if err:
+        return err
+    state = iat_load_state()
+    body = request.get_json(silent=True) or {}
+    if state.get("halt_reason") and not body.get("clear_halt"):
+        return jsonify({"error": "Halted: " + str(state["halt_reason"]) + " (post clear_halt=true)"}), 400
+    if state.get("execution_mode") == "live" and body.get("ack") is not True:
+        return jsonify({"error": "live execution requires ack:true"}), 400
+    if body.get("clear_halt"):
+        state["halt_reason"] = None
+        state["loss_streak"] = 0
+    state["armed"] = True
+    state["day"] = iat_today()
+    iat_save_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/index-autotrader/disarm", methods=["POST"])
+def iat_disarm_route():
+    err = _iat_gate()
+    if err:
+        return err
+    state = iat_load_state()
+    state["armed"] = False
+    iat_save_state(state)
+    return jsonify({"ok": True, "state": state})
+
+
+@app.route("/api/index-autotrader/close-all", methods=["POST"])
+def iat_close_all_route():
+    err = _iat_gate()
+    if err:
+        return err
+    state = iat_load_state()
+    trades = iat_load_trades()
+    closed = []
+    for trade in trades:
+        if trade.get("status") != "open":
+            continue
+        bid = iat_option_quote(trade) or trade.get("entry_price")
+        closed.append(iat_close(trade, "Manual close all", bid, state))
+    state["armed"] = False
+    iat_save_state(state)
+    iat_save_trades(trades)
+    return jsonify({"ok": True, "closed": len(closed)})
 
 start_application_workers()
 

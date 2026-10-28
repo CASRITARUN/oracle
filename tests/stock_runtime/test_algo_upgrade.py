@@ -35,7 +35,7 @@ ns=dict(np=np,json=json,math=math,os=os,sqlite3=sqlite3,threading=threading,time
 for _node in tree.body:
     if not isinstance(_node,ast.Assign):continue
     _names=[t.id for t in _node.targets if isinstance(t,ast.Name)]
-    if not _names or not any(n.startswith(('STOCK_','INDEX_')) for n in _names):continue
+    if not _names or not any(n.startswith(('STOCK_','INDEX_','IAT_')) for n in _names):continue
     if any(n in ns for n in _names):continue
     try:_value=eval(compile(ast.Expression(_node.value),'production constants','eval'),ns)
     except Exception:continue
