@@ -13849,8 +13849,9 @@ class StockDeskEngine(DeskEngine):
         elif age<0:problems.append('model training timestamp is in the future; check server clock')
         elif age>7:problems.append(f'model trained {age:.1f} days ago (maximum 7); automatic retraining pending — see Learning lab')
         # An AUC level scales SIZING, it is not an entry cutoff (see model_quality docs).
-        # The 0.25 floor is removed so a zero-skill model sizes to zero, not a quarter.
-        weight=0. if problems else min(1.,max(0.,(auc-.5)/.15))*min(1.,samples/300.)
+        # Below STOCK_LIVE_MIN_DIRECTION_AUC the model has no demonstrated edge and is
+        # given no size at all; above it, size ramps up from zero rather than from 0.25.
+        weight=0. if problems or auc is None or auc<STOCK_LIVE_MIN_DIRECTION_AUC else min(1.,max(0.,(auc-.5)/.15))*min(1.,samples/300.)
         return dict(live_ok=not problems,risk_weight=weight,issues=problems,age_days=age,
                     note='Validation-quality proxy; confidence is not a calibrated win probability')
     @staticmethod
@@ -16530,7 +16531,10 @@ class StockRuntimeEngine(StockDeskEngine):
             result['issues']=[x for x in result['issues'] if not x.startswith('model trained ')]
             result['live_ok']=not result['issues'];result['revalidated_at']=review['updated']
             if result['live_ok']:
-                result['risk_weight']=min(1.,max(0.,(float(review.get('champion_auc') or .5)-.5)/.15))*min(1.,float(review['samples'])/300.)
+                # Same floor as the base engine: a revalidated champion below the edge
+                # floor keeps live_ok but is sized to zero, never to the old 0.25 minimum.
+                _champion_auc=float(review.get('champion_auc') or .5)
+                result['risk_weight']=0. if _champion_auc<STOCK_LIVE_MIN_DIRECTION_AUC else min(1.,max(0.,(_champion_auc-.5)/.15))*min(1.,float(review['samples'])/300.)
         return result
     def _risk_tick(self):
         # Yesterday's manual pause must not silently prevent the already-authorized
