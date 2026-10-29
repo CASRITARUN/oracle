@@ -457,7 +457,8 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <button class="top-tab-btn" id="tabBtnStockTradeAI" onclick="switchTopTab('stockTradeAI')">📊 Stock Options AI</button>
 <button class="top-tab-btn active" id="tabBtnCondor" onclick="switchTopTab('condor')">Option Selling — Condor / Strangle</button>
 <button class="top-tab-btn" id="tabBtnMove" onclick="switchTopTab('move')">📈 Long Straddle / Strangle (Breakout)</button>
-<button class="top-tab-btn" id="tabBtnIat" onclick="switchTopTab('iat')">🤖 Index Autotrader — independent</button>
+<button class="top-tab-btn" id="tabBtnPAStock" onclick="switchTopTab('paStock')">🎯 Stock Options — Auto Trader</button>
+<button class="top-tab-btn" id="tabBtnPAIndex" onclick="switchTopTab('paIndex')">🎯 Index Options — Auto Trader</button>
 </div>
 
 
@@ -1006,113 +1007,6 @@ body.ai-evolution-mode .top-tab-btn.active { color:#20252b; border-bottom-color:
 <section data-ix-pane="journal" class="sk-view" hidden><div class="sk-section-intro"><div><p class="sk-eyebrow">TRADE JOURNAL</p><h2>Confirmed fills and retained evidence.</h2><p>This new index engine has its own trade history. Paper trades are simulated; live fills come from Kite. Retired engine records are not imported.</p></div></div><section class="sk-panel"><h2>Recent trades</h2><div id="ixTrades" class="sk-table-wrap"></div></section><section class="sk-panel"><h2>Broker orders</h2><div id="ixOrders" class="sk-table-wrap"></div></section><section class="sk-panel"><h2>Order reconciliation</h2><div id="ixRecovery"></div></section><section class="sk-panel"><h2>Detailed review &amp; exports</h2><div id="ixReviewControls"></div><div id="ixReviewOutput"></div></section></section>
 <section data-ix-pane="risk" class="sk-view" hidden><div class="sk-section-intro"><div><p class="sk-eyebrow">RISK &amp; CONTROLS</p><h2>Set the index desk limits.</h2><p>Disarm and close/reconcile index positions before changing settings. Index risk limits apply only to this desk; Stock AI uses its own limits.</p></div></div><form id="ixSettings" class="sk-panel"><div id="ixFields" class="sk-settings"></div><button class="sk-primary" id="ixSave" type="submit">Save index settings</button><p class="sk-footnote">Stops and whole-lot size adapt to ATR, option delta, entry strength, available daily risk, premium budget and displayed depth. Pending limits can be repriced within configured bounds; unknown submissions require broker confirmation. Stops only tighten after entry. Planned loss includes estimated costs; gaps and fills can exceed it. Brokerage reserve excludes percentage charges, which are estimated separately.</p></form><section class="sk-panel"><h2>Execution protection</h2><p id="ixHalt">—</p><button id="ixClear">Clear resolved halt</button><p class="sk-footnote">Cannot clear unresolved live orders or mismatched quantities. Live mode requires explicit confirmation. Each restart disarms entries.</p></section><section class="sk-panel"><h2>Entry &amp; exit logic</h2><p>Direction selects CE or PE. Contract selection checks delta, spread, a valid lot size and executable bid/ask. This new engine uses the Stock AI workflow: historical and forward direction, historical setup ranking and completed paper-option evidence. Its own models train only on this index universe. It rechecks each candidate before submission. Stops, partial profit-taking, targets, reversal, maximum holding time and intraday square-off supervise filled quantities.</p><p class="sk-footnote">AUC has no hard minimum for entry. Brier is diagnostic; sample count, model age and baseline checks still apply; AUC continues to influence size. This desk starts in paper mode; it does not inherit Stock AI’s automatic 09:15 arming. Only one backend process should run.</p></section></section>
 <footer class="sk-footer"><span>INDEX OPTIONS AI</span><span>Independent risk · IST timestamps</span><small id="ixBuild">Connecting…</small></footer></div></div>
-
-<div class="tab-page" id="tabPageIat">
-<style>
-  .iat-wrap{padding:18px 22px;display:grid;gap:16px}
-  .iat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
-  .iat-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px}
-  .iat-card h3{margin:0 0 10px;font-size:13px;letter-spacing:.06em;color:#667085;text-transform:uppercase}
-  .iat-kpi{display:flex;gap:22px;flex-wrap:wrap}
-  .iat-kpi div span{display:block;font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em}
-  .iat-kpi div b{font-size:22px;font-weight:600}
-  .iat-pos{color:#0a7d54}.iat-neg{color:#c02626}.iat-flat{color:#667085}
-  .iat-fbar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
-  .iat-fbar label{width:96px;color:#667085}
-  .iat-fbar .track{flex:1;height:8px;background:#f1f2f4;border-radius:4px;position:relative;overflow:hidden}
-  .iat-fbar .zero{position:absolute;left:50%;top:0;bottom:0;width:1px;background:#d0d5dd}
-  .iat-fbar .fill{position:absolute;top:0;bottom:0;border-radius:4px}
-  .iat-fbar .val{width:52px;text-align:right;font-variant-numeric:tabular-nums}
-  .iat-table{width:100%;border-collapse:collapse;font-size:12px}
-  .iat-table th,.iat-table td{padding:6px 8px;text-align:left;border-bottom:1px solid #eef0f2;white-space:nowrap}
-  .iat-table th{color:#667085;font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.05em}
-  .iat-chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
-  .iat-chip.up{background:#e6f6ee;color:#0a7d54}.iat-chip.down{background:#fdeaea;color:#c02626}
-  .iat-chip.n{background:#f2f4f7;color:#475467}
-  .iat-note{font-size:12px;color:#667085;margin-top:8px;line-height:1.5}
-  .iat-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .iat-actions button{padding:8px 14px;border-radius:8px;border:1px solid #d0d5dd;background:#fff;cursor:pointer;font-weight:600}
-  .iat-actions button.go{background:#ff6338;border-color:#ff6338;color:#fff}
-  .iat-actions button.stop{background:#fff;border-color:#c02626;color:#c02626}
-  .iat-settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-  .iat-settings label{display:block;font-size:11px;color:#667085;margin-bottom:3px}
-  .iat-settings input,.iat-settings select{width:100%;padding:6px 8px;border:1px solid #d0d5dd;border-radius:6px}
-</style>
-
-<div class="iat-wrap">
-  <div class="iat-card">
-    <div class="iat-kpi">
-      <div><span>Autotrader</span><b id="iatArmed">—</b></div>
-      <div><span>Execution</span><b id="iatMode">—</b></div>
-      <div><span>Today</span><b id="iatDayR">—</b></div>
-      <div><span>Trades today</span><b id="iatTrades">—</b></div>
-      <div><span>Loss streak</span><b id="iatStreak">—</b></div>
-      <div><span>Last scan</span><b id="iatScan">—</b></div>
-    </div>
-    <p class="iat-note" id="iatBlock">—</p>
-    <div class="iat-actions" style="margin-top:12px">
-      <select id="iatExecMode"><option value="track">Track (simulated)</option><option value="live">Live (real orders)</option></select>
-      <button class="go" id="iatArm">Arm</button>
-      <button class="stop" id="iatDisarm">Disarm</button>
-      <button id="iatCloseAll">Close all positions</button>
-      <button id="iatRefresh">Refresh ↻</button>
-    </div>
-    <p class="iat-note"><strong>This engine is independent.</strong> It runs its own seven-factor signal model over its own candles and decides for itself — it does not read Stock AI or Index AI. Every live order is MIS, so the broker's own end-of-day square-off is a second safety net behind the hard stop, target, trailing stop, max-hold, square-off, daily-R limit, trade cap and loss-streak breaker. Nothing is sent to the broker in track mode.</p>
-  </div>
-
-  <div class="iat-grid">
-    <div class="iat-card">
-      <h3>Live signal</h3>
-      <div class="iat-kpi" style="margin-bottom:12px">
-        <div><span>Composite</span><b id="iatScore">—</b></div>
-        <div><span>Direction</span><b id="iatDir">—</b></div>
-        <div><span>Agreement</span><b id="iatAgree">—</b></div>
-        <div><span>Regime</span><b id="iatRegime">—</b></div>
-        <div><span>Spot</span><b id="iatSpot">—</b></div>
-        <div><span>Vol pctile</span><b id="iatVol">—</b></div>
-      </div>
-      <div id="iatFactors"></div>
-      <p class="iat-note" id="iatSignalNote"></p>
-    </div>
-
-    <div class="iat-card">
-      <h3>Performance</h3>
-      <div class="iat-kpi">
-        <div><span>Net R</span><b id="iatNetR">—</b></div>
-        <div><span>Trailing expectancy</span><b id="iatExp">—</b></div>
-        <div><span>Win rate</span><b id="iatWin">—</b></div>
-        <div><span>Profit factor</span><b id="iatPf">—</b></div>
-      </div>
-      <p class="iat-note">Trailing window is the last 24 closed trades. Expectancy is measured in R, so it is comparable across different position sizes.</p>
-    </div>
-  </div>
-
-  <div class="iat-card">
-    <h3>Open positions</h3>
-    <div style="overflow-x:auto"><table class="iat-table" id="iatOpen"><thead><tr>
-      <th>Symbol</th><th>Type</th><th>Contract</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Strength</th><th>Mode</th>
-    </tr></thead><tbody></tbody></table></div>
-  </div>
-
-  <div class="iat-card">
-    <h3>Recent trades</h3>
-    <div style="overflow-x:auto"><table class="iat-table" id="iatRecent"><thead><tr>
-      <th>Closed</th><th>Symbol</th><th>Type</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>Reason</th>
-    </tr></thead><tbody></tbody></table></div>
-  </div>
-
-  <div class="iat-card">
-    <h3>Strategy settings</h3>
-    <div class="iat-settings" id="iatSettings"></div>
-    <div class="iat-actions" style="margin-top:14px">
-      <button class="go" id="iatSave">Save settings</button>
-      <span class="iat-note" id="iatSaveMsg"></span>
-    </div>
-    <p class="iat-note">Saving settings does not arm the engine. Signal thresholds, risk, time and book-quality limits are all adjustable; halts must be cleared explicitly.</p>
-  </div>
-</div>
-</div>
-
 <div class="tab-page" id="tabPageStockTradeAI"><!-- STOCK_AI_V1_START -->
 <style>
 /* AI Desk v2: restrained midnight/ivory workspace, electric chart accents. */
@@ -2572,145 +2466,16 @@ document.getElementById("refreshEventsBtn").onclick = loadEvents;
 // Remaining top tabs + Continuous Index Breakout Monitor
 // ============================================================================
 function switchTopTab(which) {
-  if(!['condor','move','stockTradeAI','indexTradeAI','iat'].includes(which))which='stockTradeAI';
-  for(const [key,suffix] of [['condor','Condor'],['move','Move'],['stockTradeAI','StockTradeAI'],['indexTradeAI','IndexTradeAI'],['iat','Iat']]){
+  if(!['condor','move','stockTradeAI','indexTradeAI'].includes(which))which='stockTradeAI';
+  for(const [key,suffix] of [['condor','Condor'],['move','Move'],['stockTradeAI','StockTradeAI'],['indexTradeAI','IndexTradeAI']]){
     document.getElementById('tabPage'+suffix).classList.toggle('active',which===key);
     document.getElementById('tabBtn'+suffix).classList.toggle('active',which===key);
   }
   document.body.classList.toggle('ai-evolution-mode',['stockTradeAI','indexTradeAI'].includes(which));
-  if(which==='iat')iatInitIatUI();
   if(which==='stockTradeAI')initStockTradeAIUI();
   if(which==='indexTradeAI')initIndexTradeAIUI();
 }
 
-
-
-// ---------------- Index Autotrader (independent engine) ----------------
-const IAT_FIELDS = [
-  ['entry_threshold','Entry threshold',0.05],['min_agreement','Min factor agreement',1],
-  ['max_vol_percentile','Max vol percentile',0.01],['reversal_threshold','Reversal threshold',0.05],
-  ['risk_per_trade_pct','Risk per trade (% of capital)',0.1],['stop_pct_of_premium','Stop % of premium',0.1],
-  ['reward_r','Reward : risk',0.1],['capital_per_trade','Capital per trade',1000],
-  ['max_daily_loss_r','Daily loss cap (R)',0.5],['max_trades_per_day','Max trades / day',1],
-  ['max_concurrent','Max concurrent',1],['max_loss_streak','Loss-streak breaker',1],
-  ['session_start','Session start',0],['square_off','Square-off',0],
-  ['protected_minutes','Protected minutes',1],['max_hold_minutes','Max hold (min)',1],
-  ['min_dte','Min days to expiry',1],['max_spread_pct','Max spread %',0.05],
-  ['min_delta','Min delta',0.01],['max_delta','Max delta',0.01],
-  ['trailing_activate_r','Trail activates at (R)',0.05],['trailing_giveback_r','Trail giveback (R)',0.05],
-  ['breakeven_after_r','Breakeven after (R)',0.05],['poll_seconds','Poll seconds',1],
-];
-let IAT_DATA = null;
-
-function iatNum(v){ return (v===null||v===undefined||v==='') ? '—' : Number(v).toFixed(2); }
-function iatR(v){ const n=Number(v); if(!isFinite(n)) return '—'; return (n>0?'+':'')+n.toFixed(2)+'R'; }
-function iatCls(v){ return v>0?'iat-pos':v<0?'iat-neg':'iat-flat'; }
-
-async function iatFetch(){
-  try{
-    const r = await fetch('/api/index-autotrader/state',{credentials:'same-origin'});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    IAT_DATA = await r.json();
-    iatRender();
-  }catch(e){ const el=document.getElementById('iatBlock'); if(el) el.textContent='Autotrader status unavailable: '+e.message; }
-}
-
-function iatRender(){
-  const d=IAT_DATA; if(!d) return;
-  const s=d.state||{}, st=d.stats||{};
-  const armed=document.getElementById('iatArmed');
-  armed.textContent = s.armed ? 'ARMED' : 'DISARMED';
-  armed.className = s.armed ? 'iat-pos' : 'iat-neg';
-  document.getElementById('iatMode').textContent = (s.execution_mode||'track').toUpperCase();
-  const dayR=document.getElementById('iatDayR');
-  dayR.textContent = iatR(s.realized_r_today); dayR.className = iatCls(s.realized_r_today);
-  document.getElementById('iatTrades').textContent = s.trades_today ?? 0;
-  document.getElementById('iatStreak').textContent = s.loss_streak ?? 0;
-  document.getElementById('iatScan').textContent = s.last_scan_at ? new Date(s.last_scan_at).toLocaleTimeString() : '—';
-  const blk = d.block_reason || 'No blockers.';
-  document.getElementById('iatBlock').textContent = (s.halt_reason ? 'HALTED — '+s.halt_reason+'. ' : '') + blk + (s.last_error ? ' · '+s.last_error : '');
-  document.getElementById('iatExecMode').value = s.execution_mode || 'track';
-
-  const sig=s.last_signal||null;
-  const put=(id,v)=>{const e=document.getElementById(id); if(e) e.textContent=v;};
-  put('iatScore', sig && sig.ready ? iatNum(sig.score) : '—');
-  const dir=document.getElementById('iatDir');
-  dir.textContent = sig && sig.ready ? sig.direction : '—';
-  dir.className = sig && sig.ready ? (sig.direction==='CE'?'iat-pos chip up':'iat-neg') : '';
-  put('iatAgree', sig && sig.ready ? sig.agreement+' / 7' : '—');
-  put('iatRegime', (sig&&sig.regime)||'—');
-  put('iatSpot', sig && sig.spot ? '₹'+Number(sig.spot).toLocaleString('en-IN') : '—');
-  put('iatVol', sig ? Math.round((sig.vol_percentile||0)*100)+'th' : '—');
-  const note=document.getElementById('iatSignalNote');
-  if(note) note.textContent = sig ? ((sig.ready?'Composite '+sig.score+'. ':'')+(sig.reason||'')) : 'No signal scanned yet.';
-  const fac=document.getElementById('iatFactors');
-  fac.innerHTML = (sig&&sig.factors) ? Object.entries(sig.factors).map(([k,v])=>{
-    const pct=Math.abs(v)*50, left=v>=0?50:50-pct, col=v>=0?'#0a7d54':'#c02626';
-    return '<div class="iat-fbar"><label>'+k.replace('_',' ')+'</label><div class="track"><div class="zero"></div>'+
-      '<div class="fill" style="left:'+left+'%;width:'+pct+'%;background:'+col+'"></div></div>'+
-      '<div class="val '+iatCls(v)+'">'+(v>0?'+':'')+v.toFixed(2)+'</div></div>';
-  }).join('') : '<p class="iat-note">No factor breakdown yet.</p>';
-
-  const net=document.getElementById('iatNetR'); net.textContent=iatR(st.net_r); net.className=iatCls(st.net_r);
-  const exp=document.getElementById('iatExp'); exp.textContent=iatR(st.trailing_expectancy_r); exp.className=iatCls(st.trailing_expectancy_r);
-  put('iatWin', st.win_rate!=null ? st.win_rate+'%' : '—');
-  put('iatPf', st.profit_factor==null ? '—' : st.profit_factor);
-
-  document.querySelector('#iatOpen tbody').innerHTML = (d.open||[]).map(t=>
-    '<tr><td>'+t.symbol+'</td><td><span class="iat-chip '+(t.direction==='CE'?'up':'down')+'">'+t.direction+'</span></td>'+
-    '<td>'+(t.tradingsymbol||'')+'</td><td>'+t.quantity+'</td><td>'+iatNum(t.entry_price)+'</td>'+
-    '<td>'+iatNum(t.sl_price)+'</td><td>'+iatNum(t.target_price)+'</td><td>'+iatNum(t.strength)+'</td>'+
-    '<td>'+(t.execution_mode||'')+'</td></tr>').join('') || '<tr><td colspan="9" class="iat-note">No open positions.</td></tr>';
-
-  document.querySelector('#iatRecent tbody').innerHTML = (d.recent||[]).map(t=>
-    '<tr><td>'+(t.closed_at?new Date(t.closed_at).toLocaleTimeString():'—')+'</td><td>'+t.symbol+'</td>'+
-    '<td><span class="iat-chip '+(t.direction==='CE'?'up':'down')+'">'+t.direction+'</span></td>'+
-    '<td>'+iatNum(t.entry_price)+'</td><td>'+iatNum(t.exit_price)+'</td>'+
-    '<td class="'+iatCls(t.realized_pnl)+'">'+(t.realized_pnl==null?'—':Number(t.realized_pnl).toFixed(0))+'</td>'+
-    '<td class="'+iatCls(t.realized_r)+'">'+iatR(t.realized_r)+'</td><td>'+(t.exit_reason||'')+'</td></tr>'
-  ).join('') || '<tr><td colspan="8" class="iat-note">No closed trades yet.</td></tr>';
-
-  if(!document.getElementById('iatSettings').dataset.built && d.defaults){
-    document.getElementById('iatSettings').dataset.built='1';
-    document.getElementById('iatSettings').innerHTML = IAT_FIELDS.map(([k,label])=>
-      '<div><label>'+label+'</label><input data-iat="'+k+'" value="'+(d.defaults[k]??'')+'"></div>').join('')+
-      '<div><label>Index symbols</label><input data-iat="symbols" value="'+((s.symbols||['NIFTY']).join(','))+'"></div>';
-  }
-}
-
-function iatPost(url,body){
-  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body||{})})
-    .then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{ if(!ok) throw new Error(j.error||'failed'); iatFetch(); return j; })
-    .catch(e=>{ const m=document.getElementById('iatBlock'); if(m) m.textContent=e.message; });
-}
-
-function iatInitIatUI(){
-  const on=(id,fn)=>{const el=document.getElementById(id); if(el&&!el.dataset.b){el.dataset.b='1';el.addEventListener('click',fn);}};
-  on('iatArm',async()=>{
-    const mode=document.getElementById('iatExecMode').value;
-    if(mode==='live' && !confirm('LIVE mode places real, unattended MIS orders with real money. Confirm.')) return;
-    await iatPost('/api/index-autotrader/config',{execution_mode:mode});
-    await iatPost('/api/index-autotrader/arm',{ack:mode==='live'});
-  });
-  on('iatDisarm',()=>iatPost('/api/index-autotrader/disarm',{}));
-  on('iatCloseAll',()=>{ if(confirm('Close every open index autotrader position and disarm?')) iatPost('/api/index-autotrader/close-all',{}); });
-  on('iatRefresh',()=>iatFetch());
-  on('iatSave',()=>{
-    const body={};
-    document.querySelectorAll('#iatSettings [data-iat]').forEach(el=>{
-      const k=el.dataset.iat, raw=el.value.trim();
-      if(k==='symbols'){ body.symbols=raw.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean); return; }
-      const num=Number(raw); if(raw!=='' && isFinite(num)) body[k]=num;
-    });
-    iatPost('/api/index-autotrader/config',body).then(()=>{ const m=document.getElementById('iatSaveMsg'); if(m) m.textContent='Saved '+new Date().toLocaleTimeString(); });
-  });
-  if(!iatInitIatUI._t){ iatInitIatUI._t=setInterval(iatFetch,20000); }
-  iatFetch();
-}
-
-function iatClearHalt(){
-  iatPost('/api/index-autotrader/config',{clear_halt:true});
-}
 
 function fmtMoney(v) { return v == null ? "—" : "₹" + Number(v).toLocaleString("en-IN", {maximumFractionDigits:2}); }
 function fmtTime(v) { return v ? new Date(v).toLocaleTimeString() : "—"; }
@@ -4013,5 +3778,174 @@ function renderStockRuntime(s){
 <script id="stock-default-tab">
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>switchTopTab('stockTradeAI'),{once:true});else switchTopTab('stockTradeAI');
 </script>
+<!-- ===== PA AUTO-TRADER (v3): two new tabs — Stock Options Auto / Index Options Auto ===== -->
+<style id="pa-style">
+.pa-wrap{padding:18px 28px 40px;display:grid;gap:14px}
+.pa-note{background:rgba(91,141,239,.10);border:1px solid rgba(91,141,239,.35);border-radius:10px;padding:10px 14px;font-size:12.5px;color:var(--muted);line-height:1.5}
+.pa-note b{color:var(--text)}
+.pa-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.pa-kpi{background:#1d212b;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.pa-kpi .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.pa-kpi .v{font-size:19px;font-weight:700;margin-top:4px}
+.pa-kpi .s{font-size:11px;color:var(--muted);margin-top:2px}
+.pa-pos{color:var(--green)}.pa-neg{color:var(--red)}
+.pa-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.pa-bar .grow{flex:1}
+.pa-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px 14px;margin-top:10px}
+.pa-form label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.pa-form input[type=number],.pa-form input[type=time],.pa-form select{width:100%}
+.pa-syms{display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-size:13px}
+.pa-tablewrap{overflow-x:auto}
+.pa-tablewrap td,.pa-tablewrap th{white-space:nowrap}
+.pa-tablewrap td.wrap{white-space:normal;min-width:260px;max-width:520px;font-size:12px;color:var(--muted)}
+.pa-msg{font-size:12px;margin-top:8px;min-height:16px}
+.pa-ev{font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;max-height:230px;overflow:auto;background:#12151b;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.pa-ev .WARN,.pa-ev .HALT,.pa-ev .ERROR{color:#e6b43c}.pa-ev .ERROR,.pa-ev .HALT{color:var(--red)}.pa-ev .ENTRY,.pa-ev .SIGNAL{color:var(--accent)}.pa-ev .EXIT{color:var(--green)}
+.pa-halt{background:rgba(229,72,77,.12);border:1px solid rgba(229,72,77,.45);color:#ff9a9d;border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600}
+details.pa-det>summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--text)}
+details.pa-det ul{margin:8px 0 0 18px;font-size:12.5px;color:var(--muted);line-height:1.6}
+</style>
+<div class="tab-page" id="tabPagePAStock"><div class="pa-wrap" id="paRootStock"></div></div>
+<div class="tab-page" id="tabPagePAIndex"><div class="pa-wrap" id="paRootIndex"></div></div>
+<script id="pa-script">
+(function(){
+const $=(id)=>document.getElementById(id);
+const esc=(s)=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const inr=(v)=>v==null||isNaN(v)?'—':'₹'+Number(v).toLocaleString('en-IN',{maximumFractionDigits:0});
+const px=(v)=>v==null||isNaN(v)?'—':Number(v).toFixed(2);
+const cls=(v)=>v>0?'pa-pos':v<0?'pa-neg':'';
+const NAMES={stock:'Stock Options',index:'Index Options'};
+const FIELDS=[
+ ['risk_per_trade','Risk per trade (₹)',100,0],['score_min','Min signal score (50-95)',1,0],['rr','Target (× risk)',0.1,0],
+ ['min_sl_pct','Min stop (% of premium)',1,1],['max_sl_pct','Max stop (% of premium)',1,1],['max_lots','Max lots / trade',1,0],
+ ['max_capital_per_trade','Max capital / trade (₹)',5000,0],['min_premium','Min option premium (₹)',0.5,0],['max_spread_pct','Max bid-ask spread (%)',0.1,0],
+ ['min_oi_lots','Min open interest (lots)',50,0],['min_dte','Min days to expiry',1,0],['cooldown_min','Cooldown after a trade (min)',5,0],
+ ['stall_minutes','Time-stop if no progress (min)',5,0],['max_entries_per_symbol','Max entries / symbol / day',1,0]];
+const TIMES=[['entry_from','No entries before'],['entry_to','No entries after'],['squareoff','Square-off at']];
+
+async function paGet(u){const r=await fetch(u,{cache:'no-store'});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+async function paPost(u,b){
+  const st=await fetch('/api/website-status',{cache:'no-store'});const d=await st.json();
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-Website-CSRF':d.csrf||''},body:JSON.stringify(b||{})});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+
+function build(desk){
+  const R=desk==='stock'?$('paRootStock'):$('paRootIndex');const p='pa-'+desk+'-';
+  const fields=FIELDS.map(f=>`<label>${f[1]}<input type="number" id="${p}f-${f[0]}" step="${f[2]}"></label>`).join('')+
+    TIMES.map(f=>`<label>${f[1]}<input type="time" id="${p}f-${f[0]}"></label>`).join('')+
+    `<label>Strike selection<select id="${p}f-moneyness"><option value="ATM">At-the-money</option><option value="ITM1">1 strike in-the-money</option></select></label>`+
+    (desk==='index'?`<label>Skip entries if India VIX above<input type="number" id="${p}f-vix_max" step="1"></label>`:`<label>Shortlist size (stocks scanned)<input type="number" id="${p}f-shortlist" step="1"></label>`);
+  const syms=desk==='index'?`<div class="pa-syms" style="margin-top:12px"><span style="color:var(--muted);font-size:11px;text-transform:uppercase">Indices traded</span>${['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY'].map(s=>`<label style="flex-direction:row;align-items:center;gap:6px;text-transform:none;font-size:13px;color:var(--text)"><input type="checkbox" id="${p}sym-${s}"> ${s}</label>`).join('')}</div>`:'';
+  R.innerHTML=`
+  <div class="pa-note"><b>${NAMES[desk]} — Auto Trader (v3, fresh logic).</b> Buys <b>CALLS</b> on bullish setups and <b>PUTS</b> on bearish setups only (option buying — the most you can lose on a trade is its premium; nothing is sold naked). It starts in <b>PAPER</b> mode: nothing reaches Zerodha until you switch to LIVE and type <b>LIVE</b>. Hard limits built into the server: <b>max 3 open trades</b>, <b>max ₹10,000 loss per day</b> (new risk is sized inside 90% of it; everything is flattened and halted at 95%). Disarms itself after every restart. No strategy can guarantee profit — run Paper first and check the Backtest below.</div>
+  <div id="${p}halt"></div>
+  <div class="panel"><div class="pa-bar">
+     <div id="${p}pills" class="pa-bar"></div><div class="grow"></div>
+     <label style="font-size:12px;color:var(--muted)">Mode <select id="${p}mode"><option value="paper">PAPER (simulated)</option><option value="live">LIVE (real money)</option></select></label>
+     <button id="${p}arm">Arm auto-trading</button>
+     <button class="secondary" id="${p}scan">Scan now</button>
+     ${desk==='stock'?`<button class="secondary" id="${p}short">Rebuild shortlist</button>`:''}
+     <button class="danger" id="${p}closeall">Close all trades</button></div>
+     <div class="pa-msg" id="${p}msg"></div>
+     <div class="pa-kpis" id="${p}kpis" style="margin-top:12px"></div></div>
+  <div class="panel"><h2>Open trades</h2><div class="pa-tablewrap" id="${p}open"></div></div>
+  <div class="panel"><h2>Latest scan — what the engine sees (updates every closed 5-minute candle)</h2><div class="pa-msg" id="${p}scaninfo"></div><div class="pa-tablewrap" id="${p}signals"></div></div>
+  ${desk==='stock'?`<div class="panel"><h2>Stock shortlist (most liquid F&amp;O stocks that are "in play" today)</h2><div class="pa-tablewrap" id="${p}shortlist"></div></div>`:''}
+  <div class="panel"><h2>Today's closed trades</h2><div class="pa-tablewrap" id="${p}closed"></div></div>
+  <div class="panel"><h2>Activity log</h2><div class="pa-ev" id="${p}events"></div></div>
+  <div class="panel"><details class="pa-det"><summary>Settings (risk limits are clamped by the server: ≤3 trades, ≤₹10,000/day)</summary>
+     <div class="pa-form">${fields}
+       <label>Daily loss cap (₹, both tabs, ≤10,000)<input type="number" id="${p}g-daily_loss" step="500"></label>
+       <label>Max open trades (≤3)<input type="number" id="${p}g-max_open" step="1"></label>
+       <label>Pause after N losses in a row<input type="number" id="${p}g-max_consecutive_losses" step="1"></label></div>${syms}
+     <div class="pa-bar" style="margin-top:12px"><button id="${p}save">Save settings</button></div><div class="pa-msg" id="${p}cfgmsg"></div></details></div>
+  <div class="panel"><h2>Backtest (replays this strategy on recent 5-minute candles)</h2>
+     <div class="pa-bar"><label style="font-size:12px;color:var(--muted)">Symbol <input type="text" id="${p}bt-sym" style="width:130px" value="${desk==='index'?'NIFTY':'RELIANCE'}"></label>
+     <label style="font-size:12px;color:var(--muted)">Days <input type="number" id="${p}bt-days" value="25" style="width:70px"></label>
+     <button class="secondary" id="${p}bt-run">Run backtest</button></div><div class="pa-msg" id="${p}bt-msg"></div><div id="${p}bt-out"></div></div>
+  <div class="panel"><details class="pa-det"><summary>How the strategy decides (plain English)</summary><ul>
+     <li><b>Direction needs 3 time-frames to agree</b> on the underlying (${desk==='index'?'nearest index future':'the stock'}): daily trend (price vs EMA20/EMA50), 15-minute trend (EMA9 vs EMA21 and ADX ≥ 18), and the 5-minute price on the right side of VWAP. Trades against the daily trend are never taken.</li>
+     <li><b>Two triggers:</b> (1) Opening-Range breakout/breakdown after 9:30 with a strong candle and volume ≥ 1.3× average; (2) trend pull-back to EMA21/VWAP confirmed by an engulfing, hammer / shooting-star or marubozu candle.</li>
+     <li><b>Filters:</b> RSI not exhausted, price not stretched &gt; 2.2 ATR from VWAP, day move not already exhausted, ${desk==='index'?'India VIX below your limit':'stock must not fight the NIFTY direction'}, option bid-ask spread / open interest / premium checks.</li>
+     <li><b>Score ≥ your minimum</b> (default 65 / 100) is required. Best-scoring signals are taken first while slots remain.</li>
+     <li><b>Stop &amp; size:</b> the stop sits beyond the signal's structure (opening range / pull-back low) and is converted to an option-premium stop with Black-Scholes; if that needs more than the max stop % the trade is skipped. Lots are sized so a stop-out costs ≤ your "risk per trade".</li>
+     <li><b>Exits:</b> exchange stop-loss order is placed immediately (LIVE); stop moves to break-even at +1R and trails after +1.5R; target at your R multiple; exit if a 5-minute candle closes beyond the structure level; time-stop if the trade stalls; all positions closed by your square-off time (default 15:10).</li>
+     <li><b>Capital protection:</b> max 3 trades open, ₹10,000/day cap (see note above), pause after repeated losses, per-symbol cooldown, India VIX filter for index trades.</li></ul></details></div>`;
+  wire(desk);
+}
+
+let CACHE={stock:null,index:null};
+function wire(desk){
+  const p='pa-'+desk+'-',url='/api/pa/'+desk+'/';
+  const msg=(t,bad)=>{const e=$(p+'msg');e.textContent=t||'';e.style.color=bad?'var(--red)':'var(--muted)'};
+  const act=async(a,extra)=>{try{msg('Working…');await paPost(url+'control',Object.assign({action:a},extra||{}));msg('Done.');refresh(desk)}catch(e){msg(e.message,true)}};
+  $(p+'arm').onclick=()=>{const c=CACHE[desk];if(!c)return;if(c.cfg.armed)return act('disarm');
+    if(c.cfg.mode==='live'&&!confirm('LIVE MODE: real orders will be sent to your Zerodha account automatically. Max 3 trades, max ₹10,000 loss/day. Arm now?'))return;act('arm')};
+  $(p+'mode').onchange=async(e)=>{const m=e.target.value;let confirmTxt='';
+    if(m==='live'){confirmTxt=prompt('Real money! Type LIVE to switch this tab to LIVE trading (it will be disarmed until you arm it).');if(confirmTxt!=='LIVE'){e.target.value='paper';return}}
+    act('set_mode',{mode:m,confirm:confirmTxt})};
+  $(p+'scan').onclick=()=>act('scan');
+  if($(p+'short'))$(p+'short').onclick=()=>act('refresh_shortlist');
+  $(p+'closeall').onclick=()=>{if(confirm('Close ALL open trades on this tab now?'))act('close_all')};
+  $(p+'save').onclick=async()=>{const b={};
+    FIELDS.forEach(f=>{const v=$(p+'f-'+f[0]).value;if(v!=='')b[f[0]]=f[3]?Number(v)/100:Number(v)});
+    TIMES.forEach(f=>{const v=$(p+'f-'+f[0]).value;if(v)b[f[0]]=v});
+    b.moneyness=$(p+'f-moneyness').value;
+    if(desk==='index'){b.vix_max=Number($(p+'f-vix_max').value);b.symbols=['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY'].filter(s=>$(p+'sym-'+s).checked)}else b.shortlist=Number($(p+'f-shortlist').value);
+    ['daily_loss','max_open','max_consecutive_losses'].forEach(k=>{const v=$(p+'g-'+k).value;if(v!=='')b[k]=Number(v)});
+    try{await paPost(url+'config',b);$(p+'cfgmsg').textContent='Saved (server clamps values to the safe limits).';$(p+'cfgmsg').style.color='var(--green)';$(p+'f-risk_per_trade').dataset.loaded='';refresh(desk)}catch(e){$(p+'cfgmsg').textContent=e.message;$(p+'cfgmsg').style.color='var(--red)'}};
+  $(p+'bt-run').onclick=async()=>{const o=$(p+'bt-out'),m=$(p+'bt-msg');o.innerHTML='';m.style.color='var(--muted)';m.textContent='Running… this can take up to a minute.';
+    try{const r=await paGet('/api/pa/backtest?desk='+desk+'&symbol='+encodeURIComponent($(p+'bt-sym').value.trim())+'&days='+Number($(p+'bt-days').value||25));m.textContent='';
+      const k=(a,b,c)=>`<div class="pa-kpi"><div class="k">${a}</div><div class="v ${c||''}">${b}</div></div>`;
+      o.innerHTML=`<div class="pa-kpis" style="margin:10px 0">${k('Trades',r.trades)}${k('Win rate',r.win_rate==null?'—':r.win_rate+'%')}${k('Avg R / trade',r.avg_R==null?'—':r.avg_R,cls(r.avg_R))}${k('Total R',r.total_R,cls(r.total_R))}${k('Profit factor',r.profit_factor==null?'—':r.profit_factor)}${k('Max drawdown (R)',r.max_drawdown_R)}</div>
+      <div class="pa-tablewrap"><table><tr><th>Date</th><th>Time</th><th>Side</th><th>Setup</th><th>Score</th><th>Result (R)</th></tr>${(r.last_trades||[]).map(t=>`<tr><td>${esc(t.date)}</td><td>${esc(t.time)}</td><td>${esc(t.dir)}</td><td>${esc(t.setup)}</td><td>${t.score}</td><td class="${cls(t.R)}">${t.R}</td></tr>`).join('')}</table></div><div class="pa-msg">${esc(r.note)} 1R = distance from entry to the stop. Break-even stop after +1R is included.</div>`}
+    catch(e){m.style.color='var(--red)';m.textContent=e.message}};
+}
+
+function pill(t,k){return `<span class="pill ${k}">${esc(t)}</span>`}
+function render(desk,d){
+  const p='pa-'+desk+'-',c=d.cfg,L=d.ledger;CACHE[desk]=d;
+  $(p+'pills').innerHTML=pill(d.kite_connected?'Kite connected':'Kite NOT connected',d.kite_connected?'ok':'bad')+pill(d.market_open?'Market open':'Market closed',d.market_open?'ok':'warn')+
+    pill(c.mode==='live'?'LIVE':'PAPER',c.mode==='live'?'bad':'warn')+pill(c.armed?'ARMED':'Disarmed',c.armed?'ok':'warn')+(d.scan&&d.scan.vix?pill('VIX '+Number(d.scan.vix).toFixed(1),d.scan.vix>(c.vix_max||99)?'bad':'ok'):'')+
+    (d.scan&&d.scan.last?`<span style="font-size:11px;color:var(--muted)">last scan ${esc(d.scan.last)} · server ${esc(d.now)}</span>`:'');
+  $(p+'halt').innerHTML=L.halted?`<div class="pa-halt">⛔ ${esc(L.halt_reason||'Halted for the day')}</div>`:(d.scan&&d.scan.note?`<div class="pa-note">${esc(d.scan.note)}</div>`:'');
+  const arm=$(p+'arm');arm.textContent=c.armed?'Disarm':'Arm auto-trading';arm.className=c.armed?'danger':'';arm.disabled=L.halted&&!c.armed;
+  const mode=$(p+'mode');if(document.activeElement!==mode)mode.value=c.mode;
+  const kp=(a,b,s,k)=>`<div class="pa-kpi"><div class="k">${a}</div><div class="v ${k||''}">${b}</div><div class="s">${s||''}</div></div>`;
+  $(p+'kpis').innerHTML=kp('Net P&amp;L today ('+esc(c.mode)+')',inr(L.net),'realised '+inr(L.realized)+' · open '+inr(L.unrealized),cls(L.net))+
+    kp('Daily loss cap',inr(L.cap),'flatten &amp; halt at '+inr(L.kill_at))+kp('Risk budget left',inr(Math.max(0,L.budget_left)),'for new trades')+
+    kp('Open trades',L.open_count+' / '+L.max_open,'planned risk '+inr(L.risk_open))+kp('Losses in a row',L.consecutive_losses+' / '+L.max_consecutive,'pause when reached');
+  // open
+  $(p+'open').innerHTML=d.open.length?`<table><tr><th>Contract</th><th>Side</th><th>Qty (lots)</th><th>Entry</th><th>LTP</th><th>Stop</th><th>Target</th><th>Open P&amp;L</th><th>Risk</th><th>Setup / score</th><th>Mode</th><th>Status</th><th></th></tr>${d.open.map(t=>`<tr><td><b>${esc(t.tradingsymbol)}</b></td><td>${t.side==='CE'?'<span class="pa-pos">CALL</span>':'<span class="pa-neg">PUT</span>'}</td><td>${t.qty} (${t.lots})</td><td>${px(t.entry_price)}</td><td>${px(t.ltp)}</td><td>${px(t.sl)}</td><td>${px(t.target)}</td><td class="${cls(t.open_pnl)}">${inr(t.open_pnl)}</td><td>${inr(t.planned_risk)}</td><td>${esc(t.setup)} / ${t.score}</td><td>${esc(t.mode)}</td><td>${esc(t.status)}</td><td>${t.status==='OPEN'?`<button class="secondary" data-close="${t.id}">Close</button>`:''}</td></tr>`).join('')}</table>`:'<div class="pa-msg">No open trades.</div>';
+  $(p+'open').querySelectorAll('[data-close]').forEach(b=>b.onclick=async()=>{try{await paPost('/api/pa/'+desk+'/control',{action:'close_trade',id:Number(b.dataset.close)});refresh(desk)}catch(e){alert(e.message)}});
+  // signals
+  const sc=d.scan||{};$(p+'scaninfo').textContent=sc.last?('Last scan '+sc.last+(desk==='stock'&&sc.mkt!=null?' · NIFTY bias '+(sc.mkt>0?'+':'')+sc.mkt:'')+' · entries need score ≥ '+c.score_min):'No scan yet — arm the desk or press "Scan now" after 9:20 IST.';
+  $(p+'signals').innerHTML=d.signals.length?`<table><tr><th>Symbol</th><th>Signal</th><th>Score</th><th>Bull / Bear</th><th>Setup</th><th>Underlying stop</th><th>Why / reasons</th><th>Action</th></tr>${d.signals.map(s=>`<tr><td><b>${esc(s.symbol)}</b></td><td>${s.direction==='CE'?'<span class="pa-pos">BUY CALL</span>':s.direction==='PE'?'<span class="pa-neg">BUY PUT</span>':'—'}</td><td>${s.score||0}</td><td>${s.bull||0} / ${s.bear||0}</td><td>${esc(s.setup||'')}</td><td>${s.u_stop?px(s.u_stop):'—'}</td><td class="wrap">${s.direction?esc((s.reasons||[]).join(' · ')):esc(s.why||'')}</td><td class="wrap">${esc(s.action||(s.direction&&s.score<c.score_min?'score below minimum':''))}</td></tr>`).join('')}</table>`:'<div class="pa-msg">Nothing scanned yet.</div>';
+  if(desk==='stock'&&d.shortlist){const sl=d.shortlist;$('pa-stock-shortlist').innerHTML=(sl.building?'<div class="pa-msg">Building shortlist… (takes ~1 minute)</div>':'')+(sl.error?`<div class="pa-msg" style="color:var(--red)">${esc(sl.error)}</div>`:'')+(sl.items.length?`<div class="pa-msg">Built ${esc(sl.built_at||'')}</div><table><tr><th>Symbol</th><th>Change %</th><th>Daily ATR %</th><th>Daily bias</th><th>Traded value</th></tr>${sl.items.map(x=>`<tr><td><b>${esc(x.symbol)}</b></td><td class="${cls(x.chg)}">${Number(x.chg).toFixed(2)}</td><td>${x.atr_pct}</td><td>${x.bias>0?'bullish':'bearish'}</td><td>${inr(x.value)}</td></tr>`).join('')}</table>`:(sl.building?'':'<div class="pa-msg">Shortlist is built automatically at the first scan after 9:20 IST (or press "Rebuild shortlist").</div>'))}
+  $(p+'closed').innerHTML=d.closed.length?`<table><tr><th>Exit time</th><th>Contract</th><th>Side</th><th>Qty</th><th>Entry → Exit</th><th>Reason</th><th>Net P&amp;L (after est. charges)</th><th>Mode</th></tr>${d.closed.map(t=>`<tr><td>${esc((t.exit_ts||'').slice(11))}</td><td>${esc(t.tradingsymbol)}</td><td>${t.side}</td><td>${t.qty}</td><td>${px(t.entry_price)} → ${px(t.exit_price)}</td><td>${esc(t.exit_reason)}</td><td class="${cls(t.pnl_net)}">${inr(t.pnl_net)}</td><td>${esc(t.mode)}</td></tr>`).join('')}</table>`:'<div class="pa-msg">No closed trades today.</div>';
+  $(p+'events').innerHTML=d.events.length?d.events.map(e=>`<div class="${esc(e.kind)}">${esc(e.ts.slice(11))} [${esc(e.kind)}] ${esc(e.msg)}</div>`).join(''):'<div>No activity yet.</div>';
+  // settings (only filled when not being edited)
+  const f0=$(p+'f-risk_per_trade');
+  if(!f0.dataset.loaded){FIELDS.forEach(f=>{const v=c[f[0]];if(v!=null)$(p+'f-'+f[0]).value=f[3]?Math.round(v*100):v});TIMES.forEach(f=>$(p+'f-'+f[0]).value=c[f[0]]);
+    $(p+'f-moneyness').value=c.moneyness;if(desk==='index'){$(p+'f-vix_max').value=c.vix_max;['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY'].forEach(s=>$(p+'sym-'+s).checked=(c.symbols||[]).includes(s))}else $(p+'f-shortlist').value=c.shortlist;
+    $(p+'g-daily_loss').value=d.gcfg.daily_loss;$(p+'g-max_open').value=d.gcfg.max_open;$(p+'g-max_consecutive_losses').value=d.gcfg.max_consecutive_losses;f0.dataset.loaded='1'}
+}
+async function refresh(desk){try{render(desk,await paGet('/api/pa/'+desk+'/state'))}catch(e){const m=$('pa-'+desk+'-msg');if(m){m.textContent='State error: '+e.message;m.style.color='var(--red)'}}}
+window.paRefresh=refresh;
+build('stock');build('index');
+setInterval(()=>{if(document.hidden)return;if($('tabPagePAStock').classList.contains('active'))refresh('stock');if($('tabPagePAIndex').classList.contains('active'))refresh('index')},4000);
+
+// tab switching: wrap (not edit) the existing switchTopTab so the older four tabs behave exactly as before
+const orig=window.switchTopTab,PA={paStock:['tabPagePAStock','tabBtnPAStock','stock'],paIndex:['tabPagePAIndex','tabBtnPAIndex','index']};
+window.switchTopTab=function(which){
+  for(const k in PA){const on=(which===k);$(PA[k][0]).classList.toggle('active',on);$(PA[k][1]).classList.toggle('active',on)}
+  if(PA[which]){
+    ['Condor','Move','StockTradeAI','IndexTradeAI'].forEach(s=>{const a=$('tabPage'+s),b=$('tabBtn'+s);if(a)a.classList.remove('active');if(b)b.classList.remove('active')});
+    document.body.classList.remove('ai-evolution-mode');refresh(PA[which][2]);return}
+  return orig.apply(this,arguments)};
+})();
+</script>
+<!-- ===== END PA AUTO-TRADER (v3) tabs ===== -->
+
 </body>
 </html>
