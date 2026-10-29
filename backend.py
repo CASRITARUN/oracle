@@ -13456,16 +13456,6 @@ DESK_MARKET_FEED=DeskMarketFeed()
 STOCK_FULL_SCAN_BAR_MAX_AGE = 15
 STOCK_SUCCESS_MIN_SAMPLES = 40
 STOCK_SUCCESS_MIN_AUC = 0.52
-# Live-mode direction-model edge floor for Stock AI (mirrors INDEX_LIVE_MIN_DIRECTION_AUC).
-# Used for SIZING only -- an AUC level is deliberately not an entry cutoff on this desk.
-STOCK_LIVE_MIN_DIRECTION_AUC = max(0.50, min(0.70, float(os.environ.get('STOCK_LIVE_MIN_DIRECTION_AUC', '0.52'))))
-# Minimum expected value in R for a LIVE Stock AI entry once all-in costs are counted
-# (regulatory charges + round-trip spread + slippage). Paper mode is unaffected so it
-# keeps accumulating forward evidence.
-STOCK_LIVE_MIN_EDGE_R = max(0.0, min(1.0, float(os.environ.get('STOCK_LIVE_MIN_EDGE_R', '0.15'))))
-# Live-entry confidence floor while no validated option-outcome model exists.
-# Mirrors INDEX_LIVE_FALLBACK_MIN_CONFIDENCE on the index desk.
-STOCK_LIVE_FALLBACK_MIN_CONFIDENCE = max(.55, min(.90, float(os.environ.get('STOCK_LIVE_FALLBACK_MIN_CONFIDENCE', '0.62'))))
 STOCK_HIST_SUCCESS_MIN_SAMPLES = 300
 STOCK_HIST_SUCCESS_MIN_AUC = 0.52
 STOCK_HIST_SUCCESS_MAX_SAMPLES = 24000
@@ -13848,10 +13838,7 @@ class StockDeskEngine(DeskEngine):
         if age is None:problems.append('model training timestamp unavailable; automatic retraining required')
         elif age<0:problems.append('model training timestamp is in the future; check server clock')
         elif age>7:problems.append(f'model trained {age:.1f} days ago (maximum 7); automatic retraining pending — see Learning lab')
-        # An AUC level scales SIZING, it is not an entry cutoff (see model_quality docs).
-        # Below STOCK_LIVE_MIN_DIRECTION_AUC the model has no demonstrated edge and is
-        # given no size at all; above it, size ramps up from zero rather than from 0.25.
-        weight=0. if problems or auc is None or auc<STOCK_LIVE_MIN_DIRECTION_AUC else min(1.,max(0.,(auc-.5)/.15))*min(1.,samples/300.)
+        weight=0. if problems else min(1.,max(.25,(auc-.5)/.15))*min(1.,samples/300.)
         return dict(live_ok=not problems,risk_weight=weight,issues=problems,age_days=age,
                     note='Validation-quality proxy; confidence is not a calibrated win probability')
     @staticmethod
@@ -13874,47 +13861,19 @@ class StockDeskEngine(DeskEngine):
         if getattr(self,'desk_name','')=='stock' and hasattr(self,'shared_risk'):
             blocked=self.shared_risk.confidence_block(s)
             if blocked:s.update(decision='WAIT',reason=blocked);return False
-        cfg=self.config()
-        # estimated_costs stays regulatory/brokerage-only: that is the schema the
-        # option-outcome models are trained and validated against, and trade_economics
-        # is derived from it. The economic veto below must additionally pay for what a
-        # round trip really costs -- this desk may cross max_spread on BOTH legs plus
-        # slippage, which on a volatility-scaled stop is a large fraction of 1R.
-        entry=float(s.get('entry') or 0);stop=float(s.get('stop') or 0);qty=int(s.get('qty') or 0)
-        slip=float(cfg.get('slippage_bps') or 5.)/10000.
-        spread=max(0.,float(s.get('spread') or 0))/100.
-        friction=(spread+slip)*entry*qty+(spread+slip)*max(entry,float(s.get('target') or entry))*qty
-        all_in=float(s.get('estimated_costs') or 0.)+friction
-        risk=max(.01,(entry-stop)*qty)
-        s['friction_costs']=round(friction,2);s['all_in_costs']=round(all_in,2)
-        live=cfg.get('mode')=='live'
-        edge_floor=STOCK_LIVE_MIN_EDGE_R if live else 0.
         # Historical underlying barriers are not option-profit evidence. Use only
         # a current validated option-outcome model for this economic veto.
         if s.get('live_success_model_valid') and s.get('live_success_probability') is not None:
-            probability=float(s['live_success_probability'])
+            probability=float(s['live_success_probability']);risk=max(.01,(s['entry']-s['stop'])*s['qty'])
             payoff=s.get('option_payoff')
             if not payoff:
                 s.update(decision='WAIT',reason='Validated option model lacks sufficient win/loss payoff evidence');return False
-            ev=probability*float(payoff['win_gross_r'])+(1-probability)*float(payoff['loss_gross_r'])-all_in/risk
-            s['option_expected_r_basis']='Validated option-outcome probability weighted by training payoff, less all-in costs including round-trip spread and slippage; proxy only'
+            ev=probability*float(payoff['win_gross_r'])+(1-probability)*float(payoff['loss_gross_r'])-s['estimated_costs']/risk
+            s['option_expected_r_basis']='Training-sample average gross winning/losing R weighted by validated option-outcome probability, less current estimated costs; proxy only'
             s['option_expected_r']=round(ev,4)
             if not math.isfinite(ev) or ev<=0:
-                s.update(decision='WAIT',reason='Validated option-outcome estimate is non-positive after all-in costs');return False
-        else:
-            # No validated option-outcome model. Report what the directional probability
-            # implies once friction is counted, and in LIVE mode hold it to the same
-            # positive-expectation floor. Paper deliberately stays unvetoed here so it
-            # keeps accumulating the forward evidence the live gate depends on.
-            raw=s.get('p_up')
-            p=float(raw) if s.get('direction')=='UP' else (1-float(raw)) if raw is not None else float(s.get('confidence') or .5)
-            p=.5+(max(0.,min(1.,p))-.5)*.6
-            reward=float((s.get('risk_plan') or {}).get('reward_r') or cfg.get('reward_r') or 1.8)
-            ev=p*reward-(1-p)-all_in/risk
-            s['option_expected_r']=round(ev,4) if math.isfinite(ev) else None
-            s['option_expected_r_basis']='Directional probability shrunk 40% toward 50%, times rewardR, less one unit, less all-in costs in R; diagnostic in paper, entry floor in live'
-            if live and (not math.isfinite(ev) or ev<edge_floor):
-                s.update(decision='WAIT',reason='Expected value %.2fR below the %.2fR live floor after all-in costs'%(ev,edge_floor) if math.isfinite(ev) else 'Expected value could not be computed after all-in costs');return False
+                s.update(decision='WAIT',reason='Validated option-outcome estimate is non-positive after estimated charges');return False
+        else:s['option_expected_r']=None
         return True
     def adaptive_entry_plan(self,s,q,lot,tick,funds,remaining):
         cfg=self.config();confidence=float(s.get('confidence') or .5)
@@ -15973,12 +15932,6 @@ class StockRuntimeEngine(StockDeskEngine):
         return s
     def entry_quality_gate(self,s):
         if not super().entry_quality_gate(s):return False
-        # Before any option-outcome model is validated the only economic evidence for
-        # Stock AI is direction confidence, so LIVE entries need a higher bar than paper.
-        # Mirrors INDEX_LIVE_FALLBACK_MIN_CONFIDENCE on the index desk.
-        gate_cfg=self.config()
-        if gate_cfg.get('mode')=='live' and not s.get('live_success_model_valid') and float(s.get('confidence') or 0)<STOCK_LIVE_FALLBACK_MIN_CONFIDENCE:
-            s.update(decision='WAIT',reason='Live entry needs confidence >= %d%% until a validated option-outcome model exists'%(int(round(STOCK_LIVE_FALLBACK_MIN_CONFIDENCE*100))));return False
         entry=float(s['entry']);stop=float(s['stop']);target=float(s['target']);qty=int(s['qty'])
         costs=float(s['estimated_costs']);loss=(entry-stop)*qty+costs;gain=(target-entry)*qty-costs
         if not all(math.isfinite(v) for v in (entry,stop,target,costs,loss,gain)) or not 0<stop<entry<target or qty<=0 or costs<0 or gain<=0:
@@ -16531,10 +16484,7 @@ class StockRuntimeEngine(StockDeskEngine):
             result['issues']=[x for x in result['issues'] if not x.startswith('model trained ')]
             result['live_ok']=not result['issues'];result['revalidated_at']=review['updated']
             if result['live_ok']:
-                # Same floor as the base engine: a revalidated champion below the edge
-                # floor keeps live_ok but is sized to zero, never to the old 0.25 minimum.
-                _champion_auc=float(review.get('champion_auc') or .5)
-                result['risk_weight']=0. if _champion_auc<STOCK_LIVE_MIN_DIRECTION_AUC else min(1.,max(0.,(_champion_auc-.5)/.15))*min(1.,float(review['samples'])/300.)
+                result['risk_weight']=min(1.,max(.25,(float(review.get('champion_auc') or .5)-.5)/.15))*min(1.,float(review['samples'])/300.)
         return result
     def _risk_tick(self):
         # Yesterday's manual pause must not silently prevent the already-authorized
@@ -19290,8 +19240,6 @@ def start_application_workers():
     threading.Thread(target=legacy_manage,daemon=True,name='legacy-risk-monitor').start()
     threading.Thread(target=_autotrade_loop,daemon=True).start()
     threading.Thread(target=_breakout_monitor_loop,daemon=True).start()
-    # Independent index autotrader.  Own ledger, own signal model; idles while disarmed.
-    threading.Thread(target=iat_loop,daemon=True,name='index-autotrader').start()
     def market_feed_loop():
         while not STOCK_DESK.stop_event.is_set():
             try:DESK_MARKET_FEED.ensure()
@@ -19304,848 +19252,995 @@ def start_application_workers():
     INDEX_OPTIONS_DESK.start()
     threading.Thread(target=retired_ai_supervisor,daemon=True,name='retired-ai-exits').start()
 
-# ===========================================================================
-# INDEX AUTOTRADER (IAT) -- an independent index-options trading engine
-# ---------------------------------------------------------------------------
-# This engine decides for itself.  It reads none of Stock AI, Index AI, the
-# condor desk or the move desk: it runs its own signal model over its own
-# candles, sizes its own risk, and opens and closes its own positions.  It
-# shares only infrastructure that must remain governed -- the broker request
-# gate (via place_basket_orders) and the quote cache -- plus its own state
-# file, trade ledger, limits and UI tab.
+
+# =============================================================================
+# >>> PA AUTO-TRADER (v3) — TWO NEW DESKS: "Stock Options Auto" + "Index Options Auto"
+# -----------------------------------------------------------------------------
+# Self-contained block. Written fresh: it does NOT call or reuse any strategy/AI/risk logic of the
+# older desks. It only uses plumbing that already exists in this file: the `kite` client, `SESSION`/
+# `require_session()`, `get_instruments()`, `now_ist()`, `CHARGES`, and the website-password gate.
 #
-# Safety rails, all defaulting to the safe position:
-#   * execution_mode starts as "track": nothing is sent to the broker, fills are
-#     simulated against live quotes.
-#   * every live order is MIS, so the broker's own end-of-day square-off is an
-#     independent second net behind our exits.
-#   * hard stop, target, max-hold, square-off, daily R limit, daily trade cap,
-#     loss-streak breaker and concurrent-position cap are evaluated on every tick.
-#   * nothing runs until an operator arms it, and a halt latches until cleared.
-# ===========================================================================
-IAT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_autotrader_state.json")
-IAT_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_autotrader_trades.json")
-IAT_LOCK = threading.Lock()
+# STRATEGY  (long options only -> risk is limited to the premium; nothing is ever sold naked)
+#   Direction = agreement of 3 time-frames on the UNDERLYING (index future / stock):
+#     daily trend (EMA20/EMA50 stack)  +  15-min trend (EMA9/EMA21 + ADX)  +  5-min VWAP side.
+#   Trigger   = Opening-Range breakout (volume-confirmed)  OR  trend pull-back to EMA21/VWAP that is
+#               confirmed by a reversal candle (engulfing / hammer / shooting-star / marubozu).
+#   Filters   = RSI not exhausted, price not stretched from VWAP, day-move not exhausted, stock trades
+#               must not fight the NIFTY bias, India VIX cap (index), option spread/OI/premium checks.
+#   Stop      = structure stop on the underlying mapped to the option premium with Black-Scholes
+#               (trade is skipped if that stop is too wide). Target = R-multiple. Break-even at +1R,
+#               then trailing. Time-stop for stalled trades. All trades square off before 15:10 IST.
+# RISK (hard-coded ceilings, config can only be stricter)
+#   * max 3 open trades at a time (all desks together, per book: paper / live)
+#   * max loss per day Rs 10,000 (realised + open). New trades are sized so that the sum of planned
+#     stop-losses stays inside 90% of that; everything is flattened and halted at 95%.
+# =============================================================================
+from collections import OrderedDict as _PA_OD
 
-IAT_DEFAULTS = {
-    "armed": False,
-    "execution_mode": "track",       # "track" simulates on live quotes; "live" sends orders
-    "symbols": ["NIFTY"],
-    # --- signal model ---
-    "entry_threshold": 0.45,         # |composite| required to qualify
-    "min_agreement": 4,              # factors sharing the composite sign (of 7)
-    "max_vol_percentile": 0.90,      # refuse to chase a blow-off candle
-    "reversal_threshold": 0.35,      # composite flip strength that forces an exit
-    # --- risk ---
-    "risk_per_trade_pct": 5.0,       # % of capital_per_trade risked, scaled by strength
-    "stop_pct_of_premium": 12.0,
-    "reward_r": 1.8,
-    "capital_per_trade": 25000.0,
-    "max_daily_loss_r": 4.0,
-    "max_trades_per_day": 4,
-    "max_concurrent": 1,
-    "max_loss_streak": 3,
-    # --- time ---
-    "session_start": "09:20",
-    "square_off": "15:12",
-    "protected_minutes": 15,
-    "max_hold_minutes": 90,
-    "poll_seconds": 20,
-    # --- book quality ---
-    "min_dte": 2,
-    "max_spread_pct": 0.8,
-    "min_delta": 0.40,
-    "max_delta": 0.65,
-    "min_contract_premium": 20.0,
-    # --- trailing / breakeven ---
-    "trailing_activate_r": 0.75,
-    "trailing_giveback_r": 0.65,
-    "breakeven_after_r": 1.0,
-    # --- runtime ---
-    "day": None,
-    "trades_today": 0,
-    "realized_r_today": 0.0,
-    "loss_streak": 0,
-    "peak_r_today": 0.0,
-    "last_signal": None,
-    "last_error": None,
-    "last_scan_at": None,
-    "halt_reason": None,
-    "auto_start": False,
+PA_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pa_trader.sqlite3')
+PA_HARD_DAILY_LOSS = 10000.0
+PA_HARD_MAX_OPEN = 3
+PA_GATE_FRAC = 0.90      # new risk must fit inside this share of the daily cap
+PA_KILL_FRAC = 0.95      # flatten + halt when net day P&L falls to this share of the cap
+PA_LOCK = threading.RLock()
+PA_ENTRY_LOCK = threading.Lock()
+PA_SIGNALS = {'stock': [], 'index': []}
+PA_SCAN_INFO = {'stock': {}, 'index': {}}
+PA_LTP = {}            # trade id -> dict(ltp,bid,ask,ts)
+PA_SHORTLIST = {'items': [], 'built_at': None, 'building': False, 'error': None}
+PA_LAST_SCAN = {'stock': None, 'index': None}
+PA_LAST_RECON = {'t': 0.0}
+PA_SL_MODIFY_AT = {}
+PA_SL_SENT = {}
+PA_INDEX_MAP = {'NIFTY': 'NIFTY 50', 'BANKNIFTY': 'NIFTY BANK', 'FINNIFTY': 'NIFTY FIN SERVICE', 'MIDCPNIFTY': 'NIFTY MID SELECT'}
+PA_DEFAULTS = {
+    'stock': dict(armed=False, mode='paper', risk_per_trade=3000.0, score_min=65, rr=2.0, min_sl_pct=0.12, max_sl_pct=0.32,
+                  entry_from='09:30', entry_to='14:30', squareoff='15:10', shortlist=20, min_premium=5.0, max_spread_pct=2.0,
+                  min_oi_lots=200, cooldown_min=30, max_entries_per_symbol=2, max_capital_per_trade=150000.0, min_dte=3,
+                  moneyness='ATM', max_lots=20, stall_minutes=30, symbols=[]),
+    'index': dict(armed=False, mode='paper', risk_per_trade=3000.0, score_min=65, rr=2.0, min_sl_pct=0.12, max_sl_pct=0.32,
+                  entry_from='09:30', entry_to='14:30', squareoff='15:10', shortlist=4, min_premium=20.0, max_spread_pct=1.0,
+                  min_oi_lots=1000, cooldown_min=30, max_entries_per_symbol=2, max_capital_per_trade=200000.0, min_dte=1,
+                  moneyness='ATM', max_lots=20, stall_minutes=30, vix_max=26.0, symbols=['NIFTY', 'BANKNIFTY']),
 }
-
-# Seven independent factors, each normalised to [-1, +1].  +1 is bullish for the
-# underlying, so a positive composite buys a CALL and a negative one a PUT.
-IAT_FACTOR_WEIGHTS = {
-    "ema_structure": 0.22, "rsi": 0.12, "macd_slope": 0.16,
-    "donchian": 0.18, "volume": 0.10, "vwap": 0.12, "roc": 0.10,
-}
-IAT_FACTOR_NAMES = tuple(IAT_FACTOR_WEIGHTS)
+PA_GLOBAL_DEFAULTS = dict(max_open=3, daily_loss=10000.0, max_consecutive_losses=3)
 
 
-# ----------------------------------------------------------------- primitives
-def iat_ts(v):
-    x = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    return x.replace(tzinfo=IST) if x.tzinfo is None else x.astimezone(IST)
+# ------------------------------- storage -------------------------------------
+def pa_db():
+    c = sqlite3.connect(PA_DB, timeout=10, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    try: c.execute('PRAGMA journal_mode=WAL')
+    except Exception: pass
+    return c
+
+def pa_init_db():
+    with PA_LOCK:
+        c = pa_db()
+        c.execute('CREATE TABLE IF NOT EXISTS pa_kv (k TEXT PRIMARY KEY, v TEXT)')
+        c.execute('''CREATE TABLE IF NOT EXISTS pa_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, desk TEXT, mode TEXT, status TEXT, symbol TEXT, side TEXT,
+            tradingsymbol TEXT, token INTEGER, expiry TEXT, strike REAL, lot_size INTEGER, lots INTEGER, qty INTEGER,
+            tick REAL, setup TEXT, score REAL, reasons TEXT, u_entry REAL, u_stop REAL, sl_pct REAL, planned_risk REAL,
+            entry_ts TEXT, entry_price REAL, init_sl REAL, sl REAL, target REAL, peak REAL,
+            entry_oid TEXT, sl_oid TEXT, exit_oid TEXT, exit_ts TEXT, exit_price REAL, exit_reason TEXT,
+            pnl_gross REAL, fees REAL, pnl_net REAL, day TEXT)''')
+        c.execute('CREATE TABLE IF NOT EXISTS pa_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, desk TEXT, kind TEXT, msg TEXT)')
+        c.commit(); c.close()
+
+def pa_kv_get(k, default=None):
+    with PA_LOCK:
+        c = pa_db()
+        try:
+            r = c.execute('SELECT v FROM pa_kv WHERE k=?', (k,)).fetchone()
+            return json.loads(r['v']) if r else default
+        finally: c.close()
+
+def pa_kv_set(k, v):
+    with PA_LOCK:
+        c = pa_db()
+        try:
+            c.execute('INSERT OR REPLACE INTO pa_kv(k,v) VALUES(?,?)', (k, json.dumps(v, default=str))); c.commit()
+        finally: c.close()
+
+def pa_rows(sql, args=()):
+    with PA_LOCK:
+        c = pa_db()
+        try: return [dict(r) for r in c.execute(sql, args).fetchall()]
+        finally: c.close()
+
+def pa_exec(sql, args=()):
+    with PA_LOCK:
+        c = pa_db()
+        try:
+            cur = c.execute(sql, args); c.commit(); return cur.lastrowid
+        finally: c.close()
+
+def pa_event(desk, kind, msg):
+    try: pa_exec('INSERT INTO pa_events(ts,desk,kind,msg) VALUES(?,?,?,?)', (now_ist().strftime('%Y-%m-%d %H:%M:%S'), desk, kind, str(msg)[:600]))
+    except Exception: pass
+    try: logger.info('[PA %s] %s %s', desk, kind, msg)
+    except Exception: pass
+
+def pa_update(tid, **kw):
+    if not kw: return
+    cols = ','.join(f'{k}=?' for k in kw)
+    pa_exec(f'UPDATE pa_trades SET {cols} WHERE id=?', tuple(kw.values()) + (tid,))
+
+def pa_gcfg():
+    g = dict(PA_GLOBAL_DEFAULTS); g.update(pa_kv_get('cfg:global', {}) or {})
+    g['max_open'] = max(1, min(PA_HARD_MAX_OPEN, int(g['max_open'])))
+    g['daily_loss'] = max(500.0, min(PA_HARD_DAILY_LOSS, float(g['daily_loss'])))
+    g['max_consecutive_losses'] = max(1, min(10, int(g['max_consecutive_losses'])))
+    return g
+
+def pa_cfg(desk):
+    c = dict(PA_DEFAULTS[desk]); c.update(pa_kv_get('cfg:' + desk, {}) or {})
+    g = pa_gcfg()
+    c['risk_per_trade'] = max(200.0, min(float(c['risk_per_trade']), g['daily_loss'] * PA_GATE_FRAC / g['max_open']))
+    c['score_min'] = max(50, min(95, float(c['score_min'])))
+    c['rr'] = max(1.2, min(4.0, float(c['rr'])))
+    c['min_sl_pct'] = max(0.05, min(0.30, float(c['min_sl_pct'])))
+    c['max_sl_pct'] = max(c['min_sl_pct'] + 0.03, min(0.50, float(c['max_sl_pct'])))
+    c['mode'] = 'live' if c.get('mode') == 'live' else 'paper'
+    c['shortlist'] = max(3, min(40, int(c['shortlist'])))
+    c['max_lots'] = max(1, min(100, int(c['max_lots'])))
+    if c['squareoff'] > '15:15': c['squareoff'] = '15:15'
+    return c
+
+def pa_save_cfg(desk, patch):
+    cur = pa_kv_get('cfg:' + desk, {}) or {}
+    allowed = set(PA_DEFAULTS[desk].keys())
+    for k, v in (patch or {}).items():
+        if k in allowed: cur[k] = v
+    pa_kv_set('cfg:' + desk, cur)
+    return pa_cfg(desk)
 
 
-def iat_finite(v):
+# ------------------------------- helpers -------------------------------------
+def pa_hm(s):
+    h, m = str(s).split(':'); return int(h) * 60 + int(m)
+
+def pa_minutes(dt): return dt.hour * 60 + dt.minute
+
+def pa_market_open():
+    n = now_ist(); return n.weekday() < 5 and 9 * 60 + 15 <= pa_minutes(n) <= 15 * 60 + 30
+
+def pa_tick(x, tick, up=False):
+    tick = tick or 0.05
+    q = x / tick
+    q = math.ceil(q - 1e-9) if up else math.floor(q + 1e-9)
+    return round(max(q, 1) * tick, 2)
+
+def pa_fees(entry, exit_, qty):
     try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
+        ch = CHARGES; buy = entry * qty; sell = exit_ * qty
+        brok = 2 * min(ch['brokerage_flat'], ch['brokerage_pct'] * max(buy, 1))
+        stt = ch['stt_sell_pct'] * sell
+        exch = ch['exchange_txn_pct'] * (buy + sell)
+        sebi = ch['sebi_pct'] * (buy + sell)
+        gst = ch['gst_pct'] * (brok + exch + sebi)
+        stamp = ch['stamp_duty_buy_pct'] * buy
+        return round(brok + stt + exch + sebi + gst + stamp, 2)
+    except Exception:
+        return round(40 + 0.0015 * (entry + exit_) * qty, 2)
+
+def pa_ncdf(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def pa_bs(S, K, T, r, sig, typ):
+    if T <= 0 or sig <= 0:
+        return max(0.0, S - K) if typ == 'CE' else max(0.0, K - S)
+    d1 = (math.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * math.sqrt(T)); d2 = d1 - sig * math.sqrt(T)
+    if typ == 'CE': return S * pa_ncdf(d1) - K * math.exp(-r * T) * pa_ncdf(d2)
+    return K * math.exp(-r * T) * pa_ncdf(-d2) - S * pa_ncdf(-d1)
+
+def pa_iv(price, S, K, T, r, typ):
+    intrinsic = max(0.0, S - K) if typ == 'CE' else max(0.0, K - S)
+    if T <= 0 or price <= intrinsic + 0.05: return None
+    lo, hi = 0.01, 3.0
+    if pa_bs(S, K, T, r, hi, typ) < price: return None
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if pa_bs(S, K, T, r, mid, typ) > price: hi = mid
+        else: lo = mid
+    return (lo + hi) / 2
 
 
-def iat_clamp(v, lo, hi):
-    v = iat_finite(v)
-    if v is None:
-        return lo
-    return max(lo, min(hi, v))
+# ------------------------------ indicators -----------------------------------
+def pa_ema(x, n):
+    x = np.asarray(x, float); out = np.empty_like(x); a = 2.0 / (n + 1); out[0] = x[0]
+    for i in range(1, len(x)): out[i] = a * x[i] + (1 - a) * out[i - 1]
+    return out
+
+def pa_rma(x, n):
+    x = np.asarray(x, float); out = np.empty_like(x); out[0] = x[0]
+    for i in range(1, len(x)): out[i] = (out[i - 1] * (n - 1) + x[i]) / n
+    return out
+
+def pa_tr(h, l, c):
+    pc = np.concatenate(([c[0]], c[:-1]))
+    return np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+
+def pa_atr(h, l, c, n=14): return pa_rma(pa_tr(h, l, c), n)
+
+def pa_rsi(c, n=14):
+    c = np.asarray(c, float); d = np.diff(c, prepend=c[0])
+    up = pa_rma(np.where(d > 0, d, 0.0), n); dn = pa_rma(np.where(d < 0, -d, 0.0), n)
+    rs = up / np.where(dn == 0, 1e-12, dn); return 100 - 100 / (1 + rs)
+
+def pa_adx(h, l, c, n=14):
+    up = np.diff(h, prepend=h[0]); dn = -np.diff(l, prepend=l[0])
+    pdm = np.where((up > dn) & (up > 0), up, 0.0); mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    atr = pa_rma(pa_tr(h, l, c), n); atr = np.where(atr == 0, 1e-12, atr)
+    pdi = 100 * pa_rma(pdm, n) / atr; mdi = 100 * pa_rma(mdm, n) / atr
+    dx = 100 * np.abs(pdi - mdi) / np.where(pdi + mdi == 0, 1e-12, pdi + mdi)
+    return pa_rma(dx, n)
+
+def pa_vwap(dts, h, l, c, v):
+    out = np.empty(len(c)); cum_pv = cum_v = cum_tp = 0.0; cnt = 0; day = None
+    for i in range(len(c)):
+        d = dts[i].date()
+        if d != day: day = d; cum_pv = cum_v = cum_tp = 0.0; cnt = 0
+        tp = (h[i] + l[i] + c[i]) / 3.0; cum_pv += tp * v[i]; cum_v += v[i]; cum_tp += tp; cnt += 1
+        out[i] = cum_pv / cum_v if cum_v > 0 else cum_tp / cnt
+    return out
+
+def pa_resample15(bars):
+    groups = _PA_OD()
+    for b in bars:
+        key = (b[0].date(), (pa_minutes(b[0]) - 555) // 15)
+        groups.setdefault(key, []).append(b)
+    rows = [g for g in groups.values() if len(g) == 3]
+    return (np.array([g[-1][4] for g in rows]), np.array([max(x[2] for x in g) for g in rows]), np.array([min(x[3] for x in g) for g in rows]))
+
+def pa_pattern(o, h, l, c, i, bear=False):
+    """Bullish candle patterns at bar i (arrays are pre-flipped for the bearish side)."""
+    rng = h[i] - l[i]
+    if rng <= 0 or i < 1: return None
+    body = abs(c[i] - o[i]); up = h[i] - max(o[i], c[i]); lo = min(o[i], c[i]) - l[i]
+    name = None
+    if c[i] > o[i] and c[i - 1] < o[i - 1] and c[i] >= o[i - 1] and o[i] <= c[i - 1] and body > abs(c[i - 1] - o[i - 1]): name = 'bullish engulfing'
+    elif lo >= 2 * max(body, 0.05 * rng) and up <= 0.35 * rng and c[i] >= l[i] + 0.6 * rng: name = 'hammer'
+    elif c[i] > o[i] and body >= 0.7 * rng: name = 'bullish marubozu'
+    if name and bear: name = name.replace('bullish', 'bearish').replace('hammer', 'shooting star')
+    return name
 
 
-def iat_today():
-    return now_ist().date().isoformat()
+# ------------------------------ signal engine --------------------------------
+def pa_side_eval(o, h, l, c, v, vw, i0, dc, datr, c15, adx15, mkt, bear):
+    """Score one side. All price arrays are already sign-flipped for the bearish side, so this is
+    always evaluated as a LONG setup. Returns dict(ok, score, setup, reasons, stop, why)."""
+    n = len(c); i = n - 1
+    res = dict(ok=False, score=0.0, setup=None, reasons=[], stop=None, why=None)
+    ema9 = pa_ema(c, 9); ema21 = pa_ema(c, 21); atr = pa_atr(h, l, c, 14); rsi = pa_rsi(c, 14)
+    a = float(atr[i]); px = float(c[i])
+    if a <= 0: res['why'] = 'no volatility data'; return res
+    d20 = pa_ema(dc, 20)[-1]; d50 = pa_ema(dc, 50)[-1]; dcl = dc[-1]
+    if dcl > d20 > d50: db = 20
+    elif dcl > d50: db = 10
+    elif dcl < d20 < d50: db = -20
+    elif dcl < d50: db = -10
+    else: db = 0
+    if db < 0: res['why'] = 'against daily trend'; return res
+    e9 = pa_ema(c15, 9)[-1]; e21 = pa_ema(c15, 21)[-1]
+    if not e9 > e21: res['why'] = '15m trend not aligned'; return res
+    t15 = 20 if c15[-1] > e21 else 10
+    if not px > vw[i]: res['why'] = 'wrong side of VWAP'; return res
+    vsc = 10 if vw[i] >= vw[max(i0, i - 3)] else 5
+    if px - vw[i] > 2.2 * a: res['why'] = 'price stretched from VWAP'; return res
+    if datr and (px - o[i0]) > 1.8 * datr: res['why'] = 'day move already exhausted'; return res
+    if rsi[i] > 78: res['why'] = 'RSI exhausted'; return res
+    setup = None; stop = None; sc = 0; patpts = 0; vol_ok = False; pat = None
+    n_today = i - i0 + 1
+    if n_today >= 4:
+        or_h = float(np.max(h[i0:i0 + 3])); buf = 0.1 * a; rb = h[i] - l[i]
+        fresh = any(c[j] <= or_h + buf for j in range(max(i0 + 3, i - 3), i))
+        va = float(np.mean(v[max(0, i - 20):i])) if i > 0 else 0.0
+        vol_ok = va > 0 and v[i] >= 1.3 * va
+        if c[i] > or_h + buf and rb > 0 and (c[i] - o[i]) / rb >= 0.5 and fresh:
+            setup = 'ORB'; sc = 30 if vol_ok else 18; stop = min(l[i], or_h - 0.25 * a) - 0.1 * a
+            br = (c[i] - o[i]) / rb; patpts = 10 if br >= 0.7 else 6
+            res['reasons'].append(f"Opening-range {'breakdown' if bear else 'breakout'}{' on volume x%.1f' % (v[i] / va) if vol_ok else ' (volume not confirmed)'}")
+    if setup is None:
+        lo_i = max(i0, i - 5)
+        touched = any(l[j] <= max(ema21[j], vw[j]) + 0.15 * a for j in range(lo_i, i + 1))
+        pat = pa_pattern(o, h, l, c, i, bear)
+        if pat is None and i > i0:
+            p1 = pa_pattern(o, h, l, c, i - 1, bear)
+            if p1 and c[i] > h[i - 1]: pat = p1 + ' + follow-through'
+        if touched and pat and c[i] > ema9[i] and c[i] > o[i] and 45 <= rsi[i] <= 72:
+            setup = 'Pullback'; sc = 28; patpts = 10; stop = min(l[lo_i:i + 1]) - 0.1 * a
+            res['reasons'].append(f'Pull-back to EMA21/VWAP confirmed by {pat}')
+    if setup is None: res['why'] = 'no trigger candle'; return res
+    if not (adx15 >= 18 or (setup == 'ORB' and vol_ok)): res['why'] = 'trend strength weak (15m ADX %.0f)' % adx15; return res
+    dist = px - stop
+    if dist > 2.5 * a: res['why'] = 'structure stop too wide'; return res
+    if dist < 0.8 * a: stop = px - 0.8 * a
+    rp = 10 if 52 <= rsi[i] <= 72 else 5 if 45 <= rsi[i] < 52 else 0
+    total = db + t15 + vsc + sc + patpts + rp + mkt
+    up, ab, gt = ('down', 'below', '<') if bear else ('up', 'above', '>')
+    res['reasons'] = [('Daily %strend aligned' % ('' if db >= 20 else 'mild ')) + (' (bearish)' if bear else ' (bullish)'),
+                      (f'15m EMA9{gt}EMA21, price {ab} EMA21' if t15 == 20 else f'15m EMA9{gt}EMA21'),
+                      f'Price {ab} VWAP'] + res['reasons'] + ([f'RSI {(100 - rsi[i]) if bear else rsi[i]:.0f}'] if rp else [])
+    if mkt: res['reasons'].append(f'Market (NIFTY) bias {mkt:+.0f}')
+    res.update(ok=True, score=float(total), setup=setup, stop=float(stop), atr=a, px=px)
+    return res
 
-
-def iat_ema(series, length):
-    if not series:
-        return None
-    k = 2.0 / (length + 1.0)
-    val = float(series[0])
-    for price in series[1:]:
-        val = float(price) * k + val * (1.0 - k)
-    return val
-
-
-def iat_rsi(closes, length=14):
-    if len(closes) < length + 1:
-        return None
-    gains = losses = 0.0
-    for i in range(-length, 0):
-        change = float(closes[i]) - float(closes[i - 1])
-        gains += max(change, 0.0)
-        losses += max(-change, 0.0)
-    if losses == 0:
-        return 100.0
-    rs = (gains / length) / (losses / length)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def iat_atr(highs, lows, closes, length=14):
-    if len(closes) < length + 1:
-        return None
-    trs = [max(float(highs[i]) - float(lows[i]),
-               abs(float(highs[i]) - float(closes[i - 1])),
-               abs(float(lows[i]) - float(closes[i - 1])))
-           for i in range(-length, 0)]
-    return sum(trs) / len(trs)
-
-
-def iat_vwap(rows):
-    num = den = 0.0
-    for r in rows:
-        high, low, close = iat_finite(r.get("high")), iat_finite(r.get("low")), iat_finite(r.get("close"))
-        vol = iat_finite(r.get("volume")) or 0.0
-        if None in (high, low, close) or vol <= 0:
-            continue
-        num += ((high + low + close) / 3.0) * vol
-        den += vol
-    return (num / den) if den > 0 else None
-
-
-# --------------------------------------------------------------- signal engine
-def iat_signal(candles, symbol=None, cfg=None):
-    """Independent 7-factor directional signal for one index.
-
-    The composite is a weighted mean of factors scored into [-1, +1], but an
-    entry additionally requires SIGN AGREEMENT: a large score manufactured by
-    one loud factor is precisely the coincidence this engine exists to ignore.
-    """
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    out = dict(symbol=symbol, score=0.0, strength=0.0, direction=None, agreement=0,
-               factors={}, regime="UNKNOWN", vol_percentile=0.0, atr=None, spot=None,
-               bar_ts=None, ready=False, reason="insufficient data")
-    try:
-        rows = [r for r in (candles or []) if r and iat_finite(r.get("close")) is not None]
-        if len(rows) < 60:
-            out["reason"] = "need at least 60 completed candles"
-            return out
-        closes = [iat_finite(r["close"]) for r in rows]
-        highs = [iat_finite(r.get("high") or r["close"]) for r in rows]
-        lows = [iat_finite(r.get("low") or r["close"]) for r in rows]
-        vols = [iat_finite(r.get("volume")) or 0.0 for r in rows]
-        spot = closes[-1]
-        if not spot or spot <= 0:
-            out["reason"] = "invalid last close"
-            return out
-
-        # 1. EMA structure (9/21/50) -- the trend context everything else sits in.
-        e9, e21, e50 = iat_ema(closes[-90:], 9), iat_ema(closes[-90:], 21), iat_ema(closes[-90:], 50)
-        gap = ((e9 - e50) / spot) if None not in (e9, e50) else 0.0
-        ema_score = iat_clamp(gap / 0.006, -1.0, 1.0)
-
-        # 2. RSI -- overbought/oversold is scored AGAINST continuation, mid-range
-        # is damped so a 55 reading never passes for a signal on its own.
-        rsi = iat_rsi(closes, 14)
-        if rsi is None:
-            rsi_score = 0.0
-        elif rsi >= 70:
-            rsi_score = -iat_clamp((rsi - 70.0) / 20.0, 0.0, 1.0)
-        elif rsi <= 30:
-            rsi_score = iat_clamp((30.0 - rsi) / 20.0, 0.0, 1.0)
-        else:
-            rsi_score = iat_clamp((rsi - 50.0) / 15.0, -1.0, 1.0) * 0.5
-
-        # 3. MACD histogram slope -- is momentum accelerating?
-        ema12, ema26 = iat_ema(closes[-90:], 12), iat_ema(closes[-90:], 26)
-        hist_now = (ema12 - ema26) if None not in (ema12, ema26) else 0.0
-        ema12_p, ema26_p = iat_ema(closes[-90:-1], 12), iat_ema(closes[-90:-1], 26)
-        hist_prev = (ema12_p - ema26_p) if None not in (ema12_p, ema26_p) else hist_now
-        accel = ((hist_now - hist_prev) / spot * 1000.0) if spot else 0.0
-        macd_score = iat_clamp(accel / 0.35, -1.0, 1.0)
-
-        # 4. Donchian position inside the 20-bar range.
-        win = 20
-        hi20, lo20 = max(highs[-win:]), min(lows[-win:])
-        span = hi20 - lo20
-        donchian_score = iat_clamp(((spot - lo20) / span * 2.0 - 1.0) if span > 0 else 0.0, -1.0, 1.0)
-
-        # 5. Volume -- reinforces the Donchian direction, never creates it.
-        vol_now, vol_base = vols[-1], (sum(vols[-21:-1]) / 20.0 if len(vols) >= 21 else 0.0)
-        vol_ratio = (vol_now / vol_base) if vol_base > 0 else 1.0
-        magnitude = iat_clamp((vol_ratio - 1.0) / 0.8, 0.0, 1.0)
-        volume_score = magnitude if donchian_score >= 0 else -magnitude
-
-        # 6. VWAP deviation -- the institutional reference price.
-        vwap = iat_vwap(rows[-60:])
-        vwap_score = iat_clamp(((spot - vwap) / vwap * 100.0) if vwap else 0.0 / 0.35, -1.0, 1.0) \
-            if vwap else 0.0
-
-        # 7. Five-bar rate of change.
-        roc = ((spot / closes[-6] - 1.0) * 100.0) if len(closes) >= 6 and closes[-6] else 0.0
-        roc_score = iat_clamp(roc / 0.30, -1.0, 1.0)
-
-        factors = {"ema_structure": iat_clamp(ema_score, -1, 1), "rsi": iat_clamp(rsi_score, -1, 1),
-                   "macd_slope": iat_clamp(macd_score, -1, 1), "donchian": donchian_score,
-                   "volume": iat_clamp(volume_score, -1, 1), "vwap": vwap_score,
-                   "roc": roc_score}
-        weights = dict(IAT_FACTOR_WEIGHTS)
-        total_w = sum(weights.values()) or 1.0
-        composite = sum(factors[k] * weights[k] for k in IAT_FACTOR_NAMES) / total_w
-
-        # Volatility percentile gates entries only -- it never carries direction.
-        atr = iat_atr(highs, lows, closes, 14)
-        atr_pct = (atr / spot) if atr else 0.0
-        series = []
-        for i in range(20, len(closes)):
-            a = iat_atr(highs[i - 13:i + 1], lows[i - 13:i + 1], closes[i - 13:i + 1], 14)
-            if a and closes[i]:
-                series.append(a / closes[i])
-        pctile = (1.0 * sum(1 for s in series if s <= atr_pct) / len(series)) if series else 0.5
-
-        if pctile >= 0.85:
-            regime = "HIGH_VOL"
-        elif abs(composite) >= 0.45:
-            regime = "TREND_UP" if composite > 0 else "TREND_DOWN"
-        elif abs(composite) < 0.20:
-            regime = "RANGE"
-        else:
-            regime = "CHOP"
-
-        agree = sum(1 for k in IAT_FACTOR_NAMES
-                    if factors[k] != 0 and (factors[k] > 0) == (composite > 0))
-        out.update(score=round(composite, 4), strength=round(abs(composite), 4),
-                   direction=("CE" if composite > 0 else "PE"), agreement=agree,
-                   factors={k: round(v, 4) for k, v in factors.items()}, regime=regime,
-                   vol_percentile=round(pctile, 4), atr=round(atr, 4) if atr else None,
-                   atr_pct=round(atr_pct, 6), spot=spot,
-                   vwap=round(vwap, 4) if vwap else None,
-                   rsi=round(rsi, 2) if rsi is not None else None,
-                   bar_ts=str(rows[-1]["ts"]) if rows[-1].get("ts") is not None else None,
-                   ready=True, reason=None)
-    except Exception as exc:
-        out["reason"] = "signal error: " + str(exc)
+def pa_analyze(bars5, daily, mkt=0.0):
+    """bars5: closed 5-min bars [(dt,o,h,l,c,v)...] (several sessions); daily: completed daily bars.
+    Returns dict(direction 'CE'/'PE'/None, score, setup, reasons, u_entry, u_stop, atr, bull, bear, why)."""
+    out = dict(direction=None, score=0, bull=0, bear=0, setup=None, reasons=[], why=None)
+    if len(bars5) < 45 or daily is None or len(daily) < 55: out['why'] = 'insufficient history'; return out
+    dts = [b[0] for b in bars5]; o = np.array([b[1] for b in bars5]); h = np.array([b[2] for b in bars5])
+    l = np.array([b[3] for b in bars5]); c = np.array([b[4] for b in bars5]); v = np.array([b[5] for b in bars5])
+    today = dts[-1].date(); i0 = next((k for k, d in enumerate(dts) if d.date() == today), None)
+    if i0 is None or len(bars5) - i0 < 4: out['why'] = 'too few bars today'; return out
+    vw = pa_vwap(dts, h, l, c, v)
+    c15, h15, l15 = pa_resample15(bars5)
+    if len(c15) < 25: out['why'] = 'insufficient 15m history'; return out
+    adx15 = float(pa_adx(h15, l15, c15, 14)[-1])
+    dc = np.array([d[4] for d in daily]); dh = np.array([d[2] for d in daily]); dl = np.array([d[3] for d in daily])
+    datr = float(pa_atr(dh, dl, dc, 14)[-1])
+    bull = pa_side_eval(o, h, l, c, v, vw, i0, dc, datr, c15, adx15, mkt, False)
+    bear = pa_side_eval(-o, -l, -h, -c, v, -vw, i0, -dc, datr, -c15, adx15, -mkt, True)
+    out['bull'] = round(bull['score'], 1) if bull['ok'] else 0; out['bear'] = round(bear['score'], 1) if bear['ok'] else 0
+    out['px'] = float(c[-1]); out['atr'] = float(pa_atr(h, l, c, 14)[-1]); out['adx15'] = round(adx15, 1)
+    best = None
+    if bull['ok'] and (not bear['ok'] or bull['score'] >= bear['score']): best = ('CE', bull, bull['stop'])
+    elif bear['ok']: best = ('PE', bear, -bear['stop'])
+    if best:
+        out.update(direction=best[0], score=round(best[1]['score'], 1), setup=best[1]['setup'], reasons=best[1]['reasons'], u_stop=round(best[2], 2), u_entry=float(c[-1]))
+    else:
+        out['why'] = f"long: {bull.get('why')} | short: {bear.get('why')}"
     return out
 
 
-def iat_entry_allowed(report, cfg, open_symbols):
-    """Every gate that must pass before a signal may become an order."""
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    if not report.get("ready"):
-        return False, report.get("reason") or "signal not ready"
-    if report.get("strength", 0.0) < float(cfg["entry_threshold"]):
-        return False, "strength %.2f below threshold %.2f" % (report.get("strength", 0.0),
-                                                              cfg["entry_threshold"])
-    if report.get("agreement", 0) < int(cfg["min_agreement"]):
-        return False, "only %d of 7 factors agree (need %d)" % (report.get("agreement", 0),
-                                                                cfg["min_agreement"])
-    if report.get("vol_percentile", 0.0) > float(cfg["max_vol_percentile"]):
-        return False, "volatility at the %dth percentile; refusing to chase" % int(
-            report.get("vol_percentile", 0.0) * 100)
-    if report.get("symbol") in (open_symbols or set()):
-        return False, "position already open on %s" % report.get("symbol")
-    base = now_ist().replace(tzinfo=None)
-    if base.strftime("%H:%M") < cfg["session_start"] or base.strftime("%H:%M") >= cfg["square_off"]:
-        return False, "outside the session window (%s-%s)" % (cfg["session_start"], cfg["square_off"])
-    # Parse onto TODAY.  strptime("09:20") alone yields 1900-01-01, which would make
-    # the distance to square-off span decades and block every entry.
+# ------------------------------ market data ----------------------------------
+_PA_INS = {'stamp': None, 'opt': {}, 'fut': {}, 'eq': {}, 'idx': {}}
+_PA_CANDLES = {}
+
+def pa_instruments():
+    nfo, nse = get_instruments()
+    stamp = INSTRUMENT_CACHE.get('fetched_at')
+    if _PA_INS['stamp'] == stamp and _PA_INS['opt']: return _PA_INS
+    opt, fut, eq, idx = {}, {}, {}, {}
+    for i in nfo:
+        seg = i.get('segment'); nm = str(i.get('name') or '').upper()
+        if seg == 'NFO-OPT' and i.get('instrument_type') in ('CE', 'PE'): opt.setdefault(nm, []).append(i)
+        elif seg == 'NFO-FUT': fut.setdefault(nm, []).append(i)
+    for v in fut.values(): v.sort(key=lambda x: x['expiry'])
+    for i in nse:
+        if i.get('segment') == 'NSE' and i.get('instrument_type') == 'EQ': eq[str(i['tradingsymbol']).upper()] = i
+        elif i.get('segment') == 'INDICES': idx[str(i['tradingsymbol']).upper()] = i
+    _PA_INS.update(stamp=stamp, opt=opt, fut=fut, eq=eq, idx=idx)
+    return _PA_INS
+
+def pa_hist(token, interval, days, ttl=20):
+    key = (token, interval, days); now = time.monotonic(); c = _PA_CANDLES.get(key)
+    if c and now - c[0] < ttl: return c[1]
+    to = now_ist(); rows = kite.historical_data(token, to - timedelta(days=days), to, interval)
+    out = []
+    for r in rows:
+        d = r['date']; d = d.replace(tzinfo=None) if getattr(d, 'tzinfo', None) else d
+        out.append((d, float(r['open']), float(r['high']), float(r['low']), float(r['close']), float(r.get('volume') or 0)))
+    _PA_CANDLES[key] = (now, out)
+    return out
+
+def pa_closed(bars):
+    n = now_ist()
+    return [b for b in bars if b[0] + timedelta(minutes=5) <= n + timedelta(seconds=1)]
+
+def pa_underlying(desk, sym):
+    ins = pa_instruments()
+    if desk == 'index':
+        futs = [f for f in ins['fut'].get(sym, []) if f['expiry'] >= now_ist().date()]
+        spot = ins['idx'].get(PA_INDEX_MAP.get(sym, sym).upper())
+        if not futs or not spot: return None
+        return dict(name=sym, tok5=futs[0]['instrument_token'], tokD=spot['instrument_token'], qkey='NFO:' + futs[0]['tradingsymbol'],
+                    spotkey='NSE:' + spot['tradingsymbol'], is_index=True)
+    e = ins['eq'].get(sym)
+    if not e or sym not in ins['opt']: return None
+    return dict(name=sym, tok5=e['instrument_token'], tokD=e['instrument_token'], qkey='NSE:' + sym, spotkey='NSE:' + sym, is_index=False)
+
+def pa_daily(u):
+    rows = pa_hist(u['tokD'], 'day', 200, ttl=3 * 3600)
+    return [d for d in rows if d[0].date() < now_ist().date()]
+
+def pa_bars5(u): return pa_closed(pa_hist(u['tok5'], '5minute', 8, ttl=25))
+
+def pa_market_bias():
+    """NIFTY direction used as a filter for stock trades: -10..+10."""
+    key = ('bias', now_ist().strftime('%H%M')[:3])
+    cached = PA_SCAN_INFO.setdefault('_bias', {})
+    if cached.get('key') == key: return cached['v']
+    v = 0.0
     try:
-        def _at(hm):
-            hh, mm = (int(x) for x in hm.split(":"))
-            return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        into = int((base - _at(cfg["session_start"])).total_seconds() // 60)
-        until = int((_at(cfg["square_off"]) - base).total_seconds() // 60)
-    except Exception:
-        into = until = 10 ** 6
-    if into < int(cfg["protected_minutes"]) or until < int(cfg["protected_minutes"]):
-        return False, "inside the protected %d-minute buffer" % cfg["protected_minutes"]
-    return True, None
+        u = pa_underlying('index', 'NIFTY'); b = pa_bars5(u) if u else []
+        if len(b) > 50:
+            dts = [x[0] for x in b]; h = np.array([x[2] for x in b]); l = np.array([x[3] for x in b]); c = np.array([x[4] for x in b]); vv = np.array([x[5] for x in b])
+            vw = pa_vwap(dts, h, l, c, vv); c15, _, _ = pa_resample15(b)
+            if len(c15) > 22:
+                tr = 1 if pa_ema(c15, 9)[-1] > pa_ema(c15, 21)[-1] else -1; vs = 1 if c[-1] > vw[-1] else -1
+                v = (5.0 * tr + 5.0 * vs) if tr == vs else 0.0
+    except Exception as e:
+        pa_event('system', 'WARN', 'market bias unavailable: ' + str(e))
+    cached.update(key=key, v=v)
+    return v
 
+def pa_fo_stocks():
+    ins = pa_instruments()
+    return sorted(s for s in ins['opt'] if s in ins['eq'] and s not in PA_INDEX_MAP and s not in ('NIFTYNXT50', 'NIFTYFPI'))
 
-# ---------------------------------------------------------------------- exits
-def iat_exit_reason(trade, bid, composite, cfg):
-    """Priority-ordered exit decision.  Protective rules outrank profit rules and
-    the hard stop is evaluated before the target, so a bar spanning both resolves
-    conservatively.  May mutate the trade's stop for trailing / breakeven."""
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    if bid is None or not math.isfinite(bid) or bid <= 0:
-        return "Position quote unavailable"
-    entry = float(trade.get("entry_price") or 0)
-    qty = int(trade.get("quantity") or 0)
-    if entry <= 0 or qty <= 0:
-        return "Trade record incomplete"
-    stop = float(trade.get("sl_price") or 0)
-    target = float(trade.get("target_price") or 0)
-    fees = float(trade.get("fees") or 0.0)
-    risk_unit = max(0.01, entry - float(trade.get("sl_entry") or stop))
-    held = 0.0
+def pa_build_shortlist(force=False):
+    if PA_SHORTLIST['building']: return
+    PA_SHORTLIST['building'] = True; PA_SHORTLIST['error'] = None
     try:
-        # now_ist() is naive IST; iat_ts() returns tz-aware IST.  Strip the zone so
-        # the subtraction cannot raise -- a swallowed TypeError here would silently
-        # disable the max-hold exit.
-        opened = iat_ts(trade["opened_at"]).replace(tzinfo=None)
-        held = (now_ist().replace(tzinfo=None) - opened).total_seconds() / 60.0
-    except Exception:
-        held = 0.0
-    peak = max(float(trade.get("peak_bid") or entry), bid)
-
-    if bid <= stop:
-        return "Stop reached"
-    if bid >= target:
-        return "Target reached"
-    if now_ist().strftime("%H:%M") >= cfg["square_off"]:
-        return "Intraday square-off"
-    if held >= float(cfg["max_hold_minutes"]):
-        return "Maximum holding time"
-    score = trade.get("signal_score")
-    if score is not None and composite is not None:
-        if ((float(score) > 0) != (composite > 0)) and abs(composite) >= float(cfg["reversal_threshold"]):
-            return "Signal reversed"
-    # Trailing stop only once the trade has earned it.
-    if peak >= entry + float(cfg["trailing_activate_r"]) * risk_unit:
-        trail = peak - float(cfg["trailing_giveback_r"]) * risk_unit
-        if trail > stop:
-            trade["sl_price"] = round(trail, 2)
-            trade["trail_active"] = True
-    # Breakeven once the position has covered its own round-trip costs.
-    if not trade.get("breakeven_hit"):
-        r_now = (bid - entry) / risk_unit
-        if r_now >= float(cfg["breakeven_after_r"]):
-            be = entry + (fees / qty if qty else 0.0)
-            if be > float(trade.get("sl_price") or 0):
-                trade["sl_price"] = round(be, 2)
-            trade["breakeven_hit"] = True
-    return None
-
-
-# --------------------------------------------------------------------- sizing
-def iat_size(premium, lot_size, cfg, strength, depth_qty=None):
-    """Whole lots only.  Planned loss is stop distance x quantity plus costs, sized
-    so it fits the per-trade R budget; stake scales with signal strength."""
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    if not premium or premium <= 0 or not lot_size or lot_size <= 0:
-        return dict(lots=0, quantity=0, reason="invalid premium or lot size")
-    if premium < float(cfg["min_contract_premium"]):
-        return dict(lots=0, quantity=0, reason="premium below the minimum contract price")
-    stop_distance = premium * float(cfg["stop_pct_of_premium"]) / 100.0
-    per_lot_risk = stop_distance * lot_size
-    if per_lot_risk <= 0:
-        return dict(lots=0, quantity=0, reason="non-positive per-lot risk")
-    capital = float(cfg["capital_per_trade"])
-    lots_by_capital = int(capital // (premium * lot_size))
-    # Stake is a percentage of the trade's own capital, not an R figure: R is a
-    # measurement unit for outcomes, whereas rupees are what sizes an order.
-    budget = capital * (float(cfg["risk_per_trade_pct"]) / 100.0) * iat_clamp(0.5 + strength, 0.5, 1.5)
-    lots_by_risk = int(budget // per_lot_risk)
-    lots = max(0, min(lots_by_capital, lots_by_risk))
-    if depth_qty is not None:
-        try:
-            lots = min(lots, max(0, int(depth_qty) // lot_size))
-        except (TypeError, ValueError):
-            pass
-    if lots <= 0:
-        return dict(lots=0, quantity=0,
-                    reason="one lot needs Rs%.0f risk against a Rs%.0f budget"
-                           % (per_lot_risk, budget))
-    return dict(lots=lots, quantity=lots * lot_size, stop_distance=round(stop_distance, 2),
-                planned_risk=round(per_lot_risk * lots, 2), reason=None)
-
-
-# -------------------------------------------------------------------- ledger
-def iat_load_state():
-    state = dict(IAT_DEFAULTS)
-    if os.path.exists(IAT_STATE_FILE):
-        try:
-            with open(IAT_STATE_FILE, "r") as fh:
-                stored = json.load(fh)
-            if isinstance(stored, dict):
-                state.update({k: stored[k] for k in state if k in stored})
-        except Exception:
-            pass
-    if state.get("day") != iat_today():
-        state.update(day=iat_today(), halt_reason=None, last_error=None, trades_today=0,
-                     realized_r_today=0.0, loss_streak=0, peak_r_today=0.0)
-    return state
-
-
-def iat_save_state(state):
-    with IAT_LOCK:
-        with open(IAT_STATE_FILE, "w") as fh:
-            json.dump(state, fh, indent=2, default=str)
-
-
-def iat_load_trades():
-    if not os.path.exists(IAT_TRADES_FILE):
-        return []
-    try:
-        with open(IAT_TRADES_FILE, "r") as fh:
-            rows = json.load(fh)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
-
-
-def iat_save_trades(trades):
-    with IAT_LOCK:
-        with open(IAT_TRADES_FILE, "w") as fh:
-            json.dump(trades[-400:], fh, indent=2, default=str)
-
-
-def iat_block_reason(state, trades, cfg):
-    """The single source of truth for 'may a new position be opened right now'."""
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    if state.get("halt_reason"):
-        return "Halted: " + str(state["halt_reason"])
-    if not state.get("armed"):
-        return "Autotrader disarmed"
-    if state.get("trades_today", 0) >= int(cfg["max_trades_per_day"]):
-        return "Daily trade cap reached (%d)" % cfg["max_trades_per_day"]
-    if state.get("realized_r_today", 0.0) <= -float(cfg["max_daily_loss_r"]):
-        return "Daily loss limit reached (%.2fR)" % state.get("realized_r_today", 0.0)
-    if state.get("loss_streak", 0) >= int(cfg["max_loss_streak"]):
-        return "Loss streak breaker (%d in a row)" % state.get("loss_streak", 0)
-    open_trades = [t for t in trades if t.get("status") == "open"]
-    if len(open_trades) >= int(cfg["max_concurrent"]):
-        return "Concurrent position cap reached (%d)" % len(open_trades)
-    return None
-
-
-# ---------------------------------------------------------------- contract
-def iat_pick_contract(symbol, direction, cfg):
-    """Select the option to trade: nearest ATM in the signal direction, filtered
-    for a real bid/ask, a tight spread, a delta in the tradeable band and enough
-    days left that theta is not the dominant force."""
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    data, err = get_chain_for_symbol(symbol)
-    if err:
-        return None, None, (err.get("error") if isinstance(err, dict) else str(err))
-    chain = data.get("chain") or []
-    spot = iat_finite(data.get("spot")) or 0.0
-    lot_size = int(data.get("lot_size") or 0)
-    today = now_ist().date()
-    best = None
-    for opt in chain:
-        if opt.get("instrument_type") != direction:
-            continue
-        bid, ask = iat_finite(opt.get("bid")), iat_finite(opt.get("ask"))
-        if not bid or not ask or bid <= 0 or ask <= 0 or bid > ask:
-            continue
-        mid = (bid + ask) / 2.0
-        spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 99.0
-        if spread_pct > float(cfg["max_spread_pct"]):
-            continue
-        delta = iat_finite(opt.get("delta"))
-        if delta is None or not float(cfg["min_delta"]) <= abs(delta) <= float(cfg["max_delta"]):
-            continue
-        expiry = opt.get("expiry")
-        dte = None
-        try:
-            if hasattr(expiry, "year"):
-                dte = (expiry - today).days
-            else:
-                dte = (datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).date() - today).days
-        except Exception:
-            dte = None
-        if dte is None or dte < int(cfg["min_dte"]):
-            continue
-        premium = iat_finite(opt.get("ltp")) or mid
-        if not premium or premium < float(cfg["min_contract_premium"]):
-            continue
-        entry = (spread_pct, premium, opt)
-        if best is None or entry[0] < best[0]:
-            best = entry
-    if best is None:
-        return None, None, "no %s contract passed the spread, delta, DTE and premium filters" % direction
-    return best[2], dict(spot=spot, lot_size=lot_size, spread_pct=round(best[0], 4),
-                         premium=round(best[1], 4)), None
-
-
-# ----------------------------------------------------------------- execution
-def iat_send(trade, side):
-    """MIS market order through the governed basket path.  Track mode sends
-    nothing at all -- the fill is simulated on the same live quote a live order
-    would have taken."""
-    if trade.get("execution_mode") != "live":
-        return "TRACK-%d" % int(time.time() * 1000), None
-    leg = {"leg": "iat_" + side, "tradingsymbol": trade["tradingsymbol"],
-           "exchange": trade.get("exchange", "NFO"),
-           "transaction_type": "BUY" if side == "entry" else "SELL",
-           "quantity": int(trade["quantity"])}
-    try:
-        results = place_basket_orders([leg], product="MIS", order_type="MARKET",
-                                      sequence_for_margin=False)
-    except Exception as exc:
-        return None, str(exc)
-    result = results[0] if results else {"status": "failed", "error": "no result returned"}
-    if result.get("status") != "placed":
-        return None, result.get("error") or "order failed"
-    return result.get("order_id"), None
-
-
-def iat_open(symbol, report, state, cfg):
-    cfg = dict(IAT_DEFAULTS, **(cfg or {}))
-    option, meta, err = iat_pick_contract(symbol, report["direction"], cfg)
-    if err:
-        return None, "contract: " + str(err)
-    lot_size = int(meta["lot_size"] or 0)
-    if lot_size <= 0:
-        return None, "lot size unavailable for " + str(symbol)
-    premium = meta["premium"]
-    sized = iat_size(premium, lot_size, cfg, report.get("strength") or 0.0, option.get("depth_qty"))
-    if sized["lots"] <= 0:
-        return None, sized["reason"]
-    stop_distance = premium * float(cfg["stop_pct_of_premium"]) / 100.0
-    trade = {
-        "id": "IAT%d" % int(time.time() * 1000), "symbol": symbol,
-        "direction": report["direction"], "tradingsymbol": option["tradingsymbol"],
-        "exchange": option.get("exchange", "NFO"), "strike": option.get("strike"),
-        "expiry": str(option.get("expiry")), "quantity": sized["quantity"],
-        "lot_size": lot_size, "lots": sized["lots"], "entry_price": premium,
-        "sl_price": round(premium - stop_distance, 2),
-        "sl_entry": round(premium - stop_distance, 2),
-        "target_price": round(premium + stop_distance * float(cfg["reward_r"]), 2),
-        "signal_score": report.get("score"), "strength": report.get("strength"),
-        "agreement": report.get("agreement"), "factors": report.get("factors"),
-        "regime": report.get("regime"), "vol_percentile": report.get("vol_percentile"),
-        "spread_pct": meta["spread_pct"], "spot_at_entry": meta["spot"],
-        "execution_mode": state.get("execution_mode", "track"), "status": "open",
-        "fees": 0.0, "peak_bid": premium, "breakeven_hit": False, "trail_active": False,
-        "opened_at": now_ist().isoformat(), "closed_at": None, "exit_reason": None,
-        "exit_price": None, "realized_pnl": None, "realized_r": None,
-    }
-    order_id, err = iat_send(trade, "entry")
-    if err:
-        return None, "entry order: " + str(err)
-    trade["order_id"] = order_id
-    return trade, None
-
-
-def iat_close(trade, reason, bid, state):
-    trade = dict(trade)
-    trade["status"] = "closed"
-    trade["exit_reason"] = reason
-    trade["closed_at"] = now_ist().isoformat()
-    if bid and math.isfinite(bid) and bid > 0:
-        trade["exit_price"] = round(float(bid), 2)
-    order_id, err = iat_send(trade, "exit")
-    if err:
-        trade["exit_order_error"] = str(err)
-    else:
-        trade["exit_order_id"] = order_id
-    entry = float(trade.get("entry_price") or 0)
-    qty = int(trade.get("quantity") or 0)
-    if trade.get("exit_price") and entry > 0 and qty > 0:
-        pnl = (float(trade["exit_price"]) - entry) * qty
-        risk_unit = max(0.01, entry - float(trade.get("sl_entry") or trade.get("sl_price") or entry))
-        trade["realized_pnl"] = round(pnl, 2)
-        trade["realized_r"] = round((pnl - float(trade.get("fees") or 0.0)) / (risk_unit * qty), 4)
-    state["trades_today"] = int(state.get("trades_today", 0)) + 1
-    realized = float(trade.get("realized_r") or 0.0)
-    state["realized_r_today"] = round(float(state.get("realized_r_today", 0.0)) + realized, 4)
-    state["peak_r_today"] = max(float(state.get("peak_r_today", 0.0)),
-                                float(state.get("realized_r_today", 0.0)))
-    state["loss_streak"] = int(state.get("loss_streak", 0)) + 1 if realized < 0 else 0
-    return trade
-
-
-def iat_option_quote(trade):
-    key = "%s:%s" % (trade.get("exchange", "NFO"), trade.get("tradingsymbol"))
-    try:
-        q = kite_quote_bulk([key]).get(key) or {}
-    except Exception:
-        return None
-    bid = iat_finite(q.get("last_price"))
-    if bid and bid > 0:
-        return bid
-    return None
-
-
-# ------------------------------------------------------------------ the tick
-def iat_tick():
-    """One full cycle: supervise open positions first, then look for an entry."""
-    state = iat_load_state()
-    trades = iat_load_trades()
-    cfg = state
-    if not state.get("armed"):
-        return state, trades, "disarmed"
-    open_trades = [t for t in trades if t.get("status") == "open"]
-
-    # 1. Supervision always runs before any new entry is considered.
-    latest_composite = {}
-    for symbol in state.get("symbols") or ["NIFTY"]:
-        try:
-            candles = INDEX_OPTIONS_DESK.a.bars(symbol, 120)
-            latest_composite[symbol] = iat_signal(candles, symbol, cfg).get("score")
-        except Exception:
-            latest_composite[symbol] = None
-    for trade in list(open_trades):
-        bid = iat_option_quote(trade)
-        if bid is None:
-            # A missing quote is not a reason to liquidate; it is a reason to keep
-            # the existing stop and try again next tick.
-            continue
-        trade["peak_bid"] = max(float(trade.get("peak_bid") or trade["entry_price"]), bid)
-        reason = iat_exit_reason(trade, bid, latest_composite.get(trade["symbol"]), cfg)
-        if reason:
-            closed = iat_close(trade, reason, bid, state)
-            trades[trades.index(trade)] = closed
-            open_trades.remove(trade)
-
-    # 2. Daily loss limit closes everything, it does not merely block new entries.
-    if state.get("realized_r_today", 0.0) <= -float(cfg["max_daily_loss_r"]):
-        for trade in list(open_trades):
-            bid = iat_option_quote(trade)
-            if bid:
-                closed = iat_close(trade, "Daily loss limit", bid, state)
-                trades[trades.index(trade)] = closed
-                open_trades.remove(trade)
-        state["halt_reason"] = "daily loss limit reached at %.2fR" % state["realized_r_today"]
-
-    # 3. New entry, if every gate allows it.
-    blocked = iat_block_reason(state, trades, cfg)
-    if not blocked:
-        open_symbols = {t["symbol"] for t in open_trades}
-        for symbol in state.get("symbols") or ["NIFTY"]:
+        ins = pa_instruments(); syms = pa_fo_stocks(); q = {}
+        for k in range(0, len(syms), 200):
+            q.update(kite.quote(['NSE:' + s for s in syms[k:k + 200]]))
+        rows = []
+        for s in syms:
+            d = q.get('NSE:' + s)
+            if not d: continue
+            last = float(d.get('last_price') or 0); prev = float((d.get('ohlc') or {}).get('close') or 0); vol = float(d.get('volume') or 0)
+            if last <= 0 or prev <= 0: continue
+            rows.append(dict(symbol=s, last=last, chg=(last - prev) / prev * 100.0, value=last * vol))
+        rows.sort(key=lambda r: r['value'], reverse=True)
+        top = rows[:60]; cand = []
+        for r in top:
             try:
-                candles = INDEX_OPTIONS_DESK.a.bars(symbol, 120)
-            except Exception as exc:
-                state["last_error"] = "candles: %s" % exc
-                continue
-            report = iat_signal(candles, symbol, cfg)
-            report["symbol"] = symbol
-            state["last_signal"] = report
-            ok, why = iat_entry_allowed(report, cfg, open_symbols)
-            if not ok:
-                state["last_error"] = why
-                continue
-            trade, err = iat_open(symbol, report, state, cfg)
-            if err:
-                state["last_error"] = err
-                continue
-            trades.append(trade)
-            state["last_error"] = None
-            break
-
-    state["last_scan_at"] = now_ist().isoformat()
-    iat_save_state(state)
-    iat_save_trades(trades)
-    return state, trades, None
+                u = pa_underlying('stock', r['symbol']); dly = pa_daily(u)
+                if len(dly) < 55: continue
+                dc = np.array([x[4] for x in dly]); dh = np.array([x[2] for x in dly]); dl = np.array([x[3] for x in dly])
+                atrp = float(pa_atr(dh, dl, dc, 14)[-1]) / dc[-1] * 100.0
+                d20 = pa_ema(dc, 20)[-1]; d50 = pa_ema(dc, 50)[-1]
+                bias = 20 if dc[-1] > d20 > d50 else -20 if dc[-1] < d20 < d50 else 10 if dc[-1] > d50 else -10
+                if not (0.8 <= atrp <= 5.0): continue
+                play = abs(r['chg']) / atrp
+                r.update(atr_pct=round(atrp, 2), bias=bias, in_play=round(play, 2), rank=round(play + abs(bias) / 40.0, 3)); cand.append(r)
+            except BrokerDeferred: time.sleep(1)
+            except Exception: continue
+        cand.sort(key=lambda r: r['rank'], reverse=True)
+        PA_SHORTLIST['items'] = cand[:pa_cfg('stock')['shortlist']]; PA_SHORTLIST['built_at'] = now_ist()
+        pa_event('stock', 'INFO', 'Shortlist built: ' + ', '.join(x['symbol'] for x in PA_SHORTLIST['items'][:12]))
+    except Exception as e:
+        PA_SHORTLIST['error'] = str(e); pa_event('stock', 'ERROR', 'Shortlist failed: ' + str(e))
+    finally: PA_SHORTLIST['building'] = False
 
 
-IAT_STOP = threading.Event()
+# ------------------------------ risk governor --------------------------------
+def pa_today(): return now_ist().strftime('%Y-%m-%d')
+
+def pa_open_trades(mode=None, desk=None):
+    sql = "SELECT * FROM pa_trades WHERE status IN ('PENDING_ENTRY','OPEN','EXITING')"; a = []
+    if mode: sql += ' AND mode=?'; a.append(mode)
+    if desk: sql += ' AND desk=?'; a.append(desk)
+    return pa_rows(sql, tuple(a))
+
+def pa_ledger(mode):
+    g = pa_gcfg(); cap = g['daily_loss']
+    closed = pa_rows("SELECT * FROM pa_trades WHERE status='CLOSED' AND day=? AND mode=? ORDER BY exit_ts", (pa_today(), mode))
+    realized = sum(t['pnl_net'] or 0 for t in closed)
+    opn = pa_open_trades(mode); unreal = 0.0; risk_open = 0.0
+    for t in opn:
+        if t['status'] == 'PENDING_ENTRY': risk_open += t['planned_risk'] or 0; continue
+        ltp = (PA_LTP.get(t['id']) or {}).get('bid') or (PA_LTP.get(t['id']) or {}).get('ltp') or t['entry_price']
+        unreal += (ltp - t['entry_price']) * t['qty']
+        risk_open += max(0.0, (t['entry_price'] - (t['sl'] or 0)) * t['qty'])
+    losses = 0
+    for t in reversed(closed):
+        if (t['pnl_net'] or 0) < 0: losses += 1
+        else: break
+    halt = pa_kv_get('halt', {}) or {}
+    return dict(cap=cap, realized=round(realized, 2), unrealized=round(unreal, 2), net=round(realized + unreal, 2),
+                budget_left=round(cap * PA_GATE_FRAC - max(0.0, -realized) - risk_open, 2), risk_open=round(risk_open, 2),
+                open_count=len(opn), max_open=g['max_open'], consecutive_losses=losses, max_consecutive=g['max_consecutive_losses'],
+                halted=halt.get('date') == pa_today(), halt_reason=halt.get('reason') if halt.get('date') == pa_today() else None,
+                kill_at=round(-cap * PA_KILL_FRAC, 2), closed_count=len(closed))
+
+def pa_halt(reason):
+    pa_kv_set('halt', dict(date=pa_today(), reason=reason))
+    for d in ('stock', 'index'): pa_event(d, 'HALT', reason)
 
 
-def iat_loop():
-    while not IAT_STOP.is_set():
-        try:
-            if now_ist().strftime("%H:%M") < "09:15":
-                IAT_STOP.wait(60)
-                continue
-            state = iat_load_state()
-            if state.get("armed"):
-                iat_tick()
-            IAT_STOP.wait(max(5, int(state.get("poll_seconds") or 20)))
-        except Exception as exc:
-            try:
-                stale = iat_load_state()
-                stale["last_error"] = "loop: %s" % exc
-                iat_save_state(stale)
-            except Exception:
-                pass
-            IAT_STOP.wait(20)
+# ------------------------------ order helpers (live) -------------------------
+def pa_order_hist(oid):
+    h = kite.order_history(oid)
+    return h[-1] if h else {}
+
+def pa_wait_order(oid, secs):
+    last = {}
+    for _ in range(int(secs)):
+        time.sleep(1)
+        try: last = pa_order_hist(oid)
+        except Exception: continue
+        if last.get('status') in ('COMPLETE', 'REJECTED', 'CANCELLED'): break
+    return last
+
+def pa_live_limit(ts, side, qty, price, tag='PAAUTO'):
+    return kite.place_order(variety=kite.VARIETY_REGULAR, exchange='NFO', tradingsymbol=ts,
+                            transaction_type=kite.TRANSACTION_TYPE_BUY if side == 'BUY' else kite.TRANSACTION_TYPE_SELL,
+                            quantity=int(qty), product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_LIMIT, price=float(price),
+                            validity=kite.VALIDITY_DAY, tag=tag)
+
+def pa_place_sl(t, trigger):
+    tick = t['tick'] or 0.05; trig = pa_tick(trigger, tick)
+    limit = pa_tick(max(tick, trig - max(2 * tick, trig * 0.04)), tick)
+    return kite.place_order(variety=kite.VARIETY_REGULAR, exchange='NFO', tradingsymbol=t['tradingsymbol'],
+                            transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=int(t['qty']), product=kite.PRODUCT_MIS,
+                            order_type=kite.ORDER_TYPE_SL, price=float(limit), trigger_price=float(trig),
+                            validity=kite.VALIDITY_DAY, tag='PASL')
+
+def pa_cancel_quiet(oid):
+    try: kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=oid)
+    except Exception: pass
 
 
-# -------------------------------------------------------------------- routes
-def _iat_gate():
-    if not require_session():
-        return jsonify({"error": "not_logged_in"}), 401
-    return None
+# ------------------------------ entry ----------------------------------------
+def pa_pick_contract(desk, sym, u, direction, u_price, cfg):
+    ins = pa_instruments(); today = now_ist().date()
+    opts = [o for o in ins['opt'].get(sym, []) if o['instrument_type'] == direction and o['expiry'] >= today]
+    exps = sorted({o['expiry'] for o in opts}); exp = next((e for e in exps if (e - today).days >= cfg['min_dte']), None)
+    if exp is None: return None, 'no expiry with enough days left'
+    ch = [o for o in opts if o['expiry'] == exp]; strikes = sorted({float(o['strike']) for o in ch})
+    if len(strikes) < 3: return None, 'thin option chain'
+    step = min(b - a for a, b in zip(strikes, strikes[1:]) if b > a)
+    atm = min(strikes, key=lambda k: abs(k - u_price)); k = atm
+    if cfg['moneyness'] == 'ITM1': k = atm - step if direction == 'CE' else atm + step
+    inst = next((o for o in ch if abs(float(o['strike']) - k) < 1e-6), None)
+    if not inst: return None, 'strike not found'
+    return inst, None
 
-
-@app.route("/api/index-autotrader/state")
-def iat_state_route():
-    err = _iat_gate()
-    if err:
-        return err
-    state = iat_load_state()
-    trades = iat_load_trades()
-    closed = [t for t in trades if t.get("status") == "closed" and t.get("realized_r") is not None]
-    window = [float(t["realized_r"]) for t in closed[-24:]]
-    equity, running = [], 0.0
-    for t in closed[-100:]:
-        running += float(t.get("realized_r") or 0.0)
-        equity.append(dict(ts=t.get("closed_at"), r=round(running, 4)))
-    return jsonify({
-        "state": {k: state.get(k) for k in
-                  ("armed", "execution_mode", "symbols", "day", "halt_reason", "trades_today",
-                   "realized_r_today", "loss_streak", "peak_r_today", "last_scan_at",
-                   "last_error", "last_signal")},
-        "defaults": IAT_DEFAULTS,
-        "factor_weights": IAT_FACTOR_WEIGHTS,
-        "block_reason": iat_block_reason(state, trades, state),
-        "open": [t for t in trades if t.get("status") == "open"],
-        "recent": list(reversed(closed[-25:])),
-        "stats": {
-            "trades": len(closed),
-            "trailing_expectancy_r": round(sum(window) / len(window), 4) if window else 0.0,
-            "win_rate": round(100.0 * sum(1 for r in window if r > 0) / len(window), 1) if window else 0.0,
-            "net_r": round(sum(window), 4),
-            "profit_factor": (round(sum(r for r in window if r > 0) / abs(sum(r for r in window if r < 0)), 2)
-                              if sum(r for r in window if r < 0) else None),
-        },
-        "equity": equity,
-    })
-
-
-@app.route("/api/index-autotrader/config", methods=["POST"])
-def iat_config_route():
-    err = _iat_gate()
-    if err:
-        return err
-    body = request.get_json(silent=True) or {}
-    state = iat_load_state()
-    bounds = {
-        "entry_threshold": (0.05, 1.0), "min_agreement": (1, 7),
-        "max_vol_percentile": (0.1, 1.0), "reversal_threshold": (0.05, 1.0),
-        "risk_per_trade_pct": (0.1, 100), "stop_pct_of_premium": (2, 50),
-        "reward_r": (0.5, 6), "capital_per_trade": (1000, 10000000),
-        "max_daily_loss_r": (0.5, 100), "max_trades_per_day": (0, 50),
-        "max_concurrent": (1, 5), "max_loss_streak": (1, 20),
-        "protected_minutes": (0, 120), "max_hold_minutes": (5, 400),
-        "poll_seconds": (5, 300), "min_dte": (0, 60),
-        "max_spread_pct": (0.05, 10), "min_delta": (0.05, 0.95),
-        "max_delta": (0.05, 0.99), "min_contract_premium": (0.1, 10000),
-        "trailing_activate_r": (0, 10), "trailing_giveback_r": (0, 10),
-        "breakeven_after_r": (0, 10),
-    }
-    for key, value in body.items():
-        if key == "symbols":
-            if not isinstance(value, list) or not value:
-                return jsonify({"error": "symbols must be a non-empty list"}), 400
-            state["symbols"] = [str(s).upper() for s in value][:5]
-        elif key in ("session_start", "square_off"):
-            if not isinstance(value, str) or len(value) != 5:
-                return jsonify({"error": key + " must be HH:MM"}), 400
-            datetime.strptime(value, "%H:%M")
-            state[key] = value
-        elif key in ("armed", "auto_start"):
-            if not isinstance(value, bool):
-                return jsonify({"error": key + " must be true or false"}), 400
-            state[key] = value
-        elif key == "execution_mode":
-            if value not in ("track", "live"):
-                return jsonify({"error": "execution_mode must be track or live"}), 400
-            state[key] = value
-        elif key == "clear_halt" and value:
-            state["halt_reason"] = None
-            state["loss_streak"] = 0
-        elif key in bounds:
-            value = float(value)
-            lo, hi = bounds[key]
-            if not math.isfinite(value) or not lo <= value <= hi:
-                return jsonify({"error": "%s: expected %s to %s" % (key, lo, hi)}), 400
-            state[key] = int(value) if key in ("min_agreement", "max_trades_per_day",
-                                               "max_concurrent", "max_loss_streak",
-                                               "protected_minutes", "max_hold_minutes",
-                                               "poll_seconds", "min_dte") else value
+def pa_try_enter(desk, sig, cfg, vix=None):
+    """Full entry sequence. Returns (ok, message)."""
+    sym = sig['symbol']; direction = sig['direction']; mode = cfg['mode']
+    with PA_ENTRY_LOCK:
+        led = pa_ledger(mode)
+        if led['halted']: return False, 'halted for the day'
+        if led['open_count'] >= led['max_open']: return False, 'max open trades reached'
+        if led['consecutive_losses'] >= led['max_consecutive']: return False, 'consecutive-loss breaker'
+        if led['net'] <= -led['cap'] * PA_GATE_FRAC: return False, 'daily loss gate'
+        if any(t['symbol'] == sym for t in pa_open_trades(mode)): return False, 'already holding this underlying'
+        todays = pa_rows('SELECT * FROM pa_trades WHERE day=? AND desk=? AND symbol=? AND mode=?', (pa_today(), desk, sym, mode))
+        if len(todays) >= cfg['max_entries_per_symbol']: return False, 'max entries for symbol reached'
+        for t in todays:
+            if t['exit_ts'] and (now_ist() - datetime.strptime(t['exit_ts'], '%Y-%m-%d %H:%M:%S')).total_seconds() < cfg['cooldown_min'] * 60:
+                return False, 'cooldown after previous trade'
+        u = pa_underlying(desk, sym)
+        qd = kite.quote([u['spotkey']]); spot = float(qd[u['spotkey']]['last_price'])
+        inst, err = pa_pick_contract(desk, sym, u, direction, spot, cfg)
+        if err: return False, err
+        key = 'NFO:' + inst['tradingsymbol']; q = kite.quote([key])[key]
+        buys = (q.get('depth') or {}).get('buy') or []; sells = (q.get('depth') or {}).get('sell') or []
+        bid = float(buys[0]['price']) if buys else 0.0; ask = float(sells[0]['price']) if sells else 0.0
+        lot = int(inst['lot_size']); tick = float(inst.get('tick_size') or 0.05)
+        if bid <= 0 or ask <= 0: return False, 'no two-sided quote'
+        spread = (ask - bid) / ask * 100.0
+        if spread > cfg['max_spread_pct']: return False, f'spread {spread:.1f}% too wide'
+        if ask < cfg['min_premium']: return False, f'premium {ask} below minimum'
+        if (q.get('oi') or 0) / lot < cfg['min_oi_lots']: return False, 'open interest too low'
+        if not (q.get('volume') or 0) > 0: return False, 'no volume'
+        # --- map the underlying structure stop to a premium stop (Black-Scholes) ---
+        exp_dt = datetime.combine(inst['expiry'], datetime.strptime('15:30', '%H:%M').time())
+        T = max((exp_dt - now_ist()).total_seconds(), 60.0) / (365.0 * 86400.0)
+        r = 0.0 if u['is_index'] else RISK_FREE_RATE
+        S = float(sig['u_entry']); K = float(inst['strike']); mid = (bid + ask) / 2.0
+        iv = pa_iv(mid, S, K, T, r, direction)
+        if iv:
+            p_stop = pa_bs(float(sig['u_stop']), K, T, r, iv, direction); loss_pct = (ask - p_stop) / ask
         else:
-            return jsonify({"error": "Unsupported setting: " + key}), 400
-    if state["square_off"] <= state["session_start"]:
-        return jsonify({"error": "square_off must be later than session_start"}), 400
-    state.setdefault("day", iat_today())
-    iat_save_state(state)
-    return jsonify({"ok": True, "state": state})
+            loss_pct = 0.5 * abs(S - float(sig['u_stop'])) / ask
+        if loss_pct > cfg['max_sl_pct']: return False, f'stop needs {loss_pct*100:.0f}% premium loss (> {cfg["max_sl_pct"]*100:.0f}% limit)'
+        loss_pct = max(loss_pct, cfg['min_sl_pct'])
+        entry = pa_tick(ask + max(tick, ask * 0.002), tick, up=True)
+        sl = pa_tick(entry * (1 - loss_pct), tick)
+        if sl >= entry - 2 * tick: return False, 'stop too close to entry'
+        risk_unit = (entry - sl) * lot
+        budget = min(cfg['risk_per_trade'], led['budget_left'])
+        lots = int(min(budget // risk_unit, cfg['max_lots'], cfg['max_capital_per_trade'] // (entry * lot)))
+        if lots < 1: return False, f'1 lot risks Rs {risk_unit:,.0f} > budget Rs {budget:,.0f}'
+        qty = lots * lot
+        if mode == 'live':
+            try:
+                m = kite.margins('equity'); avail = float((m.get('available') or {}).get('live_balance') or (m.get('net') or 0))
+                if entry * qty > avail * 0.95: return False, f'insufficient funds (need Rs {entry*qty:,.0f}, have Rs {avail:,.0f})'
+            except Exception as e: return False, 'could not verify margin: ' + str(e)
+        tid = pa_exec('''INSERT INTO pa_trades(desk,mode,status,symbol,side,tradingsymbol,token,expiry,strike,lot_size,lots,qty,tick,setup,score,reasons,
+                         u_entry,u_stop,sl_pct,planned_risk,entry_ts,init_sl,sl,day) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                      (desk, mode, 'PENDING_ENTRY', sym, direction, inst['tradingsymbol'], inst['instrument_token'], str(inst['expiry']), K, lot, lots, qty, tick,
+                       sig['setup'], sig['score'], json.dumps(sig['reasons']), S, float(sig['u_stop']), loss_pct, round(risk_unit * lots, 2),
+                       now_ist().strftime('%Y-%m-%d %H:%M:%S'), sl, sl, pa_today()))
+        pa_event(desk, 'SIGNAL', f"{sym} {direction} {inst['tradingsymbol']} score {sig['score']} {sig['setup']} | lots {lots} risk Rs {risk_unit*lots:,.0f} [{mode}]")
+        fill_qty, fill_px, oid = qty, entry, None
+        if mode == 'paper':
+            fill_px = pa_tick(ask * 1.002, tick, up=True)
+        else:
+            try:
+                oid = pa_live_limit(inst['tradingsymbol'], 'BUY', qty, entry); pa_update(tid, entry_oid=str(oid))
+                h = pa_wait_order(oid, 10)
+                if h.get('status') != 'COMPLETE':
+                    pa_cancel_quiet(oid); time.sleep(1)
+                    try: h = pa_order_hist(oid)
+                    except Exception: pass
+                fill_qty = int(h.get('filled_quantity') or 0); fill_px = float(h.get('average_price') or entry)
+            except Exception as e:
+                pa_update(tid, status='ABANDONED', exit_reason='entry order error: ' + str(e)); pa_event(desk, 'ERROR', f'Entry order failed: {e}')
+                return False, 'entry order error: ' + str(e)
+            if fill_qty <= 0:
+                pa_update(tid, status='ABANDONED', exit_reason='entry not filled'); pa_event(desk, 'INFO', f'{sym}: entry not filled, cancelled'); return False, 'entry not filled'
+        rr = cfg['rr']; sl2 = pa_tick(fill_px * (1 - loss_pct), tick); tgt = pa_tick(fill_px + rr * (fill_px - sl2), tick, up=True)
+        pa_update(tid, status='OPEN', qty=fill_qty, lots=max(1, fill_qty // lot), entry_price=fill_px, init_sl=sl2, sl=sl2, target=tgt, peak=fill_px,
+                  entry_ts=now_ist().strftime('%Y-%m-%d %H:%M:%S'), planned_risk=round((fill_px - sl2) * fill_qty, 2))
+        if mode == 'live':
+            t = pa_rows('SELECT * FROM pa_trades WHERE id=?', (tid,))[0]
+            try:
+                so = pa_place_sl(t, sl2); pa_update(tid, sl_oid=str(so)); PA_SL_SENT[tid] = pa_tick(sl2, tick)
+            except Exception as e:
+                pa_event(desk, 'ERROR', f'SL order failed ({e}) - exiting {inst["tradingsymbol"]} immediately')
+                pa_close_trade(pa_rows('SELECT * FROM pa_trades WHERE id=?', (tid,))[0], 'protective stop could not be placed')
+                return False, 'stop order failed; position closed'
+        pa_event(desk, 'ENTRY', f"{inst['tradingsymbol']} x{fill_qty} @ {fill_px} SL {sl2} TGT {tgt} [{mode}]")
+        return True, 'entered'
 
 
-@app.route("/api/index-autotrader/arm", methods=["POST"])
-def iat_arm_route():
-    err = _iat_gate()
-    if err:
-        return err
-    state = iat_load_state()
-    body = request.get_json(silent=True) or {}
-    if state.get("halt_reason") and not body.get("clear_halt"):
-        return jsonify({"error": "Halted: " + str(state["halt_reason"]) + " (post clear_halt=true)"}), 400
-    if state.get("execution_mode") == "live" and body.get("ack") is not True:
-        return jsonify({"error": "live execution requires ack:true"}), 400
-    if body.get("clear_halt"):
-        state["halt_reason"] = None
-        state["loss_streak"] = 0
-    state["armed"] = True
-    state["day"] = iat_today()
-    iat_save_state(state)
-    return jsonify({"ok": True, "state": state})
+# ------------------------------ exit / management ----------------------------
+def pa_close_trade(t, reason, hint=None):
+    """Closes one open trade (paper or live). Safe to call repeatedly."""
+    with PA_LOCK:
+        t = (pa_rows('SELECT * FROM pa_trades WHERE id=?', (t['id'],)) or [None])[0]
+        if not t or t['status'] not in ('OPEN', 'EXITING'): return False
+        pa_update(t['id'], status='EXITING')
+    px = None
+    try:
+        snap = PA_LTP.get(t['id']) or {}
+        bid = snap.get('bid') or snap.get('ltp') or t['entry_price']
+        if t['mode'] == 'paper':
+            px = hint or pa_tick(bid, t['tick'])
+        else:
+            if t['sl_oid']:
+                pa_cancel_quiet(t['sl_oid']); time.sleep(0.6)
+                try:
+                    h = pa_order_hist(t['sl_oid'])
+                    if h.get('status') == 'COMPLETE':
+                        px = float(h.get('average_price') or t['sl']); reason = 'stop-loss hit'
+                except Exception: pass
+            if px is None:
+                key = 'NFO:' + t['tradingsymbol']; q = kite.quote([key])[key]
+                buys = (q.get('depth') or {}).get('buy') or []; bid = float(buys[0]['price']) if buys else float(q['last_price'])
+                remaining = int(t['qty']); got = 0.0; filled = 0
+                lim = pa_tick(max(t['tick'], bid * 0.99), t['tick'])
+                try:
+                    oid = pa_live_limit(t['tradingsymbol'], 'SELL', remaining, lim, 'PAEXIT'); pa_update(t['id'], exit_oid=str(oid))
+                    h = pa_wait_order(oid, 6)
+                    if h.get('status') != 'COMPLETE': pa_cancel_quiet(oid); time.sleep(1); h = pa_order_hist(oid)
+                    f = int(h.get('filled_quantity') or 0)
+                    if f: filled += f; got += f * float(h.get('average_price') or lim)
+                except Exception as e: pa_event(t['desk'], 'WARN', f'limit exit failed: {e}')
+                if filled < remaining:
+                    res = place_basket_orders([dict(leg='exit', tradingsymbol=t['tradingsymbol'], transaction_type='SELL', quantity=remaining - filled,
+                                                    exchange='NFO', tag='PAEXIT', price=bid)], 'MIS', 'MARKET', sequence_for_margin=False)
+                    r0 = res[0] if res else {}
+                    if r0.get('status') != 'placed':
+                        pa_update(t['id'], status='OPEN'); pa_event(t['desk'], 'ERROR', f"EXIT FAILED for {t['tradingsymbol']}: {r0.get('error')} - CHECK ZERODHA NOW")
+                        return False
+                    time.sleep(1.2)
+                    try:
+                        h = pa_order_hist(r0['order_id']); f2 = int(h.get('filled_quantity') or (remaining - filled)); ap = float(h.get('average_price') or bid)
+                    except Exception: f2, ap = remaining - filled, bid
+                    filled += f2; got += f2 * ap
+                px = got / filled if filled else bid
+    except Exception as e:
+        pa_update(t['id'], status='OPEN'); pa_event(t['desk'], 'ERROR', f"exit error {t['tradingsymbol']}: {e}"); return False
+    gross = (px - t['entry_price']) * t['qty']; fees = pa_fees(t['entry_price'], px, t['qty'])
+    pa_update(t['id'], status='CLOSED', exit_price=round(px, 2), exit_ts=now_ist().strftime('%Y-%m-%d %H:%M:%S'), exit_reason=reason,
+              pnl_gross=round(gross, 2), fees=fees, pnl_net=round(gross - fees, 2))
+    pa_event(t['desk'], 'EXIT', f"{t['tradingsymbol']} @ {px:.2f} ({reason}) net Rs {gross - fees:,.0f} [{t['mode']}]")
+    PA_LTP.pop(t['id'], None); PA_SL_MODIFY_AT.pop(t['id'], None); PA_SL_SENT.pop(t['id'], None)
+    return True
+
+def pa_expire_old():
+    for t in pa_rows("SELECT * FROM pa_trades WHERE status IN ('OPEN','EXITING','PENDING_ENTRY') AND day<>?", (pa_today(),)):
+        pa_update(t['id'], status='ABANDONED', exit_reason='left over from a previous day (intraday product is squared off by the broker) - verify on Zerodha')
+        pa_event(t['desk'], 'WARN', f"{t['tradingsymbol']} from {t['day']} was still open in the engine - marked abandoned, please verify on Zerodha")
+
+def pa_manage():
+    pa_expire_old()
+    """Runs every few seconds: prices, stops, trailing, targets, time exits, kill switch, reconciliation."""
+    open_t = [t for t in pa_open_trades() if t['status'] == 'OPEN']
+    n = now_ist(); nm = pa_minutes(n)
+    if open_t:
+        keys = ['NFO:' + t['tradingsymbol'] for t in open_t]
+        try: quotes = kite.quote(keys)
+        except BrokerDeferred: return
+        except Exception as e: pa_event('system', 'WARN', 'quote failed: ' + str(e)); return
+        live_orders = {}
+        if any(t['mode'] == 'live' for t in open_t):
+            try: live_orders = {str(o['order_id']): o for o in kite.orders()}
+            except Exception: live_orders = {}
+        for t in open_t:
+            q = quotes.get('NFO:' + t['tradingsymbol']) or {}
+            ltp = float(q.get('last_price') or 0); buys = (q.get('depth') or {}).get('buy') or []
+            bid = float(buys[0]['price']) if buys and buys[0].get('price') else ltp
+            if ltp <= 0: continue
+            PA_LTP[t['id']] = dict(ltp=ltp, bid=bid, ts=time.time())
+            cfg = pa_cfg(t['desk']); entry = t['entry_price']; R = entry - t['init_sl']
+            peak = max(t['peak'] or entry, ltp)
+            sl = t['sl']; tick = t['tick']
+            # trailing: break-even at +1R, trail 0.8R behind the peak after +1.5R
+            if peak >= entry + R: sl = max(sl, pa_tick(entry * 1.01, tick, up=True))
+            if peak >= entry + 1.5 * R: sl = max(sl, pa_tick(peak - 0.8 * R, tick))
+            sl = min(sl, pa_tick(ltp - 2 * tick, tick)) if sl > t['sl'] else sl
+            if peak != t['peak'] or sl != t['sl']:
+                pa_update(t['id'], peak=peak, sl=sl); t = dict(t, sl=sl, peak=peak)
+            if t['mode'] == 'live' and t['sl_oid']:
+                sent = PA_SL_SENT.get(t['id'], t['init_sl'])
+                if sl >= sent + tick and time.time() - PA_SL_MODIFY_AT.get(t['id'], 0) > 15:
+                    try:
+                        trig = pa_tick(sl, tick); lim = pa_tick(max(tick, trig - max(2 * tick, trig * 0.04)), tick)
+                        kite.modify_order(variety=kite.VARIETY_REGULAR, order_id=t['sl_oid'], price=lim, trigger_price=trig)
+                        PA_SL_MODIFY_AT[t['id']] = time.time(); PA_SL_SENT[t['id']] = trig; pa_event(t['desk'], 'TRAIL', f"{t['tradingsymbol']} stop -> {trig}")
+                    except Exception as e: pa_event(t['desk'], 'WARN', f'SL modify failed: {e}')
+            reason = None
+            if t['mode'] == 'live' and t['sl_oid']:
+                so = live_orders.get(str(t['sl_oid'])) or {}
+                if so.get('status') == 'COMPLETE':
+                    px = float(so.get('average_price') or t['sl']); gross = (px - entry) * t['qty']; fees = pa_fees(entry, px, t['qty'])
+                    pa_update(t['id'], status='CLOSED', exit_price=px, exit_ts=n.strftime('%Y-%m-%d %H:%M:%S'), exit_reason='stop-loss hit (exchange order)',
+                              pnl_gross=round(gross, 2), fees=fees, pnl_net=round(gross - fees, 2))
+                    pa_event(t['desk'], 'EXIT', f"{t['tradingsymbol']} stopped @ {px} net Rs {gross - fees:,.0f}"); PA_LTP.pop(t['id'], None); continue
+                if so.get('status') in ('REJECTED', 'CANCELLED'):
+                    try:
+                        so2 = pa_place_sl(t, t['sl']); pa_update(t['id'], sl_oid=str(so2)); pa_event(t['desk'], 'WARN', 'stop order was cancelled/rejected - re-placed')
+                    except Exception as e: reason = 'stop order lost and could not be re-placed'
+            if reason is None:
+                if bid >= t['target']: reason = 'target reached'
+                elif t['mode'] == 'paper' and bid <= t['sl']: reason = 'stop-loss hit' if t['sl'] <= entry else 'trailing stop hit'
+                elif nm >= pa_hm(cfg['squareoff']): reason = 'end-of-day square-off'
+                else:
+                    age = (n - datetime.strptime(t['entry_ts'], '%Y-%m-%d %H:%M:%S')).total_seconds() / 60.0
+                    if age >= cfg['stall_minutes'] and peak < entry + 0.3 * R: reason = 'time-stop (no progress)'
+            if reason is None:
+                st = PA_SCAN_INFO[t['desk']].get('bars', {}).get(t['symbol'])
+                if st and st['ts'] > datetime.strptime(t['entry_ts'], '%Y-%m-%d %H:%M:%S'):
+                    if (t['side'] == 'CE' and st['close'] <= t['u_stop']) or (t['side'] == 'PE' and st['close'] >= t['u_stop']):
+                        reason = 'structure broken (5m close beyond stop level)'
+            if reason: pa_close_trade(t, reason)
+    # --- kill switch (net day P&L, per book) ---
+    for mode in ('paper', 'live'):
+        led = pa_ledger(mode)
+        if led['open_count'] or led['closed_count']:
+            if not led['halted'] and led['net'] <= -led['cap'] * PA_KILL_FRAC:
+                pa_halt(f"Daily loss limit reached ({mode}): net Rs {led['net']:,.0f}. All positions flattened; no new trades today.")
+                for t in pa_open_trades(mode):
+                    if t['status'] == 'OPEN': pa_close_trade(t, 'daily loss limit')
+    # --- broker reconciliation (live) ---
+    if time.time() - PA_LAST_RECON['t'] > 30 and any(t['mode'] == 'live' for t in pa_open_trades()):
+        PA_LAST_RECON['t'] = time.time()
+        try:
+            net = {(p['tradingsymbol']): p for p in (kite.positions().get('net') or []) if p.get('product') == 'MIS'}
+            for t in pa_open_trades('live'):
+                if t['status'] != 'OPEN': continue
+                p = net.get(t['tradingsymbol'])
+                if (p is None or int(p.get('quantity') or 0) == 0) and (now_ist() - datetime.strptime(t['entry_ts'], '%Y-%m-%d %H:%M:%S')).total_seconds() > 60:
+                    if t['sl_oid']: pa_cancel_quiet(t['sl_oid'])
+                    px = (PA_LTP.get(t['id']) or {}).get('ltp') or t['entry_price']; gross = (px - t['entry_price']) * t['qty']; fees = pa_fees(t['entry_price'], px, t['qty'])
+                    pa_update(t['id'], status='CLOSED', exit_price=px, exit_ts=n.strftime('%Y-%m-%d %H:%M:%S'), exit_reason='closed outside engine (broker shows flat)',
+                              pnl_gross=round(gross, 2), fees=fees, pnl_net=round(gross - fees, 2))
+                    pa_event(t['desk'], 'WARN', f"{t['tradingsymbol']}: broker shows no position - marked closed (P&L estimated)")
+        except Exception as e: pa_event('system', 'WARN', 'reconcile failed: ' + str(e))
 
 
-@app.route("/api/index-autotrader/disarm", methods=["POST"])
-def iat_disarm_route():
-    err = _iat_gate()
-    if err:
-        return err
-    state = iat_load_state()
-    state["armed"] = False
-    iat_save_state(state)
-    return jsonify({"ok": True, "state": state})
+# ------------------------------ scanning -------------------------------------
+def pa_scan(desk, force=False):
+    cfg = pa_cfg(desk); n = now_ist(); nm = pa_minutes(n)
+    syms = [s for s in cfg['symbols'] if s in PA_INDEX_MAP] if desk == 'index' else [x['symbol'] for x in PA_SHORTLIST['items']]
+    syms = list(dict.fromkeys(syms + [t['symbol'] for t in pa_open_trades(desk=desk)]))
+    mkt = pa_market_bias() if desk == 'stock' else 0.0
+    vix = None
+    if desk == 'index':
+        try:
+            k = 'NSE:INDIA VIX'; vix = float(kite.quote([k])[k]['last_price'])
+        except Exception: vix = None
+    sigs = []; barinfo = PA_SCAN_INFO[desk].setdefault('bars', {})
+    for sym in syms:
+        try:
+            u = pa_underlying(desk, sym)
+            if not u: sigs.append(dict(symbol=sym, direction=None, score=0, why='instrument not found')); continue
+            b = pa_bars5(u)
+            if b: barinfo[sym] = dict(ts=b[-1][0], close=b[-1][4])
+            a = pa_analyze(b, pa_daily(u), mkt)
+            a['symbol'] = sym; a['ts'] = n.strftime('%H:%M:%S'); sigs.append(a)
+        except BrokerDeferred: sigs.append(dict(symbol=sym, direction=None, score=0, why='rate-limit deferral')); time.sleep(.5)
+        except Exception as e: sigs.append(dict(symbol=sym, direction=None, score=0, why='error: ' + str(e)[:80]))
+    sigs.sort(key=lambda s: (s.get('direction') is not None, s.get('score', 0)), reverse=True)
+    PA_SIGNALS[desk] = sigs; PA_SCAN_INFO[desk].update(last=n.strftime('%H:%M:%S'), vix=vix, mkt=mkt)
+    if not cfg['armed']: return
+    if not (pa_hm(cfg['entry_from']) <= nm <= pa_hm(cfg['entry_to'])): return
+    if desk == 'index' and vix and vix > cfg['vix_max']:
+        PA_SCAN_INFO[desk]['note'] = f'India VIX {vix:.1f} above limit {cfg["vix_max"]} - no entries'; return
+    PA_SCAN_INFO[desk]['note'] = ''
+    for s in sigs:
+        if s.get('direction') and s['score'] >= cfg['score_min']:
+            ok, msg = pa_try_enter(desk, s, cfg, vix)
+            s['action'] = msg
+            if not ok and msg in ('max open trades reached', 'halted for the day', 'daily loss gate', 'consecutive-loss breaker'): break
+
+def pa_worker():
+    last_manage = 0.0
+    while True:
+        try:
+            if require_session() and pa_market_open():
+                if time.time() - last_manage >= 3:
+                    last_manage = time.time(); pa_manage()
+        except Exception as e: pa_event('system', 'ERROR', 'manage loop: ' + str(e))
+        time.sleep(1)
+
+def pa_scan_worker(desk):
+    while True:
+        try:
+            n = now_ist(); nm = pa_minutes(n)
+            if require_session() and pa_market_open() and nm >= 9 * 60 + 20:
+                cfg = pa_cfg(desk); key = (n.date(), nm // 5)
+                if cfg['armed'] and PA_LAST_SCAN[desk] != key and n.second >= 6:
+                    PA_LAST_SCAN[desk] = key
+                    if desk == 'stock':
+                        sh = PA_SHORTLIST['built_at']
+                        if not PA_SHORTLIST['items'] or not sh or (n - sh).total_seconds() > 1800: pa_build_shortlist()
+                    pa_scan(desk)
+        except Exception as e: pa_event(desk, 'ERROR', 'scan loop: ' + str(e))
+        time.sleep(2)
 
 
-@app.route("/api/index-autotrader/close-all", methods=["POST"])
-def iat_close_all_route():
-    err = _iat_gate()
-    if err:
-        return err
-    state = iat_load_state()
-    trades = iat_load_trades()
-    closed = []
-    for trade in trades:
-        if trade.get("status") != "open":
-            continue
-        bid = iat_option_quote(trade) or trade.get("entry_price")
-        closed.append(iat_close(trade, "Manual close all", bid, state))
-    state["armed"] = False
-    iat_save_state(state)
-    iat_save_trades(trades)
-    return jsonify({"ok": True, "closed": len(closed)})
+# ------------------------------ backtest (underlying based) ------------------
+def pa_backtest(desk, sym, days, rr):
+    u = pa_underlying(desk, sym)
+    if not u: raise ValueError('unknown symbol')
+    allb = pa_closed(pa_hist(u['tok5'], '5minute', days + 8, ttl=600)); daily_all = pa_hist(u['tokD'], 'day', 260, ttl=3600)
+    dates = sorted({b[0].date() for b in allb})[-days:]; trades = []
+    for d in dates:
+        idx = [k for k, b in enumerate(allb) if b[0].date() == d]
+        if len(idx) < 20: continue
+        dly = [x for x in daily_all if x[0].date() < d]; n_day = 0; cool = -1
+        for j in idx:
+            tm = pa_minutes(allb[j][0])
+            if j <= cool or tm < 9 * 60 + 30 or tm > 14 * 60 + 25 or n_day >= 2 or j + 1 >= len(allb) or allb[j + 1][0].date() != d: continue
+            a = pa_analyze(allb[max(0, j - 700):j + 1], dly, 0.0)
+            if not a.get('direction') or a['score'] < 65: continue
+            sgn = 1 if a['direction'] == 'CE' else -1; ent = allb[j + 1][1]; stop = a['u_stop']; dist = (ent - stop) * sgn
+            if dist <= 0: continue
+            tgt = ent + sgn * rr * dist; cur = stop; exit_px = None; k = j + 1
+            while k < len(allb) and allb[k][0].date() == d:
+                hi, lo, cl = allb[k][2], allb[k][3], allb[k][4]
+                if (sgn == 1 and lo <= cur) or (sgn == -1 and hi >= cur): exit_px = cur; break
+                if (sgn == 1 and hi >= tgt) or (sgn == -1 and lo <= tgt): exit_px = tgt; break
+                if (sgn == 1 and hi >= ent + dist) or (sgn == -1 and lo <= ent - dist): cur = max(cur, ent) if sgn == 1 else min(cur, ent)
+                if pa_minutes(allb[k][0]) >= 15 * 60 + 10: exit_px = cl; break
+                k += 1
+            if exit_px is None: exit_px = allb[min(k, len(allb) - 1)][4]
+            R = (exit_px - ent) * sgn / dist; n_day += 1; cool = k + 6
+            trades.append(dict(date=str(d), time=allb[j][0].strftime('%H:%M'), dir=a['direction'], setup=a['setup'], score=a['score'], R=round(R, 2)))
+    Rs = [t['R'] for t in trades]; wins = [r for r in Rs if r > 0]; loss = [r for r in Rs if r <= 0]
+    eq = np.cumsum(Rs) if Rs else np.array([0.0]); dd = float(np.max(np.maximum.accumulate(eq) - eq)) if Rs else 0.0
+    return dict(symbol=sym, days=len(dates), trades=len(Rs), win_rate=round(100 * len(wins) / len(Rs), 1) if Rs else None, avg_R=round(float(np.mean(Rs)), 3) if Rs else None,
+                total_R=round(float(sum(Rs)), 2), profit_factor=round(sum(wins) / abs(sum(loss)), 2) if loss and sum(loss) else None, max_drawdown_R=round(dd, 2),
+                last_trades=trades[-25:], note='Underlying-price replay of the same entry/stop/target/break-even rules. It ignores option theta/IV change, spreads, slippage and charges - treat as a sanity check, not a promise.')
+
+
+# ------------------------------ API routes -----------------------------------
+def pa_csrf_ok():
+    tok = request.headers.get('X-Website-CSRF', ''); sess = session.get('website_csrf', '')
+    return bool(tok and sess and hmac.compare_digest(tok, sess))
+
+def pa_clean(rows):
+    out = []
+    for r in rows:
+        r = dict(r)
+        try: r['reasons'] = json.loads(r.get('reasons') or '[]')
+        except Exception: r['reasons'] = []
+        snap = PA_LTP.get(r['id']) or {}
+        r['ltp'] = snap.get('ltp'); r['bid'] = snap.get('bid')
+        if r['status'] == 'OPEN' and r.get('entry_price') and snap.get('bid'):
+            r['open_pnl'] = round((snap['bid'] - r['entry_price']) * r['qty'], 2)
+        out.append(r)
+    return out
+
+@app.route('/api/pa/<desk>/state')
+def pa_state(desk):
+    if desk not in PA_DEFAULTS: return jsonify(error='unknown desk'), 404
+    cfg = pa_cfg(desk); led = pa_ledger(cfg['mode'])
+    sl = PA_SHORTLIST
+    return jsonify(desk=desk, cfg=cfg, gcfg=pa_gcfg(), kite_connected=bool(SESSION.get('access_token')), market_open=pa_market_open(),
+                   now=now_ist().strftime('%H:%M:%S'), ledger=led, signals=PA_SIGNALS[desk], scan=dict(PA_SCAN_INFO[desk], bars=None),
+                   open=pa_clean(pa_open_trades(desk=desk)),
+                   closed=pa_clean(pa_rows("SELECT * FROM pa_trades WHERE desk=? AND status='CLOSED' AND day=? ORDER BY exit_ts DESC", (desk, pa_today()))),
+                   events=pa_rows('SELECT ts,kind,msg FROM pa_events WHERE desk IN (?,?) ORDER BY id DESC LIMIT 60', (desk, 'system')),
+                   shortlist=dict(items=sl['items'], built_at=sl['built_at'].strftime('%H:%M') if sl['built_at'] else None, building=sl['building'], error=sl['error']) if desk == 'stock' else None)
+
+@app.route('/api/pa/<desk>/config', methods=['POST'])
+def pa_config(desk):
+    if desk not in PA_DEFAULTS: return jsonify(error='unknown desk'), 404
+    if not pa_csrf_ok(): return jsonify(error='Security token missing - refresh the page'), 403
+    body = request.get_json(silent=True) or {}; patch = {}
+    try:
+        for k in ('risk_per_trade', 'score_min', 'rr', 'min_sl_pct', 'max_sl_pct', 'max_capital_per_trade', 'vix_max'):
+            if k in body: patch[k] = float(body[k])
+        for k in ('shortlist', 'max_lots', 'min_dte', 'cooldown_min', 'stall_minutes', 'max_entries_per_symbol', 'min_oi_lots'):
+            if k in body: patch[k] = int(body[k])
+        for k in ('entry_from', 'entry_to', 'squareoff'):
+            if k in body: pa_hm(body[k]); patch[k] = str(body[k])
+        if body.get('moneyness') in ('ATM', 'ITM1'): patch['moneyness'] = body['moneyness']
+        if desk == 'index' and isinstance(body.get('symbols'), list):
+            patch['symbols'] = [s.upper() for s in body['symbols'] if s.upper() in PA_INDEX_MAP]
+        if 'daily_loss' in body or 'max_open' in body or 'max_consecutive_losses' in body:
+            g = pa_kv_get('cfg:global', {}) or {}
+            for k in ('daily_loss', 'max_open', 'max_consecutive_losses'):
+                if k in body: g[k] = float(body[k]) if k == 'daily_loss' else int(body[k])
+            pa_kv_set('cfg:global', g)
+    except (ValueError, TypeError) as e: return jsonify(error='Invalid value: ' + str(e)), 400
+    return jsonify(ok=True, cfg=pa_save_cfg(desk, patch), gcfg=pa_gcfg())
+
+@app.route('/api/pa/<desk>/control', methods=['POST'])
+def pa_control(desk):
+    if desk not in PA_DEFAULTS: return jsonify(error='unknown desk'), 404
+    if not pa_csrf_ok(): return jsonify(error='Security token missing - refresh the page'), 403
+    body = request.get_json(silent=True) or {}; action = body.get('action')
+    if action in ('arm', 'scan', 'refresh_shortlist', 'close_all', 'close_trade') and not require_session(): return jsonify(error='Connect Kite first'), 401
+    cfg = pa_cfg(desk)
+    if action == 'disarm':
+        pa_save_cfg(desk, dict(armed=False)); pa_event(desk, 'CONTROL', 'Disarmed (open trades stay managed)'); return jsonify(ok=True)
+    if action == 'set_mode':
+        m = 'live' if body.get('mode') == 'live' else 'paper'
+        if m == 'live' and body.get('confirm') != 'LIVE': return jsonify(error='Type LIVE to confirm real-money trading'), 400
+        if pa_open_trades(desk=desk): return jsonify(error='Close open trades before switching mode'), 409
+        pa_save_cfg(desk, dict(mode=m, armed=False)); pa_event(desk, 'CONTROL', f'Mode set to {m.upper()} (disarmed)'); return jsonify(ok=True)
+    if action == 'arm':
+        if pa_ledger(cfg['mode'])['halted']: return jsonify(error='Halted for today by the daily loss limit'), 409
+        pa_save_cfg(desk, dict(armed=True)); pa_event(desk, 'CONTROL', f"ARMED in {cfg['mode'].upper()} mode"); PA_LAST_SCAN[desk] = None; return jsonify(ok=True)
+    if action == 'refresh_shortlist':
+        threading.Thread(target=pa_build_shortlist, daemon=True).start(); return jsonify(ok=True)
+    if action == 'scan':
+        def job():
+            try:
+                if desk == 'stock' and not PA_SHORTLIST['items']: pa_build_shortlist()
+                pa_scan(desk)
+            except Exception as e: pa_event(desk, 'ERROR', 'manual scan: ' + str(e))
+        threading.Thread(target=job, daemon=True).start(); return jsonify(ok=True)
+    if action == 'close_trade':
+        t = pa_rows('SELECT * FROM pa_trades WHERE id=? AND desk=?', (int(body.get('id') or 0), desk))
+        if not t: return jsonify(error='trade not found'), 404
+        return jsonify(ok=bool(pa_close_trade(t[0], 'closed manually')))
+    if action == 'close_all':
+        n = 0
+        for t in pa_open_trades(desk=desk):
+            if t['status'] == 'OPEN' and pa_close_trade(t, 'closed manually (close all)'): n += 1
+        return jsonify(ok=True, closed=n)
+    return jsonify(error='unknown action'), 400
+
+@app.route('/api/pa/backtest')
+def pa_backtest_route():
+    if not require_session(): return jsonify(error='Connect Kite first'), 401
+    desk = request.args.get('desk', 'index'); sym = (request.args.get('symbol') or '').upper()
+    if desk not in PA_DEFAULTS or not sym: return jsonify(error='desk and symbol required'), 400
+    try:
+        days = max(5, min(45, int(request.args.get('days', 25)))); rr = max(1.2, min(4.0, float(request.args.get('rr', 2.0))))
+        return jsonify(pa_backtest(desk, sym, days, rr))
+    except Exception as e: return jsonify(error=str(e)), 400
+
+def pa_startup():
+    pa_init_db(); pa_expire_old()
+    for d in ('stock', 'index'):
+        cur = pa_kv_get('cfg:' + d, {}) or {}; cur['armed'] = False; pa_kv_set('cfg:' + d, cur)   # never auto-arm after a restart
+    stale = pa_rows("SELECT * FROM pa_trades WHERE status='PENDING_ENTRY' AND day=?", (pa_today(),))
+    for t in stale:
+        pa_update(t['id'], status='ABANDONED', exit_reason='restart while entry pending - verify broker positions')
+        pa_event(t['desk'], 'WARN', f"Entry for {t['tradingsymbol']} was pending at restart - check Zerodha positions")
+    if os.environ.get('AI_START_WORKERS', '1') == '1':
+        threading.Thread(target=pa_worker, daemon=True, name='pa-manage').start()
+        for d in ('stock', 'index'): threading.Thread(target=pa_scan_worker, args=(d,), daemon=True, name='pa-scan-' + d).start()
+
+pa_startup()
+# <<< END PA AUTO-TRADER (v3)
+
 
 start_application_workers()
 
