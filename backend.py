@@ -12430,9 +12430,9 @@ def _build_desk_engine_class():
             with self.db() as c:r=c.execute('SELECT value FROM desk_meta WHERE key=?',(key,)).fetchone()
             return json.loads(r[0]) if r else default
         def put(self,key,value):
-            with self.db() as c:c.execute('INSERT OR REPLACE INTO desk_meta VALUES(?,?)',(key,json.dumps(value)))
+            with self.db() as c:c.execute('INSERT OR REPLACE INTO desk_meta (key,value) VALUES(?,?)',(key,json.dumps(value)))
         def event(self,kind,detail,symbol=''):
-            with self.db() as c:c.execute('INSERT INTO desk_events VALUES(NULL,?,?,?,?)',(stamp(),kind,symbol,str(detail)))
+            with self.db() as c:c.execute('INSERT INTO desk_events (id,ts,kind,symbol,detail) VALUES(NULL,?,?,?,?)',(stamp(),kind,symbol,str(detail)))
         def record_trade(self,pid,kind,payload):
             # Recorder failures must not prevent broker reconciliation or protective exits.
             try:
@@ -12528,7 +12528,7 @@ def _build_desk_engine_class():
                     baseline=float(max(y.mean(),1-y.mean())*100),coverage=coverage,
                     train_end=datetime.fromtimestamp(max(r[1] for r in train),IST).isoformat(),
                     validation_start=datetime.fromtimestamp(cut,IST).isoformat(),horizon_minutes=15)
-                with self.db() as c:c.execute('INSERT INTO desk_models VALUES(?,?,?)',(m['id'],stamp(),json.dumps(m)))
+                with self.db() as c:c.execute('INSERT INTO desk_models (id,ts,payload) VALUES(?,?,?)',(m['id'],stamp(),json.dumps(m)))
                 self.training=dict(status='COMPLETE',progress=100,model_id=m['id']);self.event('LEARN',f"Model {m['id']} trained on {len(train)}; chronological validation {len(val)}")
             except Exception as e:
                 self.training=dict(status='ERROR',progress=0,error=str(e));self.event('ERROR','Training: '+str(e))
@@ -12586,7 +12586,7 @@ def _build_desk_engine_class():
             target=dt(last['ts'])+timedelta(minutes=15)
             if record_observation and self.a.market_open() and target.date()==dt(last['ts']).date() and target.strftime('%H:%M')<='15:25':
                 key=symbol+dt(last['ts']).isoformat()
-                with self.db() as c:c.execute('INSERT OR IGNORE INTO desk_observations VALUES(?,?,?,?,?,?,?,?,NULL,NULL)',
+                with self.db() as c:c.execute('INSERT OR IGNORE INTO desk_observations (id,symbol,ts,target_ts,spot,features,model_id,prob,label,settled_ts) VALUES(?,?,?,?,?,?,?,?,NULL,NULL)',
                     (key,symbol,dt(last['ts']).isoformat(),target.isoformat(),float(last['close']),json.dumps(x),m['id'],p))
             cfg=self.config()
             if not self.a.market_open():s['reason']='Market closed · historical prediction only';return s
@@ -15181,7 +15181,7 @@ class CASEngine(DeskEngine):
             accuracy=float(((pred>=.5)==vy).mean());baseline=float(max(vy.mean(),1-vy.mean()));brier=float(((pred-vy)**2).mean())
             if accuracy<=baseline or brier>=.25:raise ValueError('CAS validation did not beat baseline; current model retained, rule-based paper continues if none')
             m=dict(id='CAS-'+str(int(time.time())),ts=now_ist().isoformat(),mu=mu.tolist(),sd=sd.tolist(),w=w.tolist(),bias=float(b),train_samples=len(train),validation_samples=len(val),accuracy=accuracy*100,baseline=baseline*100,brier=brier,horizon_seconds=5,fast_profile=2)
-            with self.db() as c:c.execute('INSERT INTO desk_models VALUES(?,?,?)',(m['id'],m['ts'],json.dumps(m)))
+            with self.db() as c:c.execute('INSERT INTO desk_models (id,ts,payload) VALUES(?,?,?)',(m['id'],m['ts'],json.dumps(m)))
             self.training=dict(status='COMPLETE',progress=100);self.event('LEARN','CAS model validated on later, purged observations')
         except Exception as e:self.training=dict(status='ERROR',progress=0,error=str(e))
         finally:self.train_lock.release()
