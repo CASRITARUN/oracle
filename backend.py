@@ -32,8 +32,8 @@ try:
 except ImportError:
     pass
 
-API_KEY = os.environ.get("KITE_API_KEY", "vecsucwn1tckme31")
-API_SECRET = os.environ.get("KITE_API_SECRET", "mehksxgc3gsbj3zz7kpacrb9ezrkvzro")
+API_KEY = os.environ.get("KITE_API_KEY", "").strip()
+API_SECRET = os.environ.get("KITE_API_SECRET", "").strip()
 # Configure this same redirect URL in the Kite developer app settings.
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
@@ -1159,7 +1159,7 @@ class Engine:
 
 # ---- HTTP surface: small state reads and short validated control requests ----
 SESSIONS={};SESSION_LOCK=threading.Lock()
-PUBLIC_ORIGIN=os.getenv('PUBLIC_ORIGIN','').rstrip('/')
+PUBLIC_ORIGIN=os.getenv('PUBLIC_ORIGIN','https://algo.wecon.in').rstrip('/')
 ENGINE=None;PROCESS_LOCK=None
 
 def get_session(request,required=True):
@@ -1279,7 +1279,7 @@ async def diagnostics(request:Request):
 if __name__=='__main__':
     import uvicorn
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
-    uvicorn.run(app,host=os.getenv('HOST','127.0.0.1'),port=int(os.getenv('PORT','8000')),workers=1,
+    uvicorn.run(app,host=os.getenv('HOST','127.0.0.1'),port=int(os.getenv('PORT','5000')),workers=1,
                 access_log=False,proxy_headers=True,forwarded_allow_ips=os.getenv('TRUSTED_PROXY_IPS','127.0.0.1'))
 
 # Upstream workflow attribution / license:
