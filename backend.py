@@ -32,8 +32,8 @@ try:
 except ImportError:
     pass
 
-API_KEY = os.environ.get("KITE_API_KEY", "").strip()
-API_SECRET = os.environ.get("KITE_API_SECRET", "").strip()
+API_KEY = os.environ.get("vecsucwn1tckme31", "").strip()
+API_SECRET = os.environ.get("mehksxgc3gsbj3zz7kpacrb9ezrkvzro", "").strip()
 # Configure this same redirect URL in the Kite developer app settings.
 REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://algo.wecon.in/api/callback")
 
